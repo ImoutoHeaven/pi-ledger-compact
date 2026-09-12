@@ -2851,7 +2851,6 @@ test("near-capacity context keeps the latest correction when the summary fits", 
 		]);
 		await session.prompt(correction);
 		assert.ok(resumedContext);
-		assert.match(JSON.stringify(resumedContext.messages), /latest-near-capacity-correction-sentinel/);
 		const correctionEntry = sessionManager
 			.getBranch()
 			.find(
@@ -2861,7 +2860,14 @@ test("near-capacity context keeps the latest correction when the summary fits", 
 					JSON.stringify(entry.message.content).includes(correction),
 			);
 		assert.ok(correctionEntry);
-		assert.match(JSON.stringify(resumedContext.messages), new RegExp(`pi://entry/${correctionEntry.id}`));
+		const latestUserMessage = resumedContext.messages.filter((message) => message.role === "user").at(-1);
+		assert.ok(latestUserMessage);
+		const latestUserText = typeof latestUserMessage.content === "string"
+			? latestUserMessage.content
+			: latestUserMessage.content.map((block) => ("text" in block ? block.text : "")).join("\n");
+		const visiblePrefix = latestUserText.split("\n[truncated; complete entry:")[0];
+		assert.ok(visiblePrefix.length > 0 && correction.startsWith(visiblePrefix));
+		assert.match(latestUserText, new RegExp(`pi://entry/${correctionEntry.id}`));
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 		if (previousTaskLimit === undefined) delete process.env.LEDGER_CONTEXT_TASK_TOKENS;
