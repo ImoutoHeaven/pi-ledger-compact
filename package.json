@@ -1,39 +1,48 @@
 {
   "name": "pi-better-compact",
   "version": "1.0.1",
-  "description": "A pi extension that replaces default compaction with a cache-aware dynamic programming economic model",
-  "main": "src/dp-compact.ts",
+  "type": "module",
+  "description": "A pi extension that preserves working state across native context compaction",
+  "main": "src/ledger-context.ts",
   "files": [
     "src/",
     "tsconfig.json"
   ],
   "scripts": {
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/ledger-context.test.ts"
   },
   "keywords": [
     "pi-package",
     "pi",
     "extension",
     "compaction",
-    "dynamic-programming",
-    "cache-aware"
+    "ledger",
+    "context"
   ],
   "author": "",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/takltc/pi-better-compact.git"
+    "url": "git+https://github.com/ImoutoHeaven/pi-ledger-compact.git"
   },
   "bugs": {
-    "url": "https://github.com/takltc/pi-better-compact/issues"
+    "url": "https://github.com/ImoutoHeaven/pi-ledger-compact/issues"
   },
-  "homepage": "https://github.com/takltc/pi-better-compact#readme",
+  "homepage": "https://github.com/ImoutoHeaven/pi-ledger-compact#readme",
   "pi": {
     "extensions": [
-      "./src/dp-compact.ts"
+      "./src/ledger-context.ts"
     ]
   },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*"
+  },
   "devDependencies": {
-    "typescript": "^5.0.0"
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-ai": "0.85.1",
+    "@types/node": "^22.19.19",
+    "typescript": "^5.9.3"
   }
 }

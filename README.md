@@ -1,121 +1,67 @@
-# pi DP-Based Compaction Extension
+# pi Ledger Context Extension
 
-[中文文档](./README.zh-CN.md)
+Ledger Context stores a bounded active ledger in the pi session log and carries it into the deterministic bootstrap for the next native context compaction. It uses pi's public ExtensionAPI and SDK.
 
-A pi extension that replaces the default compaction strategy with a **cache-aware dynamic programming (DP) economic model**, inspired by the [bash-agent compaction decision algorithm](https://github.com/lloydzhou/bash-agent/wiki/%E5%8A%A8%E6%80%81%E5%8E%8B%E7%BC%A9%E5%86%B3%E7%AD%96%EF%BC%9A%E4%BD%95%E6%97%B6%E5%8E%8B%E7%BC%A9%EF%BC%9F%E4%BF%9D%E7%95%99%E5%A4%9A%E5%B0%91%EF%BC%9F).
+## Requirements
 
-## Core Idea
-
-**Default pi compaction strategy:**
-- Triggers when `contextTokens > contextWindow - reserveTokens`
-- Keeps a fixed amount of recent messages (`keepRecentTokens`)
-
-**This extension's DP strategy:**
-- Enumerates candidate keep-counts *k* (how many recent messages to retain)
-- For each *k*, computes a **5-term net benefit**:
-  1. **Future savings**: Cache cost saved by not carrying old history in subsequent requests
-  2. **Cache invalidation**: One-time cost of cache miss due to the new summary prefix
-  3. **Compression request cost**: Input/output cost of the summary LLM call itself
-  4. **Information distortion penalty**: Loss of detail from summarization
-  5. **Quality improvement benefit**: Better output quality from shorter context
-- Only compacts if the best net benefit is **> 0**
-- Cut points align to **user message boundaries**, never splitting an assistant/tool turn
+- Runtime baseline: `@earendil-works/pi-coding-agent` 0.85.1 with Node.js `>=22.19.0`.
+- Keep pi native automatic compaction enabled for automatic window changes. Pi owns the compaction threshold, session log, steering and follow-up queues, overflow retry, and compaction lifecycle.
+- Configure one compaction content extension per session. Ledger Context supplies the compaction summary and recovery bootstrap so each window has one authoritative content source.
+- Automatic compaction disabled mode keeps `checkpoint`, `history_read`, `history_search`, and manual `/compact` available.
 
 ## Installation
 
-### Via npm (Recommended)
-
-Install from the npm registry (available in all sessions):
+From the checkout root, install this package as a local pi package. The manifest loads `src/ledger-context.ts`.
 
 ```bash
-pi install npm:pi-better-compact
+pi install -l .
 ```
 
-Or install locally in the current project only:
+The package exposes one extension entry and registers these model tools:
 
-```bash
-pi install -l npm:pi-better-compact
-```
+- `checkpoint` saves a complete active ledger and returns its persistence scope and handoff state.
+- `history_search` performs case-sensitive literal search on the current branch.
+- `history_read` reads a bounded slice of a referenced current-branch entry.
 
-### Via Git
+## Checkpoints and windows
 
-Install directly from GitHub:
+Call `checkpoint` with the complete active ledger and optional current-branch user request entry IDs. A successful receipt contains the checkpoint entry ID, source window ID, request history position, estimated ledger size, persistence scope, and `awaiting-native-compaction-threshold` handoff state.
 
-```bash
-pi install git:github.com/takltc/pi-better-compact
-```
+The checkpoint commits handoff preparation and lets the current run continue. Pi later decides when the native threshold is reached. Automatic and manual `/compact [instructions]` use the same Ledger Context bootstrap path and do not issue an independent summary-model request.
 
-Or locally:
+Persistent session receipts survive reopening the session log. In-memory SDK receipts cover the current process and require a persistent session for restart recovery.
 
-```bash
-pi install -l git:github.com/takltc/pi-better-compact
-```
+The bootstrap carries the latest ledger, current task and latest user wording, window metadata, bounded recent interaction, execution state, and history references. Assistant tool calls remain paired with their tool results. Persistent sessions keep complete entries in the pi session log as the durable source of evidence; in-memory sessions keep those entries for the current process.
 
-### Manual Install
+## History recovery
 
-1. Copy the extension file to pi's extensions directory:
+Use `history_search` with a case-sensitive literal `query`, then use the returned `entryId` with `history_read`. Search results identify the source role, committed window, execution status, match position, stable reference, and `nextCursor`. `history_read` returns bounded text with `offset`, `length`, and `nextOffset` pagination.
 
-```bash
-mkdir -p ~/.pi/agent/extensions
-cp src/dp-compact.ts ~/.pi/agent/extensions/
-```
+Queries and reads stay on the current session branch. Window and role filters narrow the result set. Image payloads return metadata and stable references so encoded data stays out of text output.
 
-### Disable Built-in Auto-Compact
+## Configuration and budgets
 
-After installing, disable pi's built-in auto-compact (in `~/.pi/agent/settings.json` or project `.pi/settings.json`):
+All seven extension settings use the `LEDGER_CONTEXT_` namespace. Every configured value is a positive integer. `LEDGER_CONTEXT_URGENT_TOKENS` must be smaller than `LEDGER_CONTEXT_REMINDER_TOKENS`.
 
-```json
-{
-  "compaction": {
-    "enabled": false,
-    "reserveTokens": 16384,
-    "keepRecentTokens": 20000
-  }
-}
-```
+The urgent default uses the default soft threshold; set both overrides together when a custom soft threshold needs a matching urgent threshold.
 
-Then launch pi — the extension loads automatically.
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `LEDGER_CONTEXT_REMINDER_TOKENS` | `max(2, floor(min(window × 0.20, 32768)))` | Remaining token budget for the soft reminder |
+| `LEDGER_CONTEXT_URGENT_TOKENS` | `max(1, min(default soft threshold − 1, floor(min(window × 0.10, 16384))))` | Remaining token budget for the urgent reminder |
+| `LEDGER_CONTEXT_LEDGER_TOKENS` | `4096` | Estimated token limit for a saved ledger |
+| `LEDGER_CONTEXT_TASK_TOKENS` | `4096` | Estimated token limit for task and request recovery text |
+| `LEDGER_CONTEXT_TAIL_TOKENS` | `4096` | Estimated token limit for recent interaction display |
+| `LEDGER_CONTEXT_READ_TOKENS` | `2048` | Estimated token limit for one history tool result |
+| `LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS` | `max(1, floor(min(window × 0.10, 16384)))` | Output space reserved in each conservative request budget |
 
-## Usage
+Each request budget includes the actual system prompt, active tool schemas and prompt guidelines, model metadata, selected recovery content, and output reserve. Ledger input also has a fixed `65,536` UTF-8 byte limit and accepts at most `8` active request references. History search accepts queries up to `8,192` bytes, identifiers up to `1,024` characters, `100` results per page, and reads up to `65,536` characters per request.
 
-- **Auto-trigger**: After each `agent_end`, the extension checks context usage. When it crosses `CHECK_THRESHOLD` (default 60%), it triggers compaction, but the DP model inside `session_before_compact` decides whether to actually execute.
-- **Manual trigger**: You can still use `/compact [instructions]` manually.
-- **Check status**: `/dp-status` shows current DP parameters and session statistics.
-- **Evaluate decision**: `/dp-eval` runs the DP evaluation immediately, showing whether compaction is worthwhile and the optimal keep count.
+Unknown provider usage is reported as unknown and estimated from visible content. The estimate remains bounded by the model window. A tiny model window enters the explicit capacity error path when fixed context and minimum recovery metadata cannot fit; `ctx.abort()` stops the active request.
 
-## Parameter Tuning
+## Recovery states
 
-Adjust DP parameters via environment variables:
-
-| Environment Variable | Default | Description |
-|----------------------|---------|-------------|
-| `DP_P_INPUT` | 3.0 | Uncached input price ($/MTok) |
-| `DP_P_CACHE` | 0.3 | Cached input price ($/MTok) |
-| `DP_P_OUT` | 15.0 | Output price ($/MTok) |
-| `DP_V` | 5000 | Fixed prefix tokens (system prompt, tools, etc.) |
-| `DP_S` | 500 | Estimated summary output tokens |
-| `DP_L` | 0 | Requests per turn used to estimate future requests (auto-estimated when 0) |
-| `DP_BASELINE_E` | 8 | Baseline for estimated remaining user turns |
-| `DP_E_FIXED` | 0 | Fixed E (skips dynamic estimation when > 0) |
-| `DP_R` | 0.8 | Single-summary information retention rate |
-| `DP_BETA` | 0.03 | Information distortion penalty coefficient |
-| `DP_QUALITY_PENALTY` | 0.2 | Long-context quality decay penalty coefficient |
-| `DP_MIN_KEEP_RATIO` | 0.12 | Minimum keep ratio for candidate messages |
-| `DP_FORCE_THRESHOLD` | 0.9 | Force compaction when context usage exceeds this |
-| `DP_CHECK_THRESHOLD` | 0.6 | Auto-check threshold — evaluate DP when usage exceeds this |
-
-Example:
-
-```bash
-export DP_P_INPUT=2.0
-export DP_P_CACHE=0.2
-export DP_FORCE_THRESHOLD=0.85
-pi
-```
-
-## File Structure
-
-```
-src/
-└── dp-compact.ts    # Main extension file
-```
+- A missing or stale checkpoint behind newer work produces a bootstrap with an explicit recovery range and history references. The model can search and read the complete current branch before continuing side effects.
+- A normal compaction cancellation or invalid checkpoint input preserves the previous valid window and checkpoint.
+- A persistent session log write failure stops the current run and future saves or compactions. Reopen the persisted file with a fresh public `SessionManager`; a normal extension reload keeps the failed in-memory branch and does not provide recovery.
+- Fork, tree, resume, reload, new session, and model changes rebuild state from the selected branch. Each branch keeps its own ledger and window records.

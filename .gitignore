@@ -4,6 +4,9 @@ node_modules/
 # pi runtime
 .pi/goal-monitor/
 
+# Local planning notes
+.scratch/
+
 # OS
 .DS_Store
 
