@@ -63,7 +63,8 @@ const historyReadParameters = Type.Object({
 });
 
 const historySearchParameters = Type.Object({
-	query: Type.String({ minLength: 1, description: "Case-sensitive literal text to find." }),
+	query: Type.String({ minLength: 1, description: "Literal text to find, ignoring case by default." }),
+	caseSensitive: Type.Optional(Type.Boolean({ description: "Match letter case exactly; defaults to false." })),
 	scope: Type.Optional(
 		Type.Union([Type.Literal("conversation"), Type.Literal("tools"), Type.Literal("all")]),
 	),
@@ -1771,8 +1772,8 @@ interface HistoryCursor {
 	filterKey: string;
 }
 
-function historySearchFilterKey(query: string, scope: HistoryScope, windowId: string | null, role: string | null): string {
-	return createHash("sha256").update(JSON.stringify({ query, scope, windowId, role }), "utf8").digest("hex");
+function historySearchFilterKey(query: string, scope: HistoryScope, windowId: string | null, role: string | null, caseSensitive: boolean): string {
+	return createHash("sha256").update(JSON.stringify({ query, scope, windowId, role, caseSensitive }), "utf8").digest("hex");
 }
 
 function encodeHistoryCursor(
@@ -1782,8 +1783,9 @@ function encodeHistoryCursor(
 	scope: HistoryScope,
 	windowId: string | null,
 	role: string | null,
+	caseSensitive: boolean,
 ): string {
-	return JSON.stringify({ version: 2, after, through, filterKey: historySearchFilterKey(query, scope, windowId, role) });
+	return JSON.stringify({ version: 2, after, through, filterKey: historySearchFilterKey(query, scope, windowId, role, caseSensitive) });
 }
 
 function decodeHistoryCursor(value: string): HistoryCursor {
@@ -2066,6 +2068,13 @@ function historySearchResult(params: HistorySearchParameters, ctx: ExtensionCont
 	if (params.scope !== undefined && !isHistoryScope(params.scope)) {
 		throw historyValidationError("scope must be conversation, tools, or all");
 	}
+	if (params.caseSensitive !== undefined && typeof params.caseSensitive !== "boolean") {
+		throw historyValidationError("caseSensitive must be a boolean");
+	}
+	const caseSensitive = params.caseSensitive ?? false;
+	const literalPattern = params.query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const insensitiveQuery = new RegExp(literalPattern, "iu");
+	const searchHeading = `History search: ${JSON.stringify(displayedHistoryQuery(params.query))} (${caseSensitive ? "case-sensitive" : "case-insensitive"} literal)`;
 	const scope: HistoryScope = params.scope ?? "conversation";
 	if (params.windowId !== undefined && (typeof params.windowId !== "string" || params.windowId.length === 0)) {
 		throw historyValidationError("windowId must be a non-empty string");
@@ -2090,9 +2099,9 @@ function historySearchResult(params: HistorySearchParameters, ctx: ExtensionCont
 	let afterIndex: number | undefined;
 	if (params.cursor !== undefined) {
 		const cursor = decodeHistoryCursor(params.cursor);
-		const filterKey = historySearchFilterKey(params.query, scope, params.windowId ?? null, params.role ?? null);
+		const filterKey = historySearchFilterKey(params.query, scope, params.windowId ?? null, params.role ?? null, caseSensitive);
 		if (cursor.filterKey !== filterKey) {
-			throw historyCursorError("cursor filters do not match the original query, scope, role, or window");
+			throw historyCursorError("cursor filters do not match the original query, caseSensitive, scope, role, or window");
 		}
 		snapshotThrough = cursor.through;
 		if (cursor.through === null) {
@@ -2113,24 +2122,27 @@ function historySearchResult(params: HistorySearchParameters, ctx: ExtensionCont
 
 	const tokenLimit = historyReadTokenLimit();
 	const limit = params.limit ?? 20;
-	const candidates: Array<{ view: HistoryEntryView; index: number; text: string }> = [];
+	const candidates: Array<{ view: HistoryEntryView; index: number; text: string; matchOffset: number }> = [];
 	for (let index = Math.min(snapshotEndIndex, branchEntries.length - 1); index >= 0; index--) {
 		if (afterIndex !== undefined && index >= afterIndex) continue;
 		const entry = branchEntries[index];
 		const role = historyRole(entry);
 		if ((params.windowId !== undefined && windowIds[index] !== params.windowId) || (params.role !== undefined && role !== params.role)) continue;
 		const text = historySearchText(entry, scope);
-		if (text === undefined || text.indexOf(params.query) < 0) continue;
+		if (text === undefined) continue;
+		const matchOffset = caseSensitive ? text.indexOf(params.query) : text.search(insensitiveQuery);
+		if (matchOffset < 0) continue;
 		candidates.push({
 			view: { entry, text, role, windowId: windowIds[index], executionStatus: historyExecutionStatus(entry), payloads: imagePayloads(entry) },
 			index,
 			text,
+			matchOffset,
 		});
 	}
 	const hits: Array<Record<string, unknown>> = [];
 	const blocks: string[] = [];
 	const metadataOutput = [
-		`History search: ${JSON.stringify(displayedHistoryQuery(params.query))} (case-sensitive literal)`,
+		searchHeading,
 		`scope: ${scope}`,
 		"hits: 0",
 		"nextCursor: (none)",
@@ -2138,11 +2150,10 @@ function historySearchResult(params: HistorySearchParameters, ctx: ExtensionCont
 	const metadataTokens = estimatedOutputTokens(metadataOutput);
 	if (metadataTokens > tokenLimit) throw historyCapacityError("history_search", tokenLimit, metadataTokens);
 	for (let candidateIndex = 0; candidateIndex < Math.min(candidates.length, limit); candidateIndex++) {
-		const { view, text } = candidates[candidateIndex];
+		const { view, text, matchOffset } = candidates[candidateIndex];
 		if (text === undefined) continue;
-		const matchOffset = text.indexOf(params.query);
 		const potentialNextCursor = candidateIndex + 1 < candidates.length
-			? encodeHistoryCursor(view.entry.id, snapshotThrough, params.query, scope, params.windowId ?? null, params.role ?? null)
+			? encodeHistoryCursor(view.entry.id, snapshotThrough, params.query, scope, params.windowId ?? null, params.role ?? null, caseSensitive)
 			: null;
 		const hitPrefix = [
 			`entryId: ${view.entry.id}`,
@@ -2164,7 +2175,7 @@ function historySearchResult(params: HistorySearchParameters, ctx: ExtensionCont
 			const proposedHits = hits.length + 1;
 			const proposedBlocks = [...blocks, block];
 			const proposedOutput = [
-				`History search: ${JSON.stringify(displayedHistoryQuery(params.query))} (case-sensitive literal)`,
+				searchHeading,
 				`scope: ${scope}`,
 				`hits: ${proposedHits}`,
 				`nextCursor: ${potentialNextCursor ?? "(none)"}`,
@@ -2198,10 +2209,10 @@ function historySearchResult(params: HistorySearchParameters, ctx: ExtensionCont
 	const lastHitIndex = lastHit ? branchEntries.findIndex((entry) => entry.id === lastHit.entryId) : -1;
 	const hasMore = lastHitIndex >= 0 && candidates.some(({ index }) => index < lastHitIndex);
 	const nextCursor = hasMore && typeof lastHit?.entryId === "string"
-		? encodeHistoryCursor(lastHit.entryId, snapshotThrough, params.query, scope, params.windowId ?? null, params.role ?? null)
+		? encodeHistoryCursor(lastHit.entryId, snapshotThrough, params.query, scope, params.windowId ?? null, params.role ?? null, caseSensitive)
 		: null;
 	const output = [
-		`History search: ${JSON.stringify(displayedHistoryQuery(params.query))} (case-sensitive literal)`,
+		searchHeading,
 		`scope: ${scope}`,
 		`hits: ${hits.length}`,
 		`nextCursor: ${nextCursor ?? "(none)"}`,
@@ -2214,7 +2225,7 @@ function historySearchResult(params: HistorySearchParameters, ctx: ExtensionCont
 			schemaVersion: LEDGER_SCHEMA_VERSION,
 			query: params.query,
 			scope,
-			caseSensitive: true,
+			caseSensitive,
 			limit,
 			snapshotThrough,
 			hits,
@@ -3528,10 +3539,10 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 	pi.registerTool({
 		name: "history_search",
 		label: "History Search",
-		description: "Search the current session branch with a bounded, case-sensitive literal query and conversation, tools, or all scope; use nextCursor for more matches.",
+		description: "Search the current session branch with a bounded literal query, ignoring case by default; set caseSensitive for exact case. Use conversation, tools, or all scope and nextCursor for more matches.",
 		promptSnippet: "search current-branch history with a literal query",
 		promptGuidelines: [
-			"Search literal text by conversation, tools, or all scope; use history_read on returned IDs. Results are newest first and cursors preserve snapshot filters.",
+			"Search literal text ignoring case by default; set caseSensitive: true for exact case. Use conversation, tools, or all scope and history_read on returned IDs. Results are newest first; cursors preserve snapshot filters, including caseSensitive.",
 			"Results are limited to the current branch and include committed window, source role, execution status, and nextCursor.",
 		],
 		parameters: historySearchParameters,

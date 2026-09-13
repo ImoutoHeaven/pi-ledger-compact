@@ -20,7 +20,7 @@ pi install -l .
 The package registers these model tools:
 
 - `checkpoint` saves a complete active ledger and returns its persistence scope and handoff state.
-- `history_search` performs case-sensitive literal search on the current branch.
+- `history_search` searches literal text on the current branch, ignoring case by default; `caseSensitive: true` requires exact case.
 - `history_read` reads a bounded text slice or one selected image from a referenced current-branch entry.
 
 ## Checkpoints and recovery
@@ -62,7 +62,7 @@ Settings failures mark the native boundary as unknown and use window protection.
 
 ## History recovery
 
-`history_search` accepts a case-sensitive literal query and returns newest-first hits with bounded excerpts and `nextCursor`. Its `scope` is `conversation` by default for user and assistant text; `tools` selects ordinary tool calls and results; `all` includes every searchable entry. Window and role filters narrow the current branch. Cursors preserve the original snapshot and filters across later activity; an invalid cursor returns an error with instructions to search again.
+`history_search` searches literal substrings, ignoring case by default. Set `caseSensitive: true` for exact case. It returns newest-first hits with bounded excerpts and `nextCursor`; snippets preserve the original text and offsets. Its `scope` is `conversation` by default for user and assistant text; `tools` selects ordinary tool calls and results; `all` includes every searchable entry. Window and role filters narrow the current branch. Cursors preserve the original snapshot and filters, including `caseSensitive`, across later activity; an invalid cursor returns an error with instructions to search again.
 
 `history_read` accepts `offset` and `length` for bounded text pagination and returns `nextOffset` when more text remains. Offsets and lengths use UTF-16 code units. Results identify the source role, window, execution status, entry reference, and payload references. The session log preserves the complete original entries.
 

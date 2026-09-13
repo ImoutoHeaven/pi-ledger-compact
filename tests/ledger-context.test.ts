@@ -3064,6 +3064,55 @@ test("fresh history searches use the latest repeated tool call ID", { timeout: T
 	}
 });
 
+test("history_search ignores case by default, preserves literal offsets and binds cursor case mode", { timeout: TEST_TIMEOUT_MS }, async () => {
+	const { root, faux, session, sessionManager } = await createFixture(false);
+	try {
+		const originals = ["İ Timeout [A+B].", "second TIMEOUT [A+B].", "third timeout [a+b]."];
+		const ids = originals.map((content) => sessionManager.appendMessage({ role: "user", content, timestamp: Date.now() }));
+		sessionManager.appendMessage({ role: "user", content: "AABx is not the bracketed literal.", timestamp: Date.now() });
+		const search = async (params: Record<string, unknown>) => {
+			faux.setResponses([fauxAssistantMessage(fauxToolCall("history_search", { role: "user", ...params })), fauxAssistantMessage("done")]);
+			await session.prompt("Run the history lookup.");
+			const result = messageEntries(sessionManager.getBranch()).filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_search").at(-1)!;
+			assert.ok(result);
+			assertHistoryOutputWithinTokens(result);
+			return {
+				text: toolResultText(result),
+				isError: result.message.role === "toolResult" && result.message.isError,
+				details: (result.message as { details: { caseSensitive: boolean; hits: Array<{ entryId: string; matchOffset: number; snippet: string }>; nextCursor: string | null } }).details,
+			};
+		};
+		const first = await search({ query: "timeout", limit: 1 });
+		assert.equal(first.isError, false);
+		assert.equal(first.details.caseSensitive, false);
+		assert.deepEqual(first.details.hits.map((hit) => hit.entryId), [ids[2]]);
+		assert.ok(first.details.nextCursor);
+		assert.match(first.text, /case-insensitive literal/);
+		sessionManager.appendMessage({ role: "user", content: "late TIMEOUT", timestamp: Date.now() });
+		const next = await search({ query: "timeout", caseSensitive: false, limit: 1, cursor: first.details.nextCursor });
+		assert.deepEqual(next.details.hits.map((hit) => hit.entryId), [ids[1]]);
+		const mismatch = await search({ query: "timeout", caseSensitive: true, cursor: first.details.nextCursor });
+		assert.equal(mismatch.isError, true);
+		assert.match(mismatch.text, /history_cursor_invalid/);
+		const strict = await search({ query: "Timeout", caseSensitive: true });
+		assert.equal(strict.details.caseSensitive, true);
+		assert.deepEqual(strict.details.hits.map((hit) => hit.entryId), [ids[0]]);
+		assert.match(strict.text, /case-sensitive literal/);
+		const literal = await search({ query: "[A+B]." });
+		assert.deepEqual(literal.details.hits.map((hit) => hit.entryId), [...ids].reverse());
+		assert.equal((await search({ query: ".*" })).details.hits.length, 0);
+		const unicode = await search({ query: "TIMEOUT" });
+		const originalHit = unicode.details.hits.find((hit) => hit.entryId === ids[0]);
+		assert.ok(originalHit);
+		assert.equal(originalHit.matchOffset, originals[0].indexOf("Timeout"));
+		assert.match(originalHit.snippet, /İ Timeout/);
+		assert.equal((await search({ query: "timeout", caseSensitive: "yes" })).isError, true);
+	} finally {
+		session.dispose();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test("history_search scopes conversation, tools, and all views with newest results", { timeout: TEST_TIMEOUT_MS }, async () => {
 	const { root, faux, session, sessionManager } = await createFixture(false);
 	try {

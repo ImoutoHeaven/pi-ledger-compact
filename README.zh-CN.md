@@ -20,7 +20,7 @@ pi install -l .
 包注册以下模型工具：
 
 - `checkpoint` 保存完整工作账本，并回报持久化范围和交接状态。
-- `history_search` 在当前分支执行区分大小写的字面搜索。
+- `history_search` 在当前分支执行字面搜索，默认忽略大小写；`caseSensitive: true` 要求大小写一致。
 - `history_read` 读取当前分支指定条目的有界正文，或选取一个图像。
 
 ## 检查点与恢复
@@ -62,7 +62,7 @@ const ledgerExtension = createLedgerContext({
 
 ## 历史恢复
 
-`history_search` 接受区分大小写的字面查询，按从新到旧的顺序返回带有界摘录和 `nextCursor` 的结果。`scope` 默认为 `conversation`，搜索用户和助手正文；`tools` 搜索普通工具调用和结果；`all` 包含所有可搜索条目。窗口和角色过滤器可进一步限定当前分支中的搜索范围。游标在后续活动中保留原始快照和过滤条件；无效游标会返回错误及重新搜索指引。
+`history_search` 搜索连续的字面子串，默认忽略大小写；设置 `caseSensitive: true` 时要求大小写一致。结果按从新到旧排列，包含有界摘录和 `nextCursor`，摘录保留原文及其偏移。`scope` 默认为 `conversation`，搜索用户和助手正文；`tools` 搜索普通工具调用和结果；`all` 包含所有可搜索条目。窗口和角色过滤器可进一步限定当前分支中的搜索范围。游标在后续活动中保留原始快照和过滤条件，包括 `caseSensitive`；无效游标会返回错误及重新搜索指引。
 
 `history_read` 接受 `offset` 和 `length` 对正文分页，在仍有后续内容时返回 `nextOffset`。偏移和长度均以 UTF-16 代码单元计量。结果包含来源角色、窗口、执行状态、条目引用和载荷引用。会话日志保留完整原始条目。
 
