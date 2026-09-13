@@ -604,8 +604,8 @@ test("runtime lifecycle restores forked, switched, tree, and model state", { tim
 			(entry): entry is Extract<SessionEntry, { type: "custom" }> =>
 				entry.type === "custom" && entry.customType === "ledger-context/reminder-handoff",
 		);
-		assert.equal(reloadHandoffs.length, 1);
-		assert.deepEqual(newManager.getBranch().filter((entry) => entry.id !== reloadHandoffs[0].id).map((entry) => entry.id), newBranchBeforeReload);
+		assert.equal(reloadHandoffs.length, 0);
+		assert.deepEqual(newManager.getBranch().map((entry) => entry.id), newBranchBeforeReload);
 		await runtime.switchSession(mainFile);
 		assert.equal(runtime.session.sessionManager.getSessionFile(), mainFile);
 	} finally {
@@ -1801,7 +1801,7 @@ test("ordinary thinking volume includes mixed work and excludes maintenance-only
 	}
 });
 
-test("external runs receive one settled reminder while extension work stays internal", { timeout: TEST_TIMEOUT_MS }, async () => {
+test("short prompts stay silent and deferred volume reminders reach the next normal request", { timeout: TEST_TIMEOUT_MS }, async () => {
 	const previousTailLimit = process.env.LEDGER_CONTEXT_TAIL_TOKENS;
 	const previousSoft = process.env.LEDGER_CONTEXT_REMINDER_TOKENS;
 	const previousUrgent = process.env.LEDGER_CONTEXT_URGENT_TOKENS;
@@ -1840,13 +1840,7 @@ test("external runs receive one settled reminder while extension work stays inte
 			(entry): entry is Extract<SessionEntry, { type: "custom_message" }> =>
 				entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE,
 		);
-		assert.equal(remindersAfterSecond.length, 1);
-		const externalReminderCountBeforeExtension = remindersAfterSecond.filter((entry) =>
-			(entry.details as { reasonKinds?: string[] }).reasonKinds?.includes("external-run"),
-		).length;
-		assert.equal(externalReminderCountBeforeExtension, 1);
-		assert.match(JSON.stringify(remindersAfterSecond[0].details), /external-run/);
-		assert.match(JSON.stringify(secondContext.messages), /cause: external run/);
+		assert.equal(remindersAfterSecond.length, 0);
 		faux.setResponses([
 			fauxAssistantMessage(fauxToolCall("extension_probe", {}, { id: "extension-probe-call" }), { stopReason: "toolUse" }),
 			fauxAssistantMessage("extension initiated work completed"),
@@ -1856,9 +1850,19 @@ test("external runs receive one settled reminder while extension work stays inte
 			(entry): entry is Extract<SessionEntry, { type: "custom_message" }> =>
 				entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE,
 		);
-		assert.equal(remindersAfterExtension.filter((entry) =>
-			(entry.details as { reasonKinds?: string[] }).reasonKinds?.includes("external-run"),
-		).length, externalReminderCountBeforeExtension);
+		assert.equal(remindersAfterExtension.length, 0);
+		faux.setResponses([fauxAssistantMessage("Evidence: " + "v".repeat(13_000))]);
+		await session.prompt("Produce substantial evidence.");
+		assert.equal(sessionManager.getBranch().filter((entry) => entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE).length, 0);
+		await session.reload();
+		let nextContext: Context | undefined;
+		faux.setResponses([(context) => { nextContext = context; return fauxAssistantMessage("continued"); }]);
+		await session.prompt("Continue after the evidence.");
+		assert.ok(nextContext);
+		assert.match(JSON.stringify(nextContext.messages), /stale-volume/);
+		const notices = sessionManager.getBranch().filter((entry) => entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE);
+		assert.equal(notices.length, 1);
+		assert.equal(sessionManager.getBranch().filter((entry) => entry.type === "custom" && entry.customType === "ledger-context/external-run").length, 0);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 		if (previousTailLimit === undefined) delete process.env.LEDGER_CONTEXT_TAIL_TOKENS;
@@ -1870,7 +1874,7 @@ test("external runs receive one settled reminder while extension work stays inte
 	}
 });
 
-test("external provenance survives compaction reload while extension work stays internal", { timeout: TEST_TIMEOUT_MS }, async () => {
+test("short runs remain below reminder thresholds across compaction and reopen", { timeout: TEST_TIMEOUT_MS }, async () => {
 	const previousSoft = process.env.LEDGER_CONTEXT_REMINDER_TOKENS;
 	const previousUrgent = process.env.LEDGER_CONTEXT_URGENT_TOKENS;
 	process.env.LEDGER_CONTEXT_REMINDER_TOKENS = "100";
@@ -1890,7 +1894,7 @@ test("external provenance survives compaction reload while extension work stays 
 		faux.setResponses([fauxAssistantMessage("real external run")]);
 		await session.prompt("real external input");
 		const runRecords = sessionManager.getBranch().filter((entry) => entry.type === "custom" && entry.customType === "ledger-context/external-run");
-		assert.equal(runRecords.length, 1);
+		assert.equal(runRecords.length, 0);
 		sessionManager.appendMessage({ role: "user", content: "manual compaction payload " + "m".repeat(8_000), timestamp: Date.now() });
 		await session.compact();
 		const compaction = sessionManager.getBranch().filter((entry) => entry.type === "compaction").at(-1);
@@ -1901,19 +1905,17 @@ test("external provenance survives compaction reload while extension work stays 
 			let resumedContext: Context | undefined;
 			faux.setResponses([(context) => {
 				resumedContext = context;
-				return fauxAssistantMessage("reload received old-window reminder");
+				return fauxAssistantMessage("reopened below reminder thresholds");
 			}]);
 			await reopened.session.prompt("next external input after reload");
 			assert.ok(resumedContext);
 			const providerText = JSON.stringify(resumedContext.messages);
-			assert.match(providerText, new RegExp("window: " + oldWindowId));
-			assert.match(providerText, /external run/);
+			assert.doesNotMatch(providerText, /completed external run has nonmaintenance work/);
 			const reminders = reopened.sessionManager.getBranch().filter(
 				(entry): entry is Extract<SessionEntry, { type: "custom_message" }> =>
 					entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE,
 			);
-			assert.equal(reminders.length, 1);
-			assert.ok((reminders[0].details as { reasonKinds?: string[] }).reasonKinds?.includes("external-run"));
+			assert.equal(reminders.length, 0);
 		} finally {
 			reopened.session.dispose();
 		}
@@ -1926,7 +1928,7 @@ test("external provenance survives compaction reload while extension work stays 
 	}
 });
 
-test("reload handoff preserves an active external run through settlement", { timeout: 10_000 }, async () => {
+test("reload handoff preserves pending volume reminders during active tool work", { timeout: 10_000 }, async () => {
 	const previousSoft = process.env.LEDGER_CONTEXT_REMINDER_TOKENS;
 	const previousUrgent = process.env.LEDGER_CONTEXT_URGENT_TOKENS;
 	process.env.LEDGER_CONTEXT_REMINDER_TOKENS = "100";
@@ -1962,11 +1964,13 @@ test("reload handoff preserves an active external run through settlement", { tim
 	});
 	try {
 		const { faux, session, sessionManager } = fixture;
+		faux.setResponses([fauxAssistantMessage("Evidence: " + "v".repeat(13_000))]);
+		await session.prompt("Produce substantial evidence before background work.");
 		faux.setResponses([
 			fauxAssistantMessage(fauxToolCall("reload_gate", {}, { id: "reload-gate-call" }), { stopReason: "toolUse" }),
 			fauxAssistantMessage("active run settled after reload"),
 		]);
-		const runPromise = session.prompt("reload while the external run is active");
+		const runPromise = session.sendUserMessage("reload while background tool work is active");
 		await toolStartedPromise;
 		await session.reload();
 		const handoffs = sessionManager.getBranch().filter(
@@ -1979,26 +1983,23 @@ test("reload handoff preserves an active external run through settlement", { tim
 		const records = sessionManager.getBranch().filter(
 			(entry) => entry.type === "custom" && entry.customType === "ledger-context/external-run",
 		);
-		assert.equal(records.length, 1);
-		const handoff = handoffs[0].data as { externalRun?: { startPosition?: unknown; checkpointEntryId?: string | null; windowId?: string } };
-		assert.ok(handoff.externalRun?.startPosition);
-		assert.equal(handoff.externalRun?.checkpointEntryId, null);
-		assert.equal(typeof handoff.externalRun?.windowId, "string");
+		assert.equal(records.length, 0);
+		const handoff = handoffs[0].data as { pendingReminderReasons: Array<{ kind: string }> };
+		assert.ok(handoff.pendingReminderReasons.some((reason) => reason.kind === "stale-volume"));
+		assert.equal(sessionManager.getBranch().filter((entry) => entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE).length, 1);
 		await session.reload();
 		const pendingHandoffs = sessionManager.getBranch().filter(
 			(entry): entry is Extract<SessionEntry, { type: "custom" }> =>
 				entry.type === "custom" && entry.customType === "ledger-context/reminder-handoff",
 		);
-		assert.equal(pendingHandoffs.length, 2);
-		const pendingHandoff = pendingHandoffs.at(-1)!.data as { pendingReminderReasons?: unknown[] };
-		assert.ok((pendingHandoff.pendingReminderReasons?.length ?? 0) > 0);
+		assert.equal(pendingHandoffs.length, 1);
 		await session.setModel(faux.getModel());
 		faux.setResponses([
 			fauxAssistantMessage(fauxToolCall("reload_gate", {}, { id: "extension-after-model-call" }), { stopReason: "toolUse" }),
 			fauxAssistantMessage("extension-origin work after model selection"),
 		]);
 		await session.sendUserMessage("extension-origin work after model selection");
-		assert.equal(sessionManager.getBranch().filter((entry) => entry.type === "custom" && entry.customType === "ledger-context/external-run").length, 1);
+		assert.equal(sessionManager.getBranch().filter((entry) => entry.type === "custom" && entry.customType === "ledger-context/external-run").length, 0);
 		let nextExternalContext: Context | undefined;
 		faux.setResponses([(context) => {
 			nextExternalContext = context;
@@ -2006,7 +2007,7 @@ test("reload handoff preserves an active external run through settlement", { tim
 		}]);
 		await session.prompt("next external run after reload handoff");
 		assert.ok(nextExternalContext);
-		assert.match(JSON.stringify(nextExternalContext.messages), /external run/);
+		assert.equal(sessionManager.getBranch().filter((entry) => entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE).length, 1);
 	} finally {
 		rmSync(fixture.root, { recursive: true, force: true });
 		if (previousSoft === undefined) delete process.env.LEDGER_CONTEXT_REMINDER_TOKENS;

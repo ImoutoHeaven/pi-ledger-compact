@@ -22,7 +22,6 @@ export const DEFAULT_LEDGER_TOKEN_LIMIT = 4_096;
 export const DEFAULT_HISTORY_READ_TOKEN_LIMIT = 2_048;
 export const DEFAULT_OUTPUT_RESERVE_TOKEN_LIMIT = 16_384;
 export const REMINDER_MESSAGE_TYPE = "ledger-context/reminder";
-export const EXTERNAL_RUN_ENTRY_TYPE = "ledger-context/external-run";
 export const REMINDER_HANDOFF_ENTRY_TYPE = "ledger-context/reminder-handoff";
 export const DEFAULT_SOFT_REMINDER_TOKEN_LIMIT = 32_768;
 export const DEFAULT_URGENT_REMINDER_TOKEN_LIMIT = 16_384;
@@ -113,7 +112,7 @@ interface NativeCompactionSettings {
 	error?: "settings-read-failed" | "settings-reader-failed" | "settings-missing" | "settings-invalid";
 }
 
-type ReminderReasonKind = "budget" | "stale-volume" | "external-run";
+type ReminderReasonKind = "budget" | "stale-volume";
 
 interface ReminderReason {
 	key: string;
@@ -126,31 +125,11 @@ interface ReminderReason {
 	cause: string;
 }
 
-interface ExternalRunState {
-	startPosition: RequestHistoryPosition;
-	checkpointEntryId: string | null;
-	windowId: string;
-}
-
-interface ExternalRunRecord {
-	schemaVersion: typeof LEDGER_SCHEMA_VERSION;
-	kind: typeof EXTERNAL_RUN_ENTRY_TYPE;
-	runKey: string;
-	windowId: string;
-	checkpointEntryId: string | null;
-	fromEntryId: string | null;
-	toEntryId: string | null;
-	userEntryId: string;
-	assistantEntryId: string | null;
-	settledEntryId: string;
-}
-
 interface ReminderHandoffRecord {
 	schemaVersion: typeof LEDGER_SCHEMA_VERSION;
 	kind: typeof REMINDER_HANDOFF_ENTRY_TYPE;
 	pendingReminderReasons: ReminderReason[];
 	queuedReminderReasons: ReminderReason[];
-	externalRun?: ExternalRunState;
 }
 
 interface ContentBudgets {
@@ -281,9 +260,7 @@ interface SessionState {
 	deliveredReminderKeys: Set<string>;
 	queuedReminderKeys: Set<string>;
 	pendingReminderReasons: ReminderReason[];
-	pendingExternalInput: boolean;
-	externalRun?: ExternalRunState;
-	pendingExternalRunReason?: ReminderReason;
+	pendingNormalInput: boolean;
 	lastAgentStopReason?: string;
 }
 
@@ -497,7 +474,7 @@ function reminderText(
 ): string {
 	const usageText = usage.usageKnown ? `${usage.tokens} Pi effective usage` : `${usage.tokens} bounded content estimate`;
 	const causes = reasons.length > 0
-		? reasons.map((reason) => reason.kind === "stale-volume" ? reason.cause : reason.kind === "external-run" ? "external run" : `${reason.level} budget`).join("+")
+		? reasons.map((reason) => reason.kind === "stale-volume" ? reason.cause : `${reason.level} budget`).join("+")
 		: "budget";
 	const scopedReasons = reasons.filter((reason) => reason.windowId === windowId);
 	const referenceReasons = scopedReasons.length > 0 ? scopedReasons : reasons;
@@ -511,9 +488,7 @@ function reminderText(
 	const native = usage.nativeBoundaryMode === "native" ? "known" : usage.nativeBoundaryMode === "disabled" ? "disabled (window protection)" : "unknown (window protection)";
 	const noticeLabel = reasons.some((reason) => reason.kind === "budget")
 		? `${level} budget`
-		: reasons.some((reason) => reason.kind === "stale-volume")
-			? "stale-volume"
-			: "external-run";
+		: "stale-volume";
 	return [
 		`Ledger Context ${noticeLabel} reminder.`,
 		`window: ${windowId}; usage window: ${usageWindowId}; reason windows: ${reasonWindows}`,
@@ -575,7 +550,6 @@ function reminderDetails(
 
 interface VolumeMeasurement {
 	tokens: number;
-	entryCount: number;
 	fromEntryId: string | null;
 	toEntryId: string | null;
 }
@@ -605,18 +579,16 @@ function volumeMessagesForEntry(entry: SessionEntry): ContextMessage[] {
 
 function volumeMeasurement(entries: SessionEntry[], startIndex: number): VolumeMeasurement {
 	let tokens = 0;
-	let entryCount = 0;
 	let fromEntryId: string | null = null;
 	let toEntryId: string | null = null;
 	for (let index = Math.max(0, startIndex); index < entries.length; index++) {
 		const messages = volumeMessagesForEntry(entries[index]);
 		if (messages.length === 0) continue;
-		entryCount++;
 		tokens += estimateMessageTokens(messages);
 		fromEntryId ??= entries[index].id;
 		toEntryId = entries[index].id;
 	}
-	return { tokens, entryCount, fromEntryId, toEntryId };
+	return { tokens, fromEntryId, toEntryId };
 }
 
 function positionStartIndex(entries: SessionEntry[], position: RequestHistoryPosition | null): number {
@@ -653,7 +625,7 @@ function isReminderReason(value: unknown): value is ReminderReason {
 	return (
 		typeof input.key === "string" &&
 		input.key.length > 0 &&
-		(input.kind === "budget" || input.kind === "stale-volume" || input.kind === "external-run") &&
+		(input.kind === "budget" || input.kind === "stale-volume") &&
 		(input.level === undefined || input.level === "soft" || input.level === "urgent") &&
 		typeof input.windowId === "string" &&
 		input.windowId.length > 0 &&
@@ -686,7 +658,7 @@ function isReminderDetails(value: unknown): value is ReminderDetails {
 		input.remainingTokens < 0 ||
 		typeof input.usageKnown !== "boolean" ||
 		(input.reasonKeys !== undefined && (!Array.isArray(input.reasonKeys) || input.reasonKeys.some((key) => typeof key !== "string"))) ||
-		(input.reasonKinds !== undefined && (!Array.isArray(input.reasonKinds) || input.reasonKinds.some((kind) => kind !== "budget" && kind !== "stale-volume" && kind !== "external-run"))) ||
+		(input.reasonKinds !== undefined && (!Array.isArray(input.reasonKinds) || input.reasonKinds.some((kind) => kind !== "budget" && kind !== "stale-volume"))) ||
 		(input.reasonWindows !== undefined && (!Array.isArray(input.reasonWindows) || input.reasonWindows.some((window) => typeof window !== "string"))) ||
 		(input.usageWindowId !== undefined && (typeof input.usageWindowId !== "string" || input.usageWindowId.length === 0)) ||
 		(input.reasonDetails !== undefined && (!Array.isArray(input.reasonDetails) || input.reasonDetails.some((reason) => !isReminderReason(reason))))
@@ -694,39 +666,6 @@ function isReminderDetails(value: unknown): value is ReminderDetails {
 		return false;
 	}
 	return true;
-}
-
-function isExternalRunRecord(value: unknown): value is ExternalRunRecord {
-	if (!value || typeof value !== "object") return false;
-	const input = value as Record<string, unknown>;
-	return (
-		input.schemaVersion === LEDGER_SCHEMA_VERSION &&
-		input.kind === EXTERNAL_RUN_ENTRY_TYPE &&
-		typeof input.runKey === "string" &&
-		input.runKey.length > 0 &&
-		typeof input.windowId === "string" &&
-		input.windowId.length > 0 &&
-		(input.checkpointEntryId === null || typeof input.checkpointEntryId === "string") &&
-		(input.fromEntryId === null || typeof input.fromEntryId === "string") &&
-		(input.toEntryId === null || typeof input.toEntryId === "string") &&
-		typeof input.userEntryId === "string" &&
-		input.userEntryId.length > 0 &&
-		(input.assistantEntryId === null || typeof input.assistantEntryId === "string") &&
-		(input.assistantEntryId === null || input.assistantEntryId.length > 0) &&
-		typeof input.settledEntryId === "string" &&
-		input.settledEntryId.length > 0
-	);
-}
-
-function isExternalRunState(value: unknown): value is ExternalRunState {
-	if (!value || typeof value !== "object") return false;
-	const input = value as Record<string, unknown>;
-	return (
-		parseRequestPosition(input.startPosition) !== undefined &&
-		(input.checkpointEntryId === null || typeof input.checkpointEntryId === "string") &&
-		typeof input.windowId === "string" &&
-		input.windowId.length > 0
-	);
 }
 
 function isReminderHandoffRecord(value: unknown): value is ReminderHandoffRecord {
@@ -740,89 +679,8 @@ function isReminderHandoffRecord(value: unknown): value is ReminderHandoffRecord
 		input.pendingReminderReasons.every(isReminderReason) &&
 		Array.isArray(input.queuedReminderReasons) &&
 		input.queuedReminderReasons.length <= 256 &&
-		input.queuedReminderReasons.every(isReminderReason) &&
-		(input.externalRun === undefined || isExternalRunState(input.externalRun))
+		input.queuedReminderReasons.every(isReminderReason)
 	);
-}
-
-function latestExternalRunRecord(
-	state: SessionState,
-	entries: SessionEntry[],
-): { record: ExternalRunRecord; index: number } | undefined {
-	const checkpointIndex = state.checkpoint ? entries.findIndex((entry) => entry.id === state.checkpoint!.entryId) : -1;
-	for (let index = entries.length - 1; index >= 0; index--) {
-		const entry = entries[index];
-		if (entry.type !== "custom" || entry.customType !== EXTERNAL_RUN_ENTRY_TYPE || !isExternalRunRecord(entry.data)) continue;
-		if (checkpointIndex >= 0 && index <= checkpointIndex) continue;
-		return { record: entry.data, index };
-	}
-	return undefined;
-}
-
-function externalRunReason(record: ExternalRunRecord): ReminderReason {
-	return {
-		key: `${record.windowId}:external-run:${record.runKey}`,
-		kind: "external-run",
-		windowId: record.windowId,
-		checkpointEntryId: record.checkpointEntryId,
-		fromEntryId: record.fromEntryId,
-		toEntryId: record.toEntryId,
-		cause: "completed external run has nonmaintenance work without a checkpoint update",
-	};
-}
-
-function externalRunRecordForState(state: SessionState, entries: SessionEntry[]): ExternalRunRecord | undefined {
-	const run = state.externalRun;
-	if (!run || (state.checkpoint?.entryId ?? null) !== run.checkpointEntryId) return undefined;
-	const startIndex = positionStartIndex(entries, run.startPosition);
-	const runEntries = entries.slice(startIndex);
-	const user = runEntries.find(isUserEntry);
-	if (!user) return undefined;
-	const assistant = [...runEntries].reverse().find((entry) => entryMessage(entry)?.role === "assistant");
-	const settledEntry = entries.at(-1);
-	if (!settledEntry) return undefined;
-	const metric = volumeMeasurement(entries, startIndex);
-	if (metric.entryCount === 0) return undefined;
-	const runKey = `${run.windowId}:${user.id}:${settledEntry.id}:${run.startPosition.entryId ?? "none"}:${run.startPosition.branchDepth}`;
-	return {
-		schemaVersion: LEDGER_SCHEMA_VERSION,
-		kind: EXTERNAL_RUN_ENTRY_TYPE,
-		runKey,
-		windowId: run.windowId,
-		checkpointEntryId: run.checkpointEntryId,
-		fromEntryId: metric.fromEntryId,
-		toEntryId: metric.toEntryId,
-		userEntryId: user.id,
-		assistantEntryId: assistant?.id ?? null,
-		settledEntryId: settledEntry.id,
-	};
-}
-
-function appendExternalRunRecord(
-	pi: ExtensionAPI,
-	ctx: ExtensionContext,
-	state: SessionState,
-	record: ExternalRunRecord,
-): boolean {
-	const previousLeafId = ctx.sessionManager.getLeafId();
-	try {
-		pi.appendEntry(EXTERNAL_RUN_ENTRY_TYPE, record);
-		const entry = ctx.sessionManager.getLeafEntry();
-		if (!entry || entry.id === previousLeafId || entry.type !== "custom" || entry.customType !== EXTERNAL_RUN_ENTRY_TYPE || !isExternalRunRecord(entry.data) || JSON.stringify(entry.data) !== JSON.stringify(record)) {
-			throw new Error("pi did not expose the newly appended external-run record");
-		}
-		return true;
-	} catch (error) {
-		const reason = error instanceof Error ? error.message : String(error);
-		state.persistenceUncertain = reason;
-		try {
-			ctx.abort();
-		} catch {
-			// The host may already be finishing the run.
-		}
-		notify(ctx, "Ledger Context stopped after an external-run provenance write failure. Reopen the persisted session before continuing.", "error");
-		return false;
-	}
 }
 
 function appendReminderHandoff(
@@ -2504,7 +2362,7 @@ function createState(ctx: ExtensionContext): SessionState {
 		deliveredReminderKeys: new Set(),
 		queuedReminderKeys: new Set(),
 		pendingReminderReasons: [],
-		pendingExternalInput: false,
+		pendingNormalInput: false,
 	};
 }
 
@@ -2567,29 +2425,26 @@ function restoreReminderState(state: SessionState, entries: SessionEntry[]): voi
 	}
 }
 
-function latestReminderHandoff(state: SessionState, entries: SessionEntry[]): { record: ReminderHandoffRecord; index: number } | undefined {
+function latestReminderHandoff(state: SessionState, entries: SessionEntry[]): ReminderHandoffRecord | undefined {
 	const checkpointIndex = state.checkpoint ? entries.findIndex((entry) => entry.id === state.checkpoint!.entryId) : -1;
 	for (let index = entries.length - 1; index >= 0; index--) {
 		const entry = entries[index];
 		if (entry.type !== "custom" || entry.customType !== REMINDER_HANDOFF_ENTRY_TYPE || !isReminderHandoffRecord(entry.data)) continue;
 		if (checkpointIndex >= 0 && index <= checkpointIndex) continue;
-		return { record: entry.data, index };
+		return entry.data;
 	}
 	return undefined;
 }
 
-function restoreReminderHandoff(state: SessionState, entries: SessionEntry[], restoreActiveRun: boolean): void {
-	const latest = latestReminderHandoff(state, entries);
-	if (!latest) return;
-	const handoff = latest.record;
+function restoreReminderHandoff(state: SessionState, entries: SessionEntry[]): void {
+	const handoff = latestReminderHandoff(state, entries);
+	if (!handoff) return;
 	state.pendingReminderReasons = [...new Map(
 		[...handoff.pendingReminderReasons, ...handoff.queuedReminderReasons].map((reason) => [reason.key, reason]),
 	).values()];
 	for (const reason of handoff.queuedReminderReasons) {
 		for (const key of reminderDeliveryKeys(reason)) state.queuedReminderKeys.add(key);
 	}
-	const settledRecord = latestExternalRunRecord(state, entries);
-	if (restoreActiveRun && !state.externalRun && handoff.externalRun && (!settledRecord || settledRecord.index <= latest.index)) state.externalRun = handoff.externalRun;
 }
 
 function latestBranchCompaction(entries: SessionEntry[]): Extract<SessionEntry, { type: "compaction" }> | undefined {
@@ -2634,9 +2489,7 @@ function invalidateUncertainState(state: SessionState, ctx: ExtensionContext, re
 	state.deliveredReminderKeys.clear();
 	state.queuedReminderKeys.clear();
 	state.pendingReminderReasons = [];
-	state.pendingExternalInput = false;
-	state.externalRun = undefined;
-	state.pendingExternalRunReason = undefined;
+	state.pendingNormalInput = false;
 	state.lastAgentStopReason = undefined;
 }
 
@@ -2661,7 +2514,7 @@ function blockIfPersistenceUncertain(state: SessionState, ctx: ExtensionContext)
 	return true;
 }
 
-function hydrateState(state: SessionState, entries: SessionEntry[], ctx: ExtensionContext, restoreReminders = true, restoreActiveRun = false): void {
+function hydrateState(state: SessionState, entries: SessionEntry[], ctx: ExtensionContext, restoreReminders = true): void {
 	const checkpointEntries = entries.filter(
 		(entry): entry is Extract<SessionEntry, { type: "custom" }> =>
 			entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY_TYPE,
@@ -2703,10 +2556,8 @@ function hydrateState(state: SessionState, entries: SessionEntry[], ctx: Extensi
 	state.requestHistoryPosition = state.checkpoint?.data.requestHistoryPosition;
 	if (restoreReminders) {
 		restoreReminderState(state, entries);
-		restoreReminderHandoff(state, entries, restoreActiveRun);
+		restoreReminderHandoff(state, entries);
 	}
-	state.pendingExternalRunReason = restoreReminders ? pendingExternalRunReason(state, entries) : state.pendingExternalRunReason;
-	if (state.pendingExternalRunReason && reminderReasonKnown(state, state.pendingExternalRunReason)) state.pendingExternalRunReason = undefined;
 }
 
 function requestPositionForContext(entries: SessionEntry[]): RequestHistoryPosition {
@@ -2934,11 +2785,6 @@ function notify(ctx: ExtensionContext, message: string, type: "info" | "warning"
 	}
 }
 
-function pendingExternalRunReason(state: SessionState, entries: SessionEntry[]): ReminderReason | undefined {
-	const latest = latestExternalRunRecord(state, entries);
-	return latest ? externalRunReason(latest.record) : undefined;
-}
-
 function collectReminderReasons(
 	state: SessionState,
 	pi: ExtensionAPI,
@@ -2952,7 +2798,7 @@ function collectReminderReasons(
 	const interval = Number.isFinite(contextWindow) && contextWindow > 0 ? Math.max(1, Math.floor(contextWindow * 0.10)) : undefined;
 	const bucket = interval === undefined ? 0 : Math.floor(metric.tokens / interval);
 	const reasons: ReminderReason[] = [];
-	if (interval !== undefined && metric.entryCount > 0 && bucket >= 1) {
+	if (interval !== undefined && bucket >= 1) {
 		reasons.push({
 			key: `${origin.windowId}:stale-volume:${origin.checkpointEntryId ?? "none"}:tokens:${bucket * interval}`,
 			kind: "stale-volume",
@@ -2981,7 +2827,6 @@ function collectReminderReasons(
 			});
 		}
 	}
-	if (state.pendingExternalRunReason) reasons.push(state.pendingExternalRunReason);
 	return { usage, reasons: [...new Map(reasons.map((reason) => [reason.key, reason])).values()] };
 }
 
@@ -3034,13 +2879,8 @@ function deliverReminderReasons(
 	if (state.persistenceUncertain) return;
 	reconcileReminderQueue(state, ctx, false);
 	const collected = collectReminderReasons(state, pi, ctx, settingsReader);
-	const pendingReasons = state.pendingReminderReasons.filter((reason) =>
-		reason.kind !== "stale-volume" && (delivery !== "steer" || reason.kind !== "external-run"),
-	);
-	const collectedReasons = delivery === "steer"
-		? collected.reasons.filter((reason) => reason.kind !== "external-run")
-		: collected.reasons;
-	const reasons = mergeReminderReasons(pendingReasons, collectedReasons).filter((reason) => !reminderReasonKnown(state, reason));
+	const pendingReasons = state.pendingReminderReasons.filter((reason) => reason.kind !== "stale-volume");
+	const reasons = mergeReminderReasons(pendingReasons, collected.reasons).filter((reason) => !reminderReasonKnown(state, reason));
 	if (delivery === "defer") {
 		state.pendingReminderReasons = mergeReminderReasons(state.pendingReminderReasons, collected.reasons);
 		return;
@@ -3058,7 +2898,6 @@ function deliverReminderReasons(
 	const details = reminderDetails(level, windowId, usage, reasons, state.activeWindowId);
 	for (const reason of reasons) for (const key of reminderDeliveryKeys(reason)) state.queuedReminderKeys.add(key);
 	state.pendingReminderReasons = mergeReminderReasons(state.pendingReminderReasons, reasons);
-	if (reasons.some((reason) => reason.kind === "external-run")) state.pendingExternalRunReason = undefined;
 	const message = {
 		customType: REMINDER_MESSAGE_TYPE,
 		content: reminderText(level, windowId, usage, reasons, state.activeWindowId),
@@ -3174,7 +3013,6 @@ function saveCheckpoint(pi: ExtensionAPI, ctx: ExtensionContext, state: SessionS
 	state.checkpoint = { entryId: saved.entryId, data };
 	state.inferredActiveRequestEntryIds = data.activeRequestEntryIds;
 	state.requestHistoryPosition = data.requestHistoryPosition;
-	state.pendingExternalRunReason = undefined;
 	state.pendingReminderReasons = [];
 	return saved;
 }
@@ -3316,37 +3154,20 @@ function compactionDetails(
 	);
 }
 
-function startExternalRun(state: SessionState, ctx: ExtensionContext): void {
-	state.externalRun = {
-		startPosition: requestPositionForContext(ctx.sessionManager.getBranch()),
-		checkpointEntryId: state.checkpoint?.entryId ?? null,
-		windowId: state.activeWindowId,
-	};
-}
-
-function finishExternalRun(pi: ExtensionAPI, state: SessionState, ctx: ExtensionContext): void {
-	if (!state.externalRun) return;
-	const record = externalRunRecordForState(state, ctx.sessionManager.getBranch());
-	state.externalRun = undefined;
-	if (record && appendExternalRunRecord(pi, ctx, state, record)) state.pendingExternalRunReason = externalRunReason(record);
-}
-
 function reminderHandoffForState(state: SessionState): ReminderHandoffRecord | undefined {
 	const pendingReminderReasons = [...new Map(
-		[...state.pendingReminderReasons, ...(state.pendingExternalRunReason ? [state.pendingExternalRunReason] : [])]
-			.map((reason) => [reason.key, reason]),
+		state.pendingReminderReasons.map((reason) => [reason.key, reason]),
 	).values()];
 	const queuedReminderReasons = pendingReminderReasons.filter((reason) =>
 		reminderDeliveryKeys(reason).some((key) => state.queuedReminderKeys.has(key)),
 	);
 	const pending = pendingReminderReasons.filter((reason) => !queuedReminderReasons.includes(reason));
-	if (pending.length === 0 && queuedReminderReasons.length === 0 && !state.externalRun) return undefined;
+	if (pending.length === 0 && queuedReminderReasons.length === 0) return undefined;
 	return {
 		schemaVersion: LEDGER_SCHEMA_VERSION,
 		kind: REMINDER_HANDOFF_ENTRY_TYPE,
 		pendingReminderReasons: pending,
 		queuedReminderReasons,
-		externalRun: state.externalRun,
 	};
 }
 
@@ -3376,18 +3197,17 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		if (handoff) appendReminderHandoff(pi, ctx, state, handoff);
 	});
 
-	pi.on("session_start", async (event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
 		const state = getState(ctx);
 		if (blockIfPersistenceUncertain(state, ctx)) return;
-		hydrateState(state, ctx.sessionManager.getBranch(), ctx, true, event.reason === "reload");
+		hydrateState(state, ctx.sessionManager.getBranch(), ctx);
 	});
 
 	pi.on("before_agent_start", async (_event, ctx) => {
 		const state = getState(ctx);
 		if (blockIfPersistenceUncertain(state, ctx)) return;
-		if (!state.pendingExternalInput) return;
-		state.pendingExternalInput = false;
-		startExternalRun(state, ctx);
+		if (!state.pendingNormalInput) return;
+		state.pendingNormalInput = false;
 		const reminder = deliverReminderReasons(pi, state, ctx, settingsReader, "beforeAgentStart");
 		return reminder ? { message: reminder } : undefined;
 	});
@@ -3430,7 +3250,6 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 			const state = getState(ctx);
 			if (blockIfPersistenceUncertain(state, ctx)) return;
 			const normalSettlement = state.lastAgentStopReason === "stop";
-			finishExternalRun(pi, state, ctx);
 			reconcileReminderQueue(state, ctx, normalSettlement);
 			state.lastAgentStopReason = undefined;
 			deliverReminderReasons(pi, state, ctx, settingsReader, "defer");
@@ -3443,9 +3262,9 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 	pi.on("input", async (event, ctx) => {
 		const state = getState(ctx);
 		if (blockIfPersistenceUncertain(state, ctx)) return { action: "handled" };
-		const qualifiesAsExternalInput =
+		const qualifiesAsNormalInput =
 			(event.source === "interactive" || event.source === "rpc") && event.streamingBehavior === undefined && ctx.isIdle();
-		state.pendingExternalInput = qualifiesAsExternalInput;
+		state.pendingNormalInput = qualifiesAsNormalInput;
 		return undefined;
 	});
 
