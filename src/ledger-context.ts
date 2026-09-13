@@ -19,8 +19,6 @@ export const LEDGER_SCHEMA_VERSION = 1 as const;
 export const MAX_ACTIVE_REQUEST_IDS = 8;
 export const LEDGER_BYTE_LIMIT = 65_536;
 export const DEFAULT_LEDGER_TOKEN_LIMIT = 4_096;
-export const DEFAULT_TASK_TOKEN_LIMIT = 4_096;
-export const DEFAULT_TAIL_TOKEN_LIMIT = 4_096;
 export const DEFAULT_HISTORY_READ_TOKEN_LIMIT = 2_048;
 export const DEFAULT_OUTPUT_RESERVE_TOKEN_LIMIT = 16_384;
 export const REMINDER_MESSAGE_TYPE = "ledger-context/reminder";
@@ -336,10 +334,11 @@ function reminderThresholds(contextWindow: number): { soft: number; urgent: numb
 
 function contentBudgets(contextWindow: number): ContentBudgets {
 	const defaultOutputReserve = Math.max(1, Math.floor(Math.min(contextWindow * 0.1, DEFAULT_OUTPUT_RESERVE_TOKEN_LIMIT)));
+	const defaultRecoveryLimit = Math.max(1, Math.floor(contextWindow * 0.05));
 	return {
 		ledgerTokens: positiveIntegerEnv("LEDGER_CONTEXT_LEDGER_TOKENS", DEFAULT_LEDGER_TOKEN_LIMIT),
-		taskTokens: positiveIntegerEnv("LEDGER_CONTEXT_TASK_TOKENS", DEFAULT_TASK_TOKEN_LIMIT),
-		tailTokens: positiveIntegerEnv("LEDGER_CONTEXT_TAIL_TOKENS", DEFAULT_TAIL_TOKEN_LIMIT),
+		taskTokens: positiveIntegerEnv("LEDGER_CONTEXT_TASK_TOKENS", defaultRecoveryLimit),
+		tailTokens: positiveIntegerEnv("LEDGER_CONTEXT_TAIL_TOKENS", defaultRecoveryLimit),
 		readTokens: positiveIntegerEnv("LEDGER_CONTEXT_READ_TOKENS", DEFAULT_HISTORY_READ_TOKEN_LIMIT),
 		outputReserveTokens: positiveIntegerEnv("LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS", defaultOutputReserve),
 	};

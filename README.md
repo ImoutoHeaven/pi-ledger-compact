@@ -83,8 +83,8 @@ All seven extension settings use the `LEDGER_CONTEXT_` namespace. Every configur
 | `LEDGER_CONTEXT_REMINDER_TOKENS` | `max(2, floor(min(window × 0.20, 32768)))` | Soft reminder lead time before the effective boundary; the used-token trigger is `B - lead time` |
 | `LEDGER_CONTEXT_URGENT_TOKENS` | `max(1, min(default soft lead time − 1, floor(min(window × 0.10, 16384))))` | Urgent reminder lead time before the effective boundary; the used-token trigger is `B - lead time` |
 | `LEDGER_CONTEXT_LEDGER_TOKENS` | `4096` | Estimated token limit for a saved ledger |
-| `LEDGER_CONTEXT_TASK_TOKENS` | `4096` | Estimated token limit for task and request recovery text |
-| `LEDGER_CONTEXT_TAIL_TOKENS` | `4096` | Estimated token limit for recent interaction display |
+| `LEDGER_CONTEXT_TASK_TOKENS` | `max(1, floor(window × 0.05))` | Estimated token limit for task and request recovery text |
+| `LEDGER_CONTEXT_TAIL_TOKENS` | `max(1, floor(window × 0.05))` | Estimated token limit for recent interaction display |
 | `LEDGER_CONTEXT_READ_TOKENS` | `2048` | Total estimated output for one `history_read` or `history_search` result; image reads include source metadata, the note, and the image estimate |
 | `LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS` | `max(1, floor(min(window × 0.10, 16384)))` | Output space reserved in each conservative request budget |
 

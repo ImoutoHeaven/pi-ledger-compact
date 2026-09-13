@@ -83,8 +83,8 @@ const ledgerExtension = createLedgerContext({
 | `LEDGER_CONTEXT_REMINDER_TOKENS` | `max(2, floor(min(window × 0.20, 32768)))` | 柔性提醒在有效边界前的提前量；已用 token 触发值为 `B - 提前量` |
 | `LEDGER_CONTEXT_URGENT_TOKENS` | `max(1, min(默认柔性提醒提前量 − 1, floor(min(window × 0.10, 16384))))` | 紧急提醒在有效边界前的提前量；已用 token 触发值为 `B - 提前量` |
 | `LEDGER_CONTEXT_LEDGER_TOKENS` | `4096` | 已保存账本的估计 token 上限 |
-| `LEDGER_CONTEXT_TASK_TOKENS` | `4096` | 任务和请求恢复文本的估计 token 上限 |
-| `LEDGER_CONTEXT_TAIL_TOKENS` | `4096` | 近期交互显示的估计 token 上限 |
+| `LEDGER_CONTEXT_TASK_TOKENS` | `max(1, floor(window × 0.05))` | 任务和请求恢复文本的估计 token 上限 |
+| `LEDGER_CONTEXT_TAIL_TOKENS` | `max(1, floor(window × 0.05))` | 近期交互显示的估计 token 上限 |
 | `LEDGER_CONTEXT_READ_TOKENS` | `2048` | 单次 `history_read` 或 `history_search` 结果的总估计输出上限；图像读取还包含来源元数据、说明文字和图像估计 |
 | `LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS` | `max(1, floor(min(window × 0.10, 16384)))` | 每次保守请求预算中预留的输出空间 |
 

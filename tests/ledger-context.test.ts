@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSy
 import { tmpdir } from "node:os";
 import { crc32, deflateSync } from "node:zlib";
 import { join, resolve } from "node:path";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import {
 	DefaultResourceLoader,
@@ -32,6 +32,17 @@ const TEST_TIMEOUT_MS = 5_000;
 const extensionErrors: ExtensionError[] = [];
 const RED_2X2_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEUlEQVR4nGP4z8DwH4QZYAwAR8oH+WdZbrcAAAAASUVORK5CYII=";
 const BLUE_3X2_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAYAAACddGYaAAAAEElEQVR4nGNgYPj/H4GROACPigv118uacgAAAABJRU5ErkJggg==";
+
+function use4kRecoveryBudgets(t: TestContext): void {
+	for (const name of ["LEDGER_CONTEXT_TASK_TOKENS", "LEDGER_CONTEXT_TAIL_TOKENS"]) {
+		const previous = process.env[name];
+		process.env[name] = "4096";
+		t.after(() => {
+			if (previous === undefined) delete process.env[name];
+			else process.env[name] = previous;
+		});
+	}
+}
 
 function highEntropyPng(width: number, height: number): string {
 	const rowBytes = width * 4 + 1;
@@ -927,7 +938,8 @@ test("recovery provenance preserves prior checkpoint and direct recovery IDs", {
 	}
 });
 
-test("native threshold compacts before the next request in the same run", { timeout: TEST_TIMEOUT_MS }, async () => {
+test("native threshold compacts before the next request in the same run", { timeout: TEST_TIMEOUT_MS }, async (t) => {
+	use4kRecoveryBudgets(t);
 	const toolResults = {
 		first: `first-large-tool-result:${"x".repeat(3_400)}`,
 		second: `second-large-tool-result:${"x".repeat(3_400)}`,
@@ -1012,7 +1024,8 @@ test("native threshold compacts before the next request in the same run", { time
 	}
 });
 
-test("long native run recovers twenty windows and reads its earliest operation", { timeout: 60_000 }, async () => {
+test("long native run recovers twenty windows and reads its earliest operation", { timeout: 60_000 }, async (t) => {
+	use4kRecoveryBudgets(t);
 	const previousOutputReserve = process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS;
 	process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS = "256";
 	const operationIds = Array.from({ length: 40 }, (_value, index) => `long-operation-${String(index + 1).padStart(2, "0")}`);
@@ -1285,7 +1298,8 @@ test("tool-batch reminders reach the next same-run provider request", { timeout:
 	}
 });
 
-test("budget reminders are bounded, deduplicated per window, and explicit about unknown usage", { timeout: TEST_TIMEOUT_MS }, async () => {
+test("budget reminders are bounded, deduplicated per window, and explicit about unknown usage", { timeout: TEST_TIMEOUT_MS }, async (t) => {
+	use4kRecoveryBudgets(t);
 	const previousSoft = process.env.LEDGER_CONTEXT_REMINDER_TOKENS;
 	const previousUrgent = process.env.LEDGER_CONTEXT_URGENT_TOKENS;
 	process.env.LEDGER_CONTEXT_REMINDER_TOKENS = "6500";
@@ -1427,7 +1441,8 @@ test("budget reminders are bounded, deduplicated per window, and explicit about 
 	}
 });
 
-test("saturated unknown usage still persists a settled urgent reminder", { timeout: TEST_TIMEOUT_MS }, async () => {
+test("saturated unknown usage still persists a settled urgent reminder", { timeout: TEST_TIMEOUT_MS }, async (t) => {
+	use4kRecoveryBudgets(t);
 	const previousSoft = process.env.LEDGER_CONTEXT_REMINDER_TOKENS;
 	const previousUrgent = process.env.LEDGER_CONTEXT_URGENT_TOKENS;
 	process.env.LEDGER_CONTEXT_REMINDER_TOKENS = "3000";
@@ -1481,7 +1496,8 @@ test("saturated unknown usage still persists a settled urgent reminder", { timeo
 	}
 });
 
-test("malformed persisted reminder details do not suppress a valid level", { timeout: TEST_TIMEOUT_MS }, async () => {
+test("malformed persisted reminder details do not suppress a valid level", { timeout: TEST_TIMEOUT_MS }, async (t) => {
+	use4kRecoveryBudgets(t);
 	const previousSoft = process.env.LEDGER_CONTEXT_REMINDER_TOKENS;
 	const previousUrgent = process.env.LEDGER_CONTEXT_URGENT_TOKENS;
 	process.env.LEDGER_CONTEXT_REMINDER_TOKENS = "6500";
@@ -2268,7 +2284,8 @@ test("native overflow cancellation leaves retry responses unconsumed", { timeout
 	}
 });
 
-test("steering queued during native compaction is delivered once in order", { timeout: TEST_TIMEOUT_MS }, async () => {
+test("steering queued during native compaction is delivered once in order", { timeout: TEST_TIMEOUT_MS }, async (t) => {
+	use4kRecoveryBudgets(t);
 	const previousSoft = process.env.LEDGER_CONTEXT_REMINDER_TOKENS;
 	const previousUrgent = process.env.LEDGER_CONTEXT_URGENT_TOKENS;
 	process.env.LEDGER_CONTEXT_REMINDER_TOKENS = "100";
@@ -3783,7 +3800,8 @@ test("history_read image errors remain explicit and source-bearing", { timeout: 
 	}
 });
 
-test("history_read image results use the global budget with complete mixed tool protocol", { timeout: 15_000 }, async () => {
+test("history_read image results use the global budget with complete mixed tool protocol", { timeout: 15_000 }, async (t) => {
+	use4kRecoveryBudgets(t);
 	const previousReserve = process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS;
 	process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS = "512";
 	const largePayload = (pi: ExtensionAPI): void => {
@@ -4221,6 +4239,56 @@ test("missing checkpoint generation cancellation and persistence failures cancel
 			session.dispose();
 			rmSync(root, { recursive: true, force: true });
 		}
+	}
+});
+
+test("task and tail defaults scale with the model window and allow independent overrides", { timeout: TEST_TIMEOUT_MS }, async () => {
+	const previousTask = process.env.LEDGER_CONTEXT_TASK_TOKENS;
+	const previousTail = process.env.LEDGER_CONTEXT_TAIL_TOKENS;
+	try {
+		for (const { window, taskLimit, tailOverride, keepsAnswer } of [
+			{ window: 20_000, taskLimit: 1_000, tailOverride: undefined, keepsAnswer: false },
+			{ window: 40_000, taskLimit: 2_000, tailOverride: undefined, keepsAnswer: true },
+			{ window: 500_000, taskLimit: 25_000, tailOverride: undefined, keepsAnswer: true },
+			{ window: 40_000, taskLimit: 256, tailOverride: 64, keepsAnswer: false },
+		]) {
+			delete process.env.LEDGER_CONTEXT_TASK_TOKENS;
+			delete process.env.LEDGER_CONTEXT_TAIL_TOKENS;
+			if (tailOverride !== undefined) {
+				process.env.LEDGER_CONTEXT_TASK_TOKENS = String(taskLimit);
+				process.env.LEDGER_CONTEXT_TAIL_TOKENS = String(tailOverride);
+			}
+			const { root, faux, session, sessionManager } = await createFixture(true, [], 1_500, {
+				contextWindow: window, maxTokens: 512, reserveTokens: 0, compactionEnabled: false,
+			});
+			try {
+				faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Preserve the current task and recent evidence." })), fauxAssistantMessage("Saved.")]);
+				await session.prompt(`Earlier task: ${"a".repeat(12_000)}`);
+				const answer = `tail-budget-probe:${"t".repeat(4_800)}`;
+				faux.setResponses([fauxAssistantMessage(answer)]);
+				await session.prompt(`Latest task: ${"u".repeat(Math.max(8_000, taskLimit * 8))}`);
+				await session.compact();
+				const summary = latestCompaction(sessionManager.getBranch()).summary;
+				const task = summary.slice(summary.indexOf("<active>"), summary.indexOf("</latest>") + "</latest>".length);
+				assert.match(task, /Latest task/);
+				assert.ok(textTokenEstimate(task) <= taskLimit);
+				assert.ok(textTokenEstimate(task) > taskLimit / 2, "the default budget must be available for a long request");
+				let context: Context | undefined;
+				faux.setResponses([(input) => { context = input; return fauxAssistantMessage("Resumed."); }]);
+				await session.prompt("Continue.");
+				assert.ok(context);
+				assert.equal(JSON.stringify(context.messages).includes(answer), keepsAnswer);
+				assert.ok(conservativeContextTokens(context, session, Math.min(window * 0.1, 16_384)) <= window);
+			} finally {
+				session.dispose();
+				rmSync(root, { recursive: true, force: true });
+			}
+		}
+	} finally {
+		if (previousTask === undefined) delete process.env.LEDGER_CONTEXT_TASK_TOKENS;
+		else process.env.LEDGER_CONTEXT_TASK_TOKENS = previousTask;
+		if (previousTail === undefined) delete process.env.LEDGER_CONTEXT_TAIL_TOKENS;
+		else process.env.LEDGER_CONTEXT_TAIL_TOKENS = previousTail;
 	}
 });
 
@@ -5092,7 +5160,8 @@ test("tail marker write failure cancels compaction and blocks another attempt", 
 	}
 });
 
-test("context display bounds large multimodal tool units while preserving protocol fields", { timeout: TEST_TIMEOUT_MS }, async () => {
+test("context display bounds large multimodal tool units while preserving protocol fields", { timeout: TEST_TIMEOUT_MS }, async (t) => {
+	use4kRecoveryBudgets(t);
 	const payload = `structured-payload-sentinel:${"p".repeat(40_000)}`;
 	const toolText = `large-tool-text-sentinel:${"t".repeat(40_000)}`;
 	const largeTool = (pi: ExtensionAPI): void => {
