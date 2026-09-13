@@ -31,7 +31,7 @@ Keep the ledger brief: goal and status, constraints and decisions, verified resu
 
 The bootstrap identifies the previous checkpoint, latest user request, and latest completed assistant answer. `requestHistoryPosition` records the log position at the start of the model request that produced the checkpoint; `pendingHistoryRange` identifies subsequent events. These positions locate evidence and do not prove it was read, understood, or reflected in the ledger. Use the retained text or read missing entries to verify the state before continuing actions with side effects.
 
-Saving a checkpoint lets the current run continue. Pi controls compaction timing. Automatic compaction and manual `/compact [instructions]` use the same recovery bootstrap, built directly from the ledger and session entries.
+Saving a checkpoint lets the current run continue. Pi controls compaction timing. Automatic compaction and manual `/compact [instructions]` use the same recovery bootstrap. With an existing checkpoint, the bootstrap is built directly from the ledger and session entries. When a checkpoint is missing, the extension tries one ledger-generation request using the current model, host authentication, and bounded history excerpts. It waits for the response or an error, subject to user cancellation. Valid output is saved as a checkpoint and included in recovery. Generation errors or invalid output use the existing recovery range and history references. User cancellation cancels compaction; a checkpoint write failure stops recovery until the persisted session is reopened.
 
 The bootstrap carries the latest ledger, current task and latest user wording, window metadata, bounded recent interaction, execution state, and direct history references. Assistant tool calls stay paired with every matching result. Persistent sessions keep complete entries in the pi session log as the durable evidence source; in-memory sessions keep them for the current process.
 
@@ -96,7 +96,7 @@ Pi context usage combines the provider's reported usage with estimates for subse
 
 ## Recovery states
 
-- Missing or stale checkpoints produce a bootstrap with an explicit recovery range and direct history references.
+- A missing checkpoint triggers one generation attempt; a failed attempt or stale checkpoint uses an explicit recovery range and direct history references.
 - Normal compaction cancellation and invalid checkpoint input preserve the previous valid window and checkpoint.
 - A persistent session log failure stops the current run and future saves or compactions. Reopen the persisted file with a fresh public `SessionManager` to resume durable recovery.
 - Fork, tree, resume, reload, new session, and model changes rebuild state from the selected branch. Each branch keeps its own ledger, window records, and pending reminder provenance.

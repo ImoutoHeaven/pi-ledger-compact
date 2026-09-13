@@ -129,6 +129,19 @@ function conservativeContextTokens(context: Context, session: AgentSession, outp
 	);
 }
 
+function registerFixtureProvider(modelRuntime: ModelRuntime, faux: ReturnType<typeof fauxProvider>) {
+	// Separate scripts for maintenance generation keep ordinary run assertions meaningful.
+	const ledgerFaux = fauxProvider({ provider: faux.provider.id, models: faux.models, tokenSize: { min: 1_024, max: 1_024 } });
+	const providerFor = (context: Context) => context.systemPrompt?.startsWith("Write a recovery ledger for this session.")
+		? ledgerFaux.provider : faux.provider;
+	modelRuntime.registerNativeProvider({
+		...faux.provider,
+		stream: (model, context, options) => providerFor(context).stream(model, context, options),
+		streamSimple: (model, context, options) => providerFor(context).streamSimple(model, context, options),
+	});
+	return ledgerFaux;
+}
+
 async function createFixture(
 	persistent: boolean,
 	extraExtensions: Array<(pi: ExtensionAPI) => void> = [],
@@ -166,7 +179,7 @@ async function createFixture(
 		modelsPath: null,
 		refreshOnCreate: false,
 	});
-	modelRuntime.registerNativeProvider(faux.provider);
+	const ledgerFaux = registerFixtureProvider(modelRuntime, faux);
 	const model = faux.getModel();
 	writeFileSync(
 		join(agentDir, "settings.json"),
@@ -203,7 +216,7 @@ async function createFixture(
 			customTools: options.customTools,
 	});
 	await session.bindExtensions({ mode: "print", onError: collectExtensionError });
-	return { root, cwd, agentDir, faux, modelRuntime, settingsManager, session, sessionManager };
+	return { root, cwd, agentDir, faux, ledgerFaux, modelRuntime, settingsManager, session, sessionManager };
 }
 
 async function createRuntimeFixture() {
@@ -226,7 +239,7 @@ async function createRuntimeFixture() {
 		modelsPath: null,
 		refreshOnCreate: false,
 	});
-	modelRuntime.registerNativeProvider(faux.provider);
+	registerFixtureProvider(modelRuntime, faux);
 	writeFileSync(
 		join(agentDir, "settings.json"),
 		JSON.stringify({ compaction: { keepRecentTokens: 16, reserveTokens: 0, enabled: false } }),
@@ -292,7 +305,7 @@ test("packed package installs and loads through the public pi package manager", 
 		modelsPath: null,
 		refreshOnCreate: false,
 	});
-	modelRuntime.registerNativeProvider(faux.provider);
+	registerFixtureProvider(modelRuntime, faux);
 	const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: true });
 	let session: AgentSession | undefined;
 	try {
@@ -935,7 +948,7 @@ test("native threshold compacts before the next request in the same run", { time
 			order.push(event.reason);
 		});
 	};
-	const { root, faux, session, sessionManager } = await createFixture(true, [observeCompactionExtension], 1_750, {
+	const { root, faux, ledgerFaux, session, sessionManager } = await createFixture(true, [observeCompactionExtension], 1_750, {
 		contextWindow: 4_000,
 		maxTokens: 100,
 		reserveTokens: 500,
@@ -944,6 +957,7 @@ test("native threshold compacts before the next request in the same run", { time
 	try {
 		let resumedContext: Context | undefined;
 		const toolCallIds = ["same-run-large-tool-first", "same-run-large-tool-second"];
+		ledgerFaux.setResponses([fauxAssistantMessage("native-generated-ledger: Large operations returned; verify evidence before repeating. Skills: none.")]);
 		faux.setResponses([
 			fauxAssistantMessage(`old-history:${"a".repeat(800)}`),
 			fauxAssistantMessage(`recent-history:${"b".repeat(800)}`),
@@ -990,6 +1004,9 @@ test("native threshold compacts before the next request in the same run", { time
 		assert.match(JSON.stringify(messages), /first-large-tool-result/);
 		assert.match(JSON.stringify(messages), /second-large-tool-result/);
 		assert.match(JSON.stringify(messages), /# Ledger Context Recovery/);
+		assert.match(JSON.stringify(messages), /native-generated-ledger/);
+		assert.equal(ledgerFaux.state.callCount, 1);
+		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 1);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -4024,6 +4041,112 @@ test("history_read nextOffset reconstructs the complete rendered entry", { timeo
 		assert.equal(reconstructed, expected);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("missing checkpoint generation saves bounded evidence once and survives reopening", { timeout: TEST_TIMEOUT_MS }, async () => {
+	const { root, faux, ledgerFaux, session, sessionManager } = await createFixture(true, [], 64, { contextWindow: 16_000, maxTokens: 512, reserveTokens: 0 });
+	try {
+		faux.setResponses([fauxAssistantMessage("Verified result: operation completed once."), fauxAssistantMessage("Next: inspect the result.")]);
+		await session.prompt("Goal: preserve the approved operation.");
+		await session.prompt(`Latest constraint: keep Unicode 原文. ${"材料".repeat(30_000)}`);
+		const ledger = "Goal: preserve the approved operation. Verified: operation completed once. Next: inspect the result. Skills: none. Earlier omitted evidence needs history_read.";
+		ledgerFaux.setResponses([(context, options, _state, model) => {
+			assert.equal(context.tools?.length ?? 0, 0);
+			assert.equal(options?.timeoutMs, undefined, "ledger generation must not impose a waiting timeout");
+			assert.equal(options?.maxRetries, 0);
+			assert.match(context.systemPrompt ?? "", /bounded selection/);
+			const input = context.messages.reduce((sum, message) => sum + estimateTokens(message), 0) + textTokenEstimate(context.systemPrompt);
+			assert.ok(input + (options?.maxTokens ?? 0) <= model.contextWindow);
+			assert.match(JSON.stringify(context.messages), /Latest constraint/);
+			assert.match(JSON.stringify(context.messages), /pi:\/\/entry\//);
+			return fauxAssistantMessage(ledger);
+		}]);
+		await session.compact();
+		assert.equal(ledgerFaux.state.callCount, 1);
+		const checkpoint = checkpointEntries(sessionManager.getBranch()).at(-1);
+		assert.ok(checkpoint);
+		assert.equal((checkpoint.data as { ledger: string }).ledger, ledger);
+		assert.equal((latestCompaction(sessionManager.getBranch()).details as { checkpointEntryId: string }).checkpointEntryId, checkpoint.id);
+		assert.match(latestCompaction(sessionManager.getBranch()).summary, /operation completed once/);
+		const reopened = SessionManager.open(sessionManager.getSessionFile()!);
+		assert.equal(checkpointEntries(reopened.getBranch()).at(-1)?.id, checkpoint.id);
+		const position = (checkpoint.data as { requestHistoryPosition: { entryId: string; branchDepth: number } }).requestHistoryPosition;
+		const branch = sessionManager.getBranch();
+		assert.equal(branch[position.branchDepth - 1].id, position.entryId);
+		assert.equal(branch.findIndex((entry) => entry.id === checkpoint.id), position.branchDepth);
+		faux.setResponses([fauxAssistantMessage("Continued without regenerating.")]);
+		await session.prompt("Continue after the generated checkpoint.");
+		await session.compact();
+		assert.equal(ledgerFaux.state.callCount, 1);
+		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 1);
+	} finally {
+		session.dispose();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("missing checkpoint generation failures use the existing recovery bootstrap", { timeout: TEST_TIMEOUT_MS }, async () => {
+	for (const response of [
+		() => { throw new Error("generation request failed"); },
+		fauxAssistantMessage("", { stopReason: "error", errorMessage: "provider unavailable" }),
+		fauxAssistantMessage(""),
+		fauxAssistantMessage("x".repeat(20_000)),
+		fauxAssistantMessage("incomplete", { stopReason: "length" }),
+		fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "must not execute" })),
+	]) {
+		const { root, faux, ledgerFaux, session, sessionManager } = await createFixture(true, [], 64, { contextWindow: 32_000, maxTokens: 512, reserveTokens: 0 });
+		try {
+			faux.setResponses([fauxAssistantMessage("First result."), fauxAssistantMessage("Second result.")]);
+			await session.prompt("First request.");
+			await session.prompt(`Second request ${"x".repeat(800)}`);
+			ledgerFaux.setResponses([response]);
+			await session.compact();
+			assert.equal(ledgerFaux.state.callCount, 1);
+			assert.equal(checkpointEntries(sessionManager.getBranch()).length, 0);
+			assert.match(latestCompaction(sessionManager.getBranch()).summary, /checkpoint missing/);
+		} finally {
+			session.dispose();
+			rmSync(root, { recursive: true, force: true });
+		}
+	}
+});
+
+test("missing checkpoint generation cancellation and persistence failures cancel compaction", { timeout: TEST_TIMEOUT_MS }, async () => {
+	for (const mode of ["cancel", "write-failure"] as const) {
+		const { root, faux, ledgerFaux, session, sessionManager } = await createFixture(true, [], 64, { contextWindow: 32_000, maxTokens: 512, reserveTokens: 0 });
+		try {
+			faux.setResponses([fauxAssistantMessage("First result."), fauxAssistantMessage("Second result.")]);
+			await session.prompt("First request.");
+			await session.prompt(`Second request ${"x".repeat(800)}`);
+			const beforeGeneration = readFileSync(sessionManager.getSessionFile()!, "utf8");
+			ledgerFaux.setResponses([() => {
+				if (mode === "cancel") {
+					session.abortCompaction();
+					return new Promise<never>(() => {});
+				}
+				else {
+					const log = sessionManager.getSessionFile()!;
+					renameSync(log, `${log}.saved`);
+					mkdirSync(log);
+				}
+				return fauxAssistantMessage("Goal: restore state. Next: verify original evidence. Skills: none.");
+			}]);
+			await assert.rejects(session.compact(), /Compaction cancelled/);
+			assert.equal(ledgerFaux.state.callCount, 1);
+			assert.equal(sessionManager.getBranch().filter((entry) => entry.type === "compaction").length, 0);
+			if (mode === "cancel") {
+				assert.equal(checkpointEntries(sessionManager.getBranch()).length, 0);
+				assert.equal(readFileSync(sessionManager.getSessionFile()!, "utf8"), beforeGeneration);
+			} else {
+				await assert.rejects(session.compact(), /Compaction cancelled/);
+				assert.equal(ledgerFaux.state.callCount, 1);
+				assert.equal(checkpointEntries(SessionManager.open(`${sessionManager.getSessionFile()!}.saved`).getBranch()).length, 0);
+			}
+		} finally {
+			session.dispose();
+			rmSync(root, { recursive: true, force: true });
+		}
 	}
 });
 
