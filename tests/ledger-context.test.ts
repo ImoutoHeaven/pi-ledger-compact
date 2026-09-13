@@ -969,7 +969,13 @@ test("native threshold compacts before the next request in the same run", { time
 	try {
 		let resumedContext: Context | undefined;
 		const toolCallIds = ["same-run-large-tool-first", "same-run-large-tool-second"];
-		ledgerFaux.setResponses([fauxAssistantMessage("native-generated-ledger: Large operations returned; verify evidence before repeating. Skills: none.")]);
+		ledgerFaux.setResponses([
+			fauxAssistantMessage("native-generated-ledger: Large operations returned; verify evidence before repeating. Skills: none."),
+			(context) => {
+				assert.match(JSON.stringify(context.messages), /Previous ledger.*native-generated-ledger/);
+				return fauxAssistantMessage("native-refreshed-ledger: Same-run work completed. Skills: none.");
+			},
+		]);
 		faux.setResponses([
 			fauxAssistantMessage(`old-history:${"a".repeat(800)}`),
 			fauxAssistantMessage(`recent-history:${"b".repeat(800)}`),
@@ -1017,8 +1023,9 @@ test("native threshold compacts before the next request in the same run", { time
 		assert.match(JSON.stringify(messages), /second-large-tool-result/);
 		assert.match(JSON.stringify(messages), /# Ledger Context Recovery/);
 		assert.match(JSON.stringify(messages), /native-generated-ledger/);
-		assert.equal(ledgerFaux.state.callCount, 1);
-		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 1);
+		assert.equal(ledgerFaux.state.callCount, sessionManager.getBranch().filter((entry) => entry.type === "compaction").length);
+		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 2);
+		assert.match(latestCompaction(sessionManager.getBranch()).summary, /native-refreshed-ledger/);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -2486,7 +2493,10 @@ test("uses pi token estimates and renders every saved ledger within its configur
 		process.env.LEDGER_CONTEXT_LEDGER_TOKENS = "4096";
 		faux.setResponses([fauxAssistantMessage("work after the large checkpoint")]);
 		await session.prompt("Add work after the large checkpoint");
-		await assert.rejects(session.compact(), /Compaction cancelled/);
+		await session.compact();
+		const missing = latestCompaction(sessionManager.getBranch());
+		assert.match(missing.summary, /Ledger refresh failed.*no usable checkpoint/);
+		assert.equal((missing.details as { checkpointEntryId: string | null }).checkpointEntryId, null);
 
 		const cjkLedger = `${"界".repeat(6_000)}CJK-LEDGER-END`;
 		faux.setResponses([
@@ -4186,7 +4196,7 @@ test("history_read nextOffset reconstructs the complete rendered entry", { timeo
 	}
 });
 
-test("missing checkpoint generation saves bounded evidence once and survives reopening", { timeout: TEST_TIMEOUT_MS }, async () => {
+test("every manual compaction refreshes the ledger and failures explicitly restore its checkpoint", { timeout: TEST_TIMEOUT_MS }, async () => {
 	const { root, faux, ledgerFaux, session, sessionManager } = await createFixture(true, [], 64, { contextWindow: 16_000, maxTokens: 512, reserveTokens: 0 });
 	try {
 		faux.setResponses([fauxAssistantMessage("Verified result: operation completed once."), fauxAssistantMessage("Next: inspect the result.")]);
@@ -4217,11 +4227,73 @@ test("missing checkpoint generation saves bounded evidence once and survives reo
 		const branch = sessionManager.getBranch();
 		assert.equal(branch[position.branchDepth - 1].id, position.entryId);
 		assert.equal(branch.findIndex((entry) => entry.id === checkpoint.id), position.branchDepth);
-		faux.setResponses([fauxAssistantMessage("Continued without regenerating.")]);
+		faux.setResponses([fauxAssistantMessage("Verified: final result is now complete.")]);
 		await session.prompt("Continue after the generated checkpoint.");
+		ledgerFaux.setResponses([(context) => {
+			assert.match(JSON.stringify(context.messages), /Previous ledger.*operation completed once/);
+			assert.match(JSON.stringify(context.messages), /final result is now complete/);
+			assert.match(JSON.stringify(context.messages), /Preserve the final result/);
+			return fauxAssistantMessage("Verified: final result complete. Preserve the original constraints.");
+		}]);
+		await session.compact("Preserve the final result");
+		assert.equal(ledgerFaux.state.callCount, 2);
+		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 2);
+		assert.match(latestCompaction(sessionManager.getBranch()).summary, /final result complete/);
+		const refreshed = checkpointEntries(sessionManager.getBranch()).at(-1)!;
+		const refreshedPosition = (refreshed.data as { requestHistoryPosition: unknown }).requestHistoryPosition;
+		faux.setResponses([fauxAssistantMessage("Later work after the refreshed checkpoint.")]);
+		await session.prompt("Continue again.");
+		ledgerFaux.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "provider unavailable" })]);
 		await session.compact();
-		assert.equal(ledgerFaux.state.callCount, 1);
-		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 1);
+		assert.equal(ledgerFaux.state.callCount, 3);
+		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 2);
+		const fallback = latestCompaction(sessionManager.getBranch());
+		assert.match(fallback.summary, /Ledger refresh failed.*previous checkpoint.*may be stale/);
+		assert.equal((fallback.details as { checkpointEntryId: string }).checkpointEntryId, refreshed.id);
+		assert.deepEqual((fallback.details as { requestHistoryPosition: unknown }).requestHistoryPosition, refreshedPosition);
+	} finally {
+		session.dispose();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("Responses tool images follow the complete result batch without changing source payloads", { timeout: TEST_TIMEOUT_MS }, async () => {
+	const { root, faux, session, sessionManager } = await createFixture(false);
+	try {
+		const image = { type: "input_image", image_url: `data:image/png;base64,${RED_2X2_PNG}`, detail: "auto" };
+		const payload = { model: "wire-test", input: [
+			{ type: "function_call_output", call_id: "first", output: [{ type: "input_text", text: "evidence" }, image, image] },
+			{ type: "function_call_output", call_id: "second", output: "plain result" },
+			{ type: "custom_tool_call_output", call_id: "third", output: [image] },
+			{ role: "assistant", content: "next message" },
+		] };
+		const original = structuredClone(payload);
+		await session.setModel({ ...faux.getModel(), api: "openai-responses" });
+		faux.setResponses([async (_context, options, _state, model) => {
+			const rewritten = await options?.onPayload?.(payload, model);
+			assert.ok(rewritten && typeof rewritten === "object" && "input" in rewritten && Array.isArray(rewritten.input));
+			assert.deepEqual(payload, original);
+			assert.deepEqual(rewritten.input.slice(0, 3).map((item) => item.call_id), ["first", "second", "third"]);
+			assert.deepEqual(rewritten.input[0].output, [{ type: "input_text", text: "evidence" }]);
+			assert.equal(rewritten.input[1].output, "plain result");
+			assert.equal(typeof rewritten.input[2].output, "string");
+			assert.deepEqual(rewritten.input.slice(3, 5).map((item) => item.role), ["user", "user"]);
+			assert.deepEqual(rewritten.input[3].content.slice(1), [image, image]);
+			assert.deepEqual(rewritten.input.at(-1), payload.input.at(-1));
+			const repeated = await options?.onPayload?.(rewritten, model);
+			assert.deepEqual(repeated ?? rewritten, rewritten, "normalization is idempotent");
+			return fauxAssistantMessage("wire verified");
+		}]);
+		await session.prompt("Verify the outgoing payload.");
+		assert.match(JSON.stringify(sessionManager.getBranch()), /wire verified/);
+		await session.setModel(faux.getModel());
+		faux.setResponses([async (_context, options, _state, model) => {
+			const unchanged = await options?.onPayload?.(payload, model);
+			assert.deepEqual(unchanged ?? payload, original, "other APIs retain their native image handling");
+			return fauxAssistantMessage("other API verified");
+		}]);
+		await session.prompt("Verify the other API.");
+		assert.match(JSON.stringify(sessionManager.getBranch()), /other API verified/);
 	} finally {
 		session.dispose();
 		rmSync(root, { recursive: true, force: true });
@@ -4247,6 +4319,7 @@ test("missing checkpoint generation failures use the existing recovery bootstrap
 			assert.equal(ledgerFaux.state.callCount, 1);
 			assert.equal(checkpointEntries(sessionManager.getBranch()).length, 0);
 			assert.match(latestCompaction(sessionManager.getBranch()).summary, /checkpoint missing/);
+			assert.match(latestCompaction(sessionManager.getBranch()).summary, /Ledger refresh failed.*no usable checkpoint/);
 		} finally {
 			session.dispose();
 			rmSync(root, { recursive: true, force: true });
