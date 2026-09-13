@@ -4243,9 +4243,9 @@ test("every manual compaction refreshes the ledger and failures explicitly resto
 		const refreshedPosition = (refreshed.data as { requestHistoryPosition: unknown }).requestHistoryPosition;
 		faux.setResponses([fauxAssistantMessage("Later work after the refreshed checkpoint.")]);
 		await session.prompt("Continue again.");
-		ledgerFaux.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "provider unavailable" })]);
+		ledgerFaux.setResponses(Array.from({ length: 3 }, () => fauxAssistantMessage("", { stopReason: "error", errorMessage: "OpenAI API error (503): service unavailable" })));
 		await session.compact();
-		assert.equal(ledgerFaux.state.callCount, 3);
+		assert.equal(ledgerFaux.state.callCount, 5);
 		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 2);
 		const fallback = latestCompaction(sessionManager.getBranch());
 		assert.match(fallback.summary, /Ledger refresh failed.*previous checkpoint.*may be stale/);
@@ -4300,23 +4300,31 @@ test("Responses tool images follow the complete result batch without changing so
 	}
 });
 
-test("missing checkpoint generation failures use the existing recovery bootstrap", { timeout: TEST_TIMEOUT_MS }, async () => {
-	for (const response of [
-		() => { throw new Error("generation request failed"); },
-		fauxAssistantMessage("", { stopReason: "error", errorMessage: "provider unavailable" }),
-		fauxAssistantMessage(""),
-		fauxAssistantMessage("x".repeat(20_000)),
-		fauxAssistantMessage("incomplete", { stopReason: "length" }),
-		fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "must not execute" })),
+test("ledger refresh exhausts invalid outputs and transient errors, but stops on permanent failures", { timeout: 25_000 }, async () => {
+	for (const { response, attempts } of [
+		{ response: () => { throw new Error("generation request failed"); }, attempts: 1 },
+		{ response: fauxAssistantMessage("", { stopReason: "error", errorMessage: "OpenAI API error (400): invalid request; retry after fixing the 503 proxy configuration" }), attempts: 1 },
+		{ response: fauxAssistantMessage("", { stopReason: "error", errorMessage: "401 authentication failed" }), attempts: 1 },
+		{ response: fauxAssistantMessage("", { stopReason: "error", errorMessage: "Authentication failed: connection rejected" }), attempts: 1 },
+		{ response: fauxAssistantMessage("", { stopReason: "error", errorMessage: "403 unsupported parameter" }), attempts: 1 },
+		{ response: fauxAssistantMessage("", { stopReason: "error", errorMessage: "429 insufficient_quota" }), attempts: 1 },
+		{ response: fauxAssistantMessage("", { stopReason: "aborted" }), attempts: 1 },
+		{ response: fauxAssistantMessage("", { stopReason: "error", errorMessage: "OpenAI API error (503): service unavailable" }), attempts: 3 },
+		{ response: fauxAssistantMessage("", { stopReason: "error", errorMessage: "429 rate limit exceeded" }), attempts: 3 },
+		{ response: fauxAssistantMessage("", { stopReason: "error", errorMessage: "Connection error: ECONNRESET" }), attempts: 3 },
+		{ response: fauxAssistantMessage(""), attempts: 3 },
+		{ response: fauxAssistantMessage("x".repeat(20_000)), attempts: 3 },
+		{ response: fauxAssistantMessage("incomplete", { stopReason: "length" }), attempts: 3 },
+		{ response: fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "must not execute" })), attempts: 3 },
 	]) {
 		const { root, faux, ledgerFaux, session, sessionManager } = await createFixture(true, [], 64, { contextWindow: 32_000, maxTokens: 512, reserveTokens: 0 });
 		try {
 			faux.setResponses([fauxAssistantMessage("First result."), fauxAssistantMessage("Second result.")]);
 			await session.prompt("First request.");
 			await session.prompt(`Second request ${"x".repeat(800)}`);
-			ledgerFaux.setResponses([response]);
+			ledgerFaux.setResponses([response, response, response, fauxAssistantMessage("must never reach a fourth attempt")]);
 			await session.compact();
-			assert.equal(ledgerFaux.state.callCount, 1);
+			assert.equal(ledgerFaux.state.callCount, attempts);
 			assert.equal(checkpointEntries(sessionManager.getBranch()).length, 0);
 			assert.match(latestCompaction(sessionManager.getBranch()).summary, /checkpoint missing/);
 			assert.match(latestCompaction(sessionManager.getBranch()).summary, /Ledger refresh failed.*no usable checkpoint/);
@@ -4327,8 +4335,39 @@ test("missing checkpoint generation failures use the existing recovery bootstrap
 	}
 });
 
+test("ledger refresh shares three attempts across transport and validation failures and saves success once", { timeout: TEST_TIMEOUT_MS }, async () => {
+	let requests = 0;
+	const throwNetworkError = (pi: ExtensionAPI) => pi.on("session_start", (_event, ctx) => {
+		const complete = ctx.modelRegistry.complete.bind(ctx.modelRegistry);
+		ctx.modelRegistry.complete = (...args) => {
+			requests++;
+			assert.equal(args[2]?.maxRetries, 0);
+			assert.equal(args[2]?.timeoutMs, undefined);
+			if (requests === 1) throw new TypeError("fetch failed");
+			return complete(...args);
+		};
+	});
+	const { root, faux, ledgerFaux, session, sessionManager } = await createFixture(true, [throwNetworkError], 64, { contextWindow: 32_000, maxTokens: 512, reserveTokens: 0 });
+	try {
+		faux.setResponses([fauxAssistantMessage("First result."), fauxAssistantMessage("Second result.")]);
+		await session.prompt("First request.");
+		await session.prompt(`Second request ${"x".repeat(800)}`);
+		ledgerFaux.setResponses([fauxAssistantMessage(""), fauxAssistantMessage("Valid ledger on attempt three."), fauxAssistantMessage("must not run")]);
+		await session.compact();
+		assert.equal(requests, 3);
+		assert.equal(ledgerFaux.state.callCount, 2);
+		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 1);
+		assert.match(latestCompaction(sessionManager.getBranch()).summary, /Valid ledger on attempt three/);
+		assert.doesNotMatch(latestCompaction(sessionManager.getBranch()).summary, /Ledger refresh failed/);
+		assert.equal(checkpointEntries(SessionManager.open(sessionManager.getSessionFile()!).getBranch()).length, 1);
+	} finally {
+		session.dispose();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test("missing checkpoint generation cancellation and persistence failures cancel compaction", { timeout: TEST_TIMEOUT_MS }, async () => {
-	for (const mode of ["cancel", "write-failure"] as const) {
+	for (const mode of ["cancel", "retry-cancel", "write-failure"] as const) {
 		const { root, faux, ledgerFaux, session, sessionManager } = await createFixture(true, [], 64, { contextWindow: 32_000, maxTokens: 512, reserveTokens: 0 });
 		try {
 			faux.setResponses([fauxAssistantMessage("First result."), fauxAssistantMessage("Second result.")]);
@@ -4336,6 +4375,10 @@ test("missing checkpoint generation cancellation and persistence failures cancel
 			await session.prompt(`Second request ${"x".repeat(800)}`);
 			const beforeGeneration = readFileSync(sessionManager.getSessionFile()!, "utf8");
 			ledgerFaux.setResponses([() => {
+				if (mode === "retry-cancel") {
+					setTimeout(() => session.abortCompaction(), 20);
+					return fauxAssistantMessage("", { stopReason: "error", errorMessage: "503 service unavailable" });
+				}
 				if (mode === "cancel") {
 					session.abortCompaction();
 					return new Promise<never>(() => {});
@@ -4350,7 +4393,7 @@ test("missing checkpoint generation cancellation and persistence failures cancel
 			await assert.rejects(session.compact(), /Compaction cancelled/);
 			assert.equal(ledgerFaux.state.callCount, 1);
 			assert.equal(sessionManager.getBranch().filter((entry) => entry.type === "compaction").length, 0);
-			if (mode === "cancel") {
+			if (mode !== "write-failure") {
 				assert.equal(checkpointEntries(sessionManager.getBranch()).length, 0);
 				assert.equal(readFileSync(sessionManager.getSessionFile()!, "utf8"), beforeGeneration);
 			} else {

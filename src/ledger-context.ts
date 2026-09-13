@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { Type, type Static } from "@earendil-works/pi-ai";
+import { setTimeout as delay } from "node:timers/promises";
+import { Type, isRetryableAssistantError, type Static } from "@earendil-works/pi-ai";
 import {
 	SessionManager,
 	SettingsManager,
@@ -3011,6 +3012,18 @@ function saveCheckpoint(pi: ExtensionAPI, ctx: ExtensionContext, state: SessionS
 	return saved;
 }
 
+function retryableLedgerError(error: unknown): boolean | undefined {
+	const message = error instanceof Error ? error.message : String(error);
+	// ponytail: assistant errors expose display text; use structured status when the SDK makes it available.
+	const status = error && typeof error === "object" && "status" in error && typeof error.status === "number" ? error.status
+		: error && typeof error === "object" && "statusCode" in error && typeof error.statusCode === "number" ? error.statusCode
+		: Number(message.match(/(?:^|\bHTTP\s+|\bstatus(?: code)?[: ]+|\bAPI error\s*\()([45]\d{2})\b/i)?.[1]);
+	if (/insufficient_quota|quota exceeded|billing|out of budget|GoUsageLimitError|FreeUsageLimitError|Monthly usage limit reached|available balance|invalid_request_error|invalid api key|unauthorized|forbidden|authentication (?:failed|required)|unsupported parameter/i.test(message)) return false;
+	if (status) return status === 408 || status === 409 || status === 429 || status >= 500;
+	if (/network|connection|fetch failed|socket|ECONN|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|timed? out|timeout|overloaded|rate.?limit|service.?unavailable/i.test(message)) return true;
+	return undefined;
+}
+
 async function generateCompactionCheckpoint(
 	ctx: ExtensionContext,
 	state: SessionState,
@@ -3061,15 +3074,37 @@ async function generateCompactionCheckpoint(
 			signal.addEventListener("abort", onAbort, { once: true });
 			removeAbortListener = () => signal.removeEventListener("abort", onAbort);
 		});
-		const result = await Promise.race([ctx.modelRegistry.complete(model, {
-			systemPrompt,
-			messages: [{ role: "user", content, timestamp: Date.now() }],
-		}, { maxTokens, maxRetries: 0, signal }), aborted]);
-		signal.throwIfAborted();
-		if (result.stopReason !== "stop" || result.content.some((block) => block.type === "toolCall")) return undefined;
-		const ledger = result.content.filter((block) => block.type === "text").map((block) => block.text).join("\n").trim();
-		if (ledgerCapacityError(ledger, maxTokens)) return undefined;
-		return validateCheckpoint({ ledger }, { ...state, requestHistoryPosition: position }, entries).data;
+		for (let attempt = 0; attempt < 3; attempt++) {
+			if (attempt > 0) await delay(500 * 2 ** (attempt - 1), undefined, { signal });
+			signal.throwIfAborted();
+			let result;
+			try {
+				result = await Promise.race([ctx.modelRegistry.complete(model, {
+					systemPrompt,
+					messages: [{ role: "user", content, timestamp: Date.now() }],
+				}, { maxTokens, maxRetries: 0, signal }), aborted]);
+			} catch (error) {
+				signal.throwIfAborted();
+				if (!retryableLedgerError(error)) return undefined;
+				continue;
+			}
+			signal.throwIfAborted();
+			if (result.stopReason === "aborted") return undefined;
+			if (result.stopReason === "error") {
+				if (!(retryableLedgerError(result.errorMessage) ?? isRetryableAssistantError(result))) return undefined;
+				continue;
+			}
+			try {
+				if (result.stopReason !== "stop" || result.content.some((block) => block.type === "toolCall")) throw new Error("Ledger output is incomplete or contains tool calls");
+				const ledger = result.content.filter((block) => block.type === "text").map((block) => block.text).join("\n").trim();
+				const capacityError = ledgerCapacityError(ledger, maxTokens);
+				if (capacityError) throw new Error(capacityError);
+				return validateCheckpoint({ ledger }, { ...state, requestHistoryPosition: position }, entries).data;
+			} catch {
+				// Invalid output shares the same attempt budget as provider failures.
+			}
+		}
+		return undefined;
 	} catch {
 		signal.throwIfAborted();
 		return undefined;
