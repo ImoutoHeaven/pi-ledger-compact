@@ -422,46 +422,6 @@ function nativeCompactionSettings(ctx: ExtensionContext, settingsReader?: Ledger
 	return { source: snapshotSource, compaction };
 }
 
-function currentRecoveryOverheadTokens(ctx: ExtensionContext, state: SessionState, budgets: ContentBudgets): number | undefined {
-	const entries = ctx.sessionManager.getBranch();
-	const latestCompaction = latestLedgerCompaction(entries);
-	const firstKeptIndex = latestCompaction
-		? Math.max(0, entries.findIndex((entry) => entry.id === latestCompaction.firstKeptEntryId))
-		: 0;
-	const firstKeptEntryId = entries[firstKeptIndex]?.id ?? "(none)";
-	try {
-		const details = buildCompactionDetails(ctx, state, entries, firstKeptEntryId, state.activeWindowId);
-		const bootstrap = renderBootstrap(entries, firstKeptIndex, state, details, undefined, budgets, "");
-		return ledgerTokenEstimate(bootstrap);
-	} catch {
-		return undefined;
-	}
-}
-
-function visibleSummaryTokens(ctx: ExtensionContext): number {
-	return ctx.sessionManager
-		.buildContextEntries()
-		.flatMap(sessionEntryToContextMessages)
-		.filter((message) => message.role === "compactionSummary" || message.role === "branchSummary")
-		.reduce((total, message) => total + estimateTokens(message), 0);
-}
-
-function effectiveTailTokens(pi: ExtensionAPI, ctx: ExtensionContext, state: SessionState): number | undefined {
-	try {
-		const contextWindow = ctx.model?.contextWindow ?? 0;
-		if (!Number.isFinite(contextWindow) || contextWindow <= 0) return undefined;
-		const budgets = contentBudgets(contextWindow);
-		const availableTokens = contextWindow - requestFixedTokens(pi, ctx) - budgets.outputReserveTokens;
-		const previousSummaryTokens = visibleSummaryTokens(ctx);
-		const currentRecoveryTokens = currentRecoveryOverheadTokens(ctx, state, budgets);
-		if (currentRecoveryTokens === undefined) return undefined;
-		const allocatable = Math.max(0, availableTokens - Math.max(previousSummaryTokens, currentRecoveryTokens));
-		return Math.min(budgets.tailTokens, allocatable);
-	} catch {
-		return undefined;
-	}
-}
-
 function utf8Bytes(value: string): number {
 	return new TextEncoder().encode(value).length;
 }
@@ -537,7 +497,7 @@ function reminderText(
 ): string {
 	const usageText = usage.usageKnown ? `${usage.tokens} Pi effective usage` : `${usage.tokens} bounded content estimate`;
 	const causes = reasons.length > 0
-		? reasons.map((reason) => reason.kind === "stale-volume" ? "tail volume" : reason.kind === "external-run" ? "external run" : `${reason.level} budget`).join("+")
+		? reasons.map((reason) => reason.kind === "stale-volume" ? reason.cause : reason.kind === "external-run" ? "external run" : `${reason.level} budget`).join("+")
 		: "budget";
 	const scopedReasons = reasons.filter((reason) => reason.windowId === windowId);
 	const referenceReasons = scopedReasons.length > 0 ? scopedReasons : reasons;
@@ -618,7 +578,6 @@ interface VolumeMeasurement {
 	entryCount: number;
 	fromEntryId: string | null;
 	toEntryId: string | null;
-	effectiveTailTokens: number | undefined;
 }
 
 function isMaintenanceToolCall(block: any): boolean {
@@ -644,7 +603,7 @@ function volumeMessagesForEntry(entry: SessionEntry): ContextMessage[] {
 	return content.length > 0 ? [{ ...message, content } as ContextMessage] : [];
 }
 
-function volumeMeasurement(entries: SessionEntry[], startIndex: number, effectiveTail: number | undefined): VolumeMeasurement {
+function volumeMeasurement(entries: SessionEntry[], startIndex: number): VolumeMeasurement {
 	let tokens = 0;
 	let entryCount = 0;
 	let fromEntryId: string | null = null;
@@ -657,7 +616,7 @@ function volumeMeasurement(entries: SessionEntry[], startIndex: number, effectiv
 		fromEntryId ??= entries[index].id;
 		toEntryId = entries[index].id;
 	}
-	return { tokens, entryCount, fromEntryId, toEntryId, effectiveTailTokens: effectiveTail };
+	return { tokens, entryCount, fromEntryId, toEntryId };
 }
 
 function positionStartIndex(entries: SessionEntry[], position: RequestHistoryPosition | null): number {
@@ -822,7 +781,7 @@ function externalRunRecordForState(state: SessionState, entries: SessionEntry[])
 	const assistant = [...runEntries].reverse().find((entry) => entryMessage(entry)?.role === "assistant");
 	const settledEntry = entries.at(-1);
 	if (!settledEntry) return undefined;
-	const metric = volumeMeasurement(entries, startIndex, DEFAULT_TAIL_TOKEN_LIMIT);
+	const metric = volumeMeasurement(entries, startIndex);
 	if (metric.entryCount === 0) return undefined;
 	const runKey = `${run.windowId}:${user.id}:${settledEntry.id}:${run.startPosition.entryId ?? "none"}:${run.startPosition.branchDepth}`;
 	return {
@@ -2978,18 +2937,20 @@ function collectReminderReasons(
 ): { usage: ReminderUsage | undefined; reasons: ReminderReason[] } {
 	const entries = ctx.sessionManager.getBranch();
 	const origin = volumeOrigin(state, entries);
-	const effectiveTail = effectiveTailTokens(pi, ctx, state);
-	const metric = volumeMeasurement(entries, positionStartIndex(entries, origin.position), effectiveTail);
+	const metric = volumeMeasurement(entries, positionStartIndex(entries, origin.position));
+	const contextWindow = ctx.model?.contextWindow ?? 0;
+	const interval = Number.isFinite(contextWindow) && contextWindow > 0 ? Math.max(1, Math.floor(contextWindow * 0.10)) : undefined;
+	const bucket = interval === undefined ? 0 : Math.floor(metric.tokens / interval);
 	const reasons: ReminderReason[] = [];
-	if (metric.effectiveTailTokens !== undefined && metric.entryCount > 0 && metric.tokens > metric.effectiveTailTokens) {
+	if (interval !== undefined && metric.entryCount > 0 && bucket >= 1) {
 		reasons.push({
-			key: `${origin.windowId}:stale-volume:${origin.checkpointEntryId ?? "none"}`,
+			key: `${origin.windowId}:stale-volume:${origin.checkpointEntryId ?? "none"}:tokens:${bucket * interval}`,
 			kind: "stale-volume",
 			windowId: origin.windowId,
 			checkpointEntryId: origin.checkpointEntryId,
 			fromEntryId: metric.fromEntryId,
 			toEntryId: metric.toEntryId,
-			cause: `new nonmaintenance volume (${metric.tokens} tokens) exceeds the effective recent-tail budget (${metric.effectiveTailTokens} tokens)`,
+			cause: `new nonmaintenance volume (${metric.tokens} tokens) reached interval ${bucket}; each interval is 10% of the current model window (${interval} tokens)`,
 		});
 	}
 	const usage = reminderUsage(pi, ctx, settingsReader);
@@ -3014,9 +2975,24 @@ function collectReminderReasons(
 	return { usage, reasons: [...new Map(reasons.map((reason) => [reason.key, reason])).values()] };
 }
 
+function volumeReminderMark(key: string): { prefix: string; tokens: number } | undefined {
+	const match = /^(.*:stale-volume:.*:tokens:)(\d+)$/.exec(key);
+	const tokens = Number(match?.[2]);
+	return match && Number.isSafeInteger(tokens) && tokens > 0 ? { prefix: match[1], tokens } : undefined;
+}
+
 function reminderReasonKnown(state: SessionState, reason: ReminderReason): boolean {
 	const keys = reasonKeys(reason);
 	if (keys.some((key) => state.deliveredReminderKeys.has(key) || state.queuedReminderKeys.has(key))) return true;
+	const volume = reason.kind === "stale-volume" ? volumeReminderMark(reason.key) : undefined;
+	if (volume) {
+		for (const knownKeys of [state.deliveredReminderKeys, state.queuedReminderKeys]) {
+			for (const key of knownKeys) {
+				const known = volumeReminderMark(key);
+				if (known?.prefix === volume.prefix && known.tokens >= volume.tokens) return true;
+			}
+		}
+	}
 	if (reason.kind === "budget" && reason.level === "soft") {
 		return [
 			`${reason.windowId}:urgent`,
@@ -3027,7 +3003,15 @@ function reminderReasonKnown(state: SessionState, reason: ReminderReason): boole
 }
 
 function mergeReminderReasons(left: ReminderReason[], right: ReminderReason[]): ReminderReason[] {
-	return [...new Map([...left, ...right].map((reason) => [reason.key, reason])).values()];
+	const merged = new Map<string, ReminderReason>();
+	for (const reason of [...left, ...right]) {
+		const volume = reason.kind === "stale-volume" ? volumeReminderMark(reason.key) : undefined;
+		if (reason.kind === "stale-volume" && !volume) continue;
+		const key = volume?.prefix ?? reason.key;
+		const previous = merged.get(key);
+		if (!previous || !volume || volume.tokens >= (volumeReminderMark(previous.key)?.tokens ?? 0)) merged.set(key, reason);
+	}
+	return [...merged.values()];
 }
 
 function deliverReminderReasons(
@@ -3040,9 +3024,9 @@ function deliverReminderReasons(
 	if (state.persistenceUncertain) return;
 	reconcileReminderQueue(state, ctx, false);
 	const collected = collectReminderReasons(state, pi, ctx, settingsReader);
-	const pendingReasons = delivery === "steer"
-		? state.pendingReminderReasons.filter((reason) => reason.kind !== "external-run")
-		: state.pendingReminderReasons;
+	const pendingReasons = state.pendingReminderReasons.filter((reason) =>
+		reason.kind !== "stale-volume" && (delivery !== "steer" || reason.kind !== "external-run"),
+	);
 	const collectedReasons = delivery === "steer"
 		? collected.reasons.filter((reason) => reason.kind !== "external-run")
 		: collected.reasons;

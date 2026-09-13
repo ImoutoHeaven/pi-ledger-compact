@@ -1575,7 +1575,7 @@ test("stale volume counts ordinary work while excluding maintenance entries", { 
 			role: "toolResult",
 			toolCallId: ordinaryCallId,
 			toolName: "ordinary_tool",
-			content: [{ type: "text", text: `ordinary-volume-result:${"o".repeat(1_000)}` }],
+			content: [{ type: "text", text: `ordinary-volume-result:${"o".repeat(7_000)}` }],
 			isError: false,
 			timestamp: Date.now(),
 		});
@@ -1632,6 +1632,80 @@ test("stale volume counts ordinary work while excluding maintenance entries", { 
 	}
 });
 
+test("volume reminders follow ten-percent marks across jumps, reload, model changes and checkpoints", { timeout: TEST_TIMEOUT_MS }, async () => {
+	const previousTail = process.env.LEDGER_CONTEXT_TAIL_TOKENS;
+	process.env.LEDGER_CONTEXT_TAIL_TOKENS = "64";
+	const { root, faux, session, sessionManager } = await createFixture(true, [], 2_000, {
+		contextWindow: 20_000, maxTokens: 512, reserveTokens: 0, compactionEnabled: false,
+	});
+	const notices = () => sessionManager.getBranch().filter((entry) => entry.type === "custom_message" &&
+		entry.customType === REMINDER_MESSAGE_TYPE &&
+		(entry.details as { reasonKinds?: string[] }).reasonKinds?.includes("stale-volume"));
+	const fillTo = (tokens: number) => {
+		const entries = sessionManager.getBranch();
+		const checkpoint = checkpointEntries(entries).at(-1)!;
+		const origin = (checkpoint.data as { requestHistoryPosition: { entryId: string } }).requestHistoryPosition.entryId;
+		const messages = messageEntries(entries.slice(entries.findIndex((entry) => entry.id === origin) + 1));
+		let used = 0;
+		for (const { message } of messages) {
+			if (message.role === "user") used += estimateTokens(message);
+			if (message.role === "assistant") {
+				const content = message.content.filter((block) => block.type === "text");
+				if (content.length > 0) used += estimateTokens({ ...message, content });
+			}
+		}
+		assert.ok(tokens > used, `${tokens} must exceed accumulated volume ${used}`);
+		const message = { role: "user" as const, content: "x".repeat((tokens - used) * 4), timestamp: Date.now() };
+		assert.equal(estimateTokens(message), tokens - used);
+		sessionManager.appendMessage(message);
+	};
+	const tick = async () => {
+		faux.setResponses([fauxAssistantMessage("ok")]);
+		await session.prompt("tick");
+	};
+	try {
+		faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "volume origin" })), fauxAssistantMessage("saved")]);
+		await session.prompt("save origin");
+		fillTo(1_990);
+		await tick();
+		assert.equal(notices().length, 0, "tail=64 must not lower the 2000-token interval");
+		fillTo(2_000);
+		await tick();
+		assert.equal(notices().length, 1, "the exact ten-percent boundary triggers");
+		fillTo(4_000);
+		await tick();
+		assert.equal(notices().length, 2, "a new interval reminds even without a checkpoint update");
+		fillTo(11_000);
+		await tick();
+		assert.equal(notices().length, 3, "a jump across several intervals produces one notice");
+		await session.reload();
+		await tick();
+		assert.equal(notices().length, 3, "reload preserves delivered marks");
+		await session.setModel({ ...faux.getModel(), contextWindow: 40_000 });
+		await tick();
+		assert.equal(notices().length, 3, "a larger model does not replay lower marks");
+		fillTo(12_000);
+		await tick();
+		assert.equal(notices().length, 4, "the current model now uses a 4000-token interval");
+		process.env.LEDGER_CONTEXT_TAIL_TOKENS = "8192";
+		faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "new volume origin" })), fauxAssistantMessage("saved")]);
+		await session.prompt("save new origin");
+		await tick();
+		assert.equal(notices().length, 4);
+		fillTo(4_000);
+		await tick();
+		assert.equal(notices().length, 5, "saving resets the origin and tail changes do not change the interval");
+		const latest = notices().at(-1)!;
+		assert.equal(latest.type, "custom_message");
+		if (latest.type === "custom_message") assert.match(String(latest.content), /10%.*4000 tokens/);
+	} finally {
+		session.dispose();
+		rmSync(root, { recursive: true, force: true });
+		if (previousTail === undefined) delete process.env.LEDGER_CONTEXT_TAIL_TOKENS;
+		else process.env.LEDGER_CONTEXT_TAIL_TOKENS = previousTail;
+	}
+});
+
 test("ordinary thinking volume includes mixed work and excludes maintenance-only thinking", { timeout: TEST_TIMEOUT_MS }, async () => {
 	const previousTailLimit = process.env.LEDGER_CONTEXT_TAIL_TOKENS;
 	const previousSoft = process.env.LEDGER_CONTEXT_REMINDER_TOKENS;
@@ -1653,7 +1727,7 @@ test("ordinary thinking volume includes mixed work and excludes maintenance-only
 		await session.prompt("save thinking volume checkpoint");
 		const mixedCallId = "thinking-mixed-ordinary-call";
 		const mixedAssistantId = sessionManager.appendMessage(fauxAssistantMessage([
-			fauxThinking("ordinary mixed reasoning " + "r".repeat(1_000)),
+			fauxThinking("ordinary mixed reasoning " + "r".repeat(7_000)),
 			fauxToolCall("ordinary_tool", { marker: "ordinary mixed call" }, { id: mixedCallId }),
 			fauxToolCall("history_read", { entryId: "checkpoint" }, { id: "thinking-maintenance-call" }),
 		]));
