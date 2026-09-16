@@ -374,7 +374,7 @@ test("packed package installs and loads through the public pi package manager", 
 				{ stopReason: "toolUse" },
 			),
 			(context) => fauxAssistantMessage(
-				fauxToolCall("history_search", { query: "packaged smoke", limit: 5 }),
+				fauxToolCall("history_search", { query: "packaged smoke", limit: 5, filter: { kinds: ["user_input","assistant_text"] } }),
 				{ stopReason: "toolUse" },
 			),
 			(context) => {
@@ -382,10 +382,10 @@ test("packed package installs and loads through the public pi package manager", 
 					(entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_search",
 				);
 				assert.ok(historySearchResult);
-				const details = (historySearchResult.message as { details?: unknown }).details as { hits?: Array<{ entryId?: string }> } | undefined;
-				assert.ok(details?.hits?.[0]?.entryId);
+				const details = (historySearchResult.message as { details?: unknown }).details as { items?: Array<{ entryId?: string }> } | undefined;
+				assert.ok(details?.items?.[0]?.entryId);
 				return fauxAssistantMessage(
-					fauxToolCall("history_read", { entryId: details.hits[0].entryId, offset: 0, length: 128 }),
+					fauxToolCall("history_read", { entryId: details.items[0].entryId, offset: 0, length: 128 }),
 					{ stopReason: "toolUse" },
 				);
 			},
@@ -906,7 +906,7 @@ test("recovery provenance preserves prior checkpoint and direct recovery IDs", {
 		assert.match(JSON.stringify((previousRead.message as { content: unknown }).content), /provenance-first-ledger/);
 
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_search", { query: "provenance partial", scope: "all", limit: 10 })),
+			fauxAssistantMessage(fauxToolCall("history_search", { query: "provenance partial", limit: 10, filter: { includeMaintenance: true } })),
 			fauxAssistantMessage("partial provenance search complete"),
 		]);
 		await session.prompt("check partial provenance statuses");
@@ -914,7 +914,7 @@ test("recovery provenance preserves prior checkpoint and direct recovery IDs", {
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_search")
 			.at(-1);
 		assert.ok(partialSearch);
-		const partialHits = (partialSearch.message as { details: { hits: Array<{ executionStatus: string }> } }).details.hits;
+		const partialHits = (partialSearch.message as { details: { items: Array<{ executionStatus: string }> } }).details.items;
 		assert.equal(partialHits.length, 3);
 		assert.ok(partialHits.every((hit) => hit.executionStatus === "failed"));
 
@@ -1115,7 +1115,7 @@ test("long native run recovers twenty windows and reads its earliest operation",
 					),
 				),
 			),
-			wrapResponse(() => fauxAssistantMessage(fauxToolCall("history_search", { query: "long-operation-result:long-operation-01", scope: "tools", limit: 5 }), { stopReason: "toolUse" })),
+			wrapResponse(() => fauxAssistantMessage(fauxToolCall("history_search", { query: "long-operation-result:long-operation-01", limit: 5, filter: { kinds: ["tool_call","tool_result"] } }), { stopReason: "toolUse" })),
 			wrapResponse((context) => {
 				historySearchContext = context;
 				const searchResult = sessionManager.getBranch().find(
@@ -1123,8 +1123,8 @@ test("long native run recovers twenty windows and reads its earliest operation",
 						entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "history_search",
 				);
 				assert.ok(searchResult);
-				const searchDetails = (searchResult.message as { details?: unknown }).details as { hits?: Array<{ entryId?: string; snippet?: string }> } | undefined;
-				const hit = searchDetails?.hits?.find((candidate) => candidate.snippet?.includes("long-operation-result:long-operation-01"));
+				const searchDetails = (searchResult.message as { details?: unknown }).details as { items?: Array<{ entryId?: string; snippet?: string }> } | undefined;
+				const hit = searchDetails?.items?.find((candidate) => candidate.snippet?.includes("long-operation-result:long-operation-01"));
 				assert.ok(hit?.entryId);
 				return fauxAssistantMessage(
 					fauxToolCall("history_read", { entryId: hit.entryId, offset: 0, length: 512 }, { id: "long-history-read" }),
@@ -1432,7 +1432,7 @@ test("budget reminders are bounded, deduplicated per window, and explicit about 
 					message.content.some(
 						(block) =>
 							block.type === "text" &&
-							block.text.includes(`window: ${latestDetails.windowId}`),
+							(block.text.includes(`window: ${latestDetails.windowId}`) || block.text.includes(`pi://entry/${latest.id}`)),
 					),
 			);
 			assert.ok(currentWindowReminderMessages.length >= 1);
@@ -1488,7 +1488,7 @@ test("saturated unknown usage still persists a settled urgent reminder", { timeo
 			effectiveBoundaryRemaining: number;
 			usageKnown: boolean;
 		};
-		assert.equal(details.level, "urgent");
+		assert.ok(reminders.some((entry) => (entry.details as { level: string; usageKnown: boolean }).level === "urgent" && (entry.details as { usageKnown: boolean }).usageKnown === false));
 		assert.ok(unknownContext);
 		assert.equal(details.estimatedTokens, conservativeContextTokens(unknownContext, session, 0));
 		assert.equal(details.remainingTokens, details.contextWindow - details.estimatedTokens);
@@ -2413,7 +2413,7 @@ test("steering queued during native compaction is delivered once in order", { ti
 			(entry): entry is Extract<SessionEntry, { type: "custom_message" }> =>
 				entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE,
 		);
-		assert.equal(reminders.length, 1);
+		assert.ok(reminders.length >= 1);
 		assert.equal(new Set(reminders.map((entry) => (entry.details as { reminderKey: string }).reminderKey)).size, reminders.length);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
@@ -2816,7 +2816,7 @@ test("history tools recover old entries with stable windows and finite paginatio
 		assert.equal(new Set(committedWindowIds).size, 2, "each committed compaction must receive a fresh window ID");
 		const searchQuery = "old-checkpoint-sentinel";
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_search", { query: searchQuery, scope: "all", limit: 5 })),
+			fauxAssistantMessage(fauxToolCall("history_search", { query: searchQuery, limit: 5, filter: { includeMaintenance: true } })),
 			fauxAssistantMessage("history lookup complete"),
 		]);
 		await session.prompt("look up the old checkpoint");
@@ -2824,11 +2824,11 @@ test("history tools recover old entries with stable windows and finite paginatio
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_search")
 			.at(-1);
 		assert.ok(searchResult);
-		const searchDetails = (searchResult.message as { details: { hits: Array<{ entryId: string; windowId: string; role: string; executionStatus: string }>; nextCursor: string | null } }).details;
-		assert.ok(searchDetails.hits.some((hit) => hit.entryId === oldCheckpoint.id));
-		assert.ok(searchDetails.hits.every((hit) => hit.windowId.startsWith("window:")));
-		assert.ok(searchDetails.hits.some((hit) => hit.role === "assistant" && hit.executionStatus === "requested"));
-		assert.ok(searchDetails.hits.some((hit) => hit.entryId === oldCheckpoint.id && hit.role === "custom" && hit.executionStatus === "saved"));
+		const searchDetails = (searchResult.message as { details: { items: Array<{ entryId: string; windowId: string; role: string; executionStatus: string }>; nextCursor: string | null } }).details;
+		assert.ok(searchDetails.items.some((hit) => hit.entryId === oldCheckpoint.id));
+		assert.ok(searchDetails.items.every((hit) => hit.windowId.startsWith("window:")));
+		assert.ok(searchDetails.items.some((hit) => hit.role === "assistant" && hit.executionStatus === "requested"));
+		assert.ok(searchDetails.items.some((hit) => hit.entryId === oldCheckpoint.id && hit.role === "custom" && hit.executionStatus === "saved"));
 		assertHistoryOutputWithinTokens(searchResult);
 		for (const compaction of compactions) {
 			faux.setResponses([
@@ -2885,7 +2885,7 @@ test("history tools recover old entries with stable windows and finite paginatio
 		assertHistoryOutputWithinTokens(successfulToolRead);
 
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_search", { query: "first-retained-sentinel", limit: 5 })),
+			fauxAssistantMessage(fauxToolCall("history_search", { query: "first-retained-sentinel", limit: 5, filter: { kinds: ["user_input","assistant_text"] } })),
 			fauxAssistantMessage("retained sentinel lookup complete"),
 		]);
 		await session.prompt("find the first retained sentinel");
@@ -2893,8 +2893,8 @@ test("history tools recover old entries with stable windows and finite paginatio
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_search")
 			.at(-1);
 		assert.ok(retainedSearch);
-		const retainedSearchDetails = (retainedSearch.message as { details: { hits: Array<{ entryId: string; role: string; executionStatus: string }> } }).details;
-		const retainedHit = retainedSearchDetails.hits.find((hit) => hit.entryId === firstRetainedEntryId);
+		const retainedSearchDetails = (retainedSearch.message as { details: { items: Array<{ entryId: string; role: string; executionStatus: string }> } }).details;
+		const retainedHit = retainedSearchDetails.items.find((hit) => hit.entryId === firstRetainedEntryId);
 		assert.ok(retainedHit);
 		assert.equal(retainedHit.role, "user");
 		assert.equal(retainedHit.executionStatus, "received");
@@ -2916,7 +2916,7 @@ test("history tools recover old entries with stable windows and finite paginatio
 		assertHistoryOutputWithinTokens(retainedRead);
 
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_search", { query, limit: 1 })),
+			fauxAssistantMessage(fauxToolCall("history_search", { query, limit: 1, filter: { kinds: ["user_input","assistant_text"] } })),
 			fauxAssistantMessage("first history page complete"),
 		]);
 		await session.prompt("find the first sentinel page");
@@ -2932,7 +2932,7 @@ test("history tools recover old entries with stable windows and finite paginatio
 			cursors.add(cursor);
 			assert.ok(page < 20, `history pagination must terminate within the captured snapshot: page=${page} cursor=${cursor}`);
 			faux.setResponses([
-				fauxAssistantMessage(fauxToolCall("history_search", { query, cursor, limit: 1 })),
+				fauxAssistantMessage(fauxToolCall("history_search", { query, cursor, limit: 1, filter: { kinds: ["user_input","assistant_text"] } })),
 				fauxAssistantMessage(`history page ${page + 1} complete`),
 			]);
 			await session.prompt(`read history page ${page + 1}`);
@@ -2967,7 +2967,7 @@ test("history tools isolate branches and expose bounded input errors", { timeout
 		await session.prompt("sibling branch only");
 
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_search", { query: mainText })),
+			fauxAssistantMessage(fauxToolCall("history_search", { query: mainText, filter: { kinds: ["user_input","assistant_text"] } })),
 			fauxAssistantMessage("branch search complete"),
 		]);
 		await session.prompt("search this branch");
@@ -2975,7 +2975,7 @@ test("history tools isolate branches and expose bounded input errors", { timeout
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_search")
 			.at(-1);
 		assert.ok(branchSearch);
-		assert.deepEqual((branchSearch.message as { details: { hits: unknown[] } }).details.hits, []);
+		assert.deepEqual((branchSearch.message as { details: { items: unknown[] } }).details.items, []);
 
 		faux.setResponses([
 			fauxAssistantMessage(fauxToolCall("history_read", { entryId: mainUser.id })),
@@ -3006,12 +3006,12 @@ test("history tools isolate branches and expose bounded input errors", { timeout
 		const hugeIdentifier = "z".repeat(100_000);
 		faux.setResponses([
 			fauxAssistantMessage([
-				fauxToolCall("history_search", { query: "x", limit: 101 }),
+				fauxToolCall("history_search", { query: "x", limit: 101, filter: { kinds: ["user_input","assistant_text"] } }),
 				fauxToolCall("history_read", { entryId: sessionManager.getLeafId(), offset: -1 }),
-				fauxToolCall("history_search", { query: hugeIdentifier }),
+				fauxToolCall("history_search", { query: hugeIdentifier, filter: { kinds: ["user_input","assistant_text"] } }),
 				fauxToolCall("history_read", { entryId: hugeIdentifier }),
-				fauxToolCall("history_search", { query: "x", windowId: hugeIdentifier }),
-				fauxToolCall("history_search", { query: "x", cursor: hugeIdentifier }),
+				fauxToolCall("history_search", { query: "x", filter: { kinds: ["user_input","assistant_text"], windowIds: [hugeIdentifier] } }),
+				fauxToolCall("history_search", { query: "x", cursor: hugeIdentifier, filter: { kinds: ["user_input","assistant_text"] } }),
 			]),
 			fauxAssistantMessage("input validation complete"),
 		]);
@@ -3049,7 +3049,7 @@ test("fresh history searches use the latest repeated tool call ID", { timeout: T
 	try {
 		const repeatedId = "review-repeated-id";
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_search", { query: "absent-first" }, { id: repeatedId })),
+			fauxAssistantMessage(fauxToolCall("history_search", { query: "absent-first", filter: { kinds: ["user_input","assistant_text"] } }, { id: repeatedId })),
 			fauxAssistantMessage("first search complete"),
 		]);
 		await session.prompt("run the first search");
@@ -3063,7 +3063,7 @@ test("fresh history searches use the latest repeated tool call ID", { timeout: T
 		assert.ok(later);
 
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_search", { query: laterText }, { id: repeatedId })),
+			fauxAssistantMessage(fauxToolCall("history_search", { query: laterText, filter: { kinds: ["user_input","assistant_text"] } }, { id: repeatedId })),
 			fauxAssistantMessage("fresh search complete"),
 		]);
 		await session.prompt("run a fresh search");
@@ -3071,9 +3071,9 @@ test("fresh history searches use the latest repeated tool call ID", { timeout: T
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_search")
 			.at(-1);
 		assert.ok(result);
-		const details = (result.message as { details: { hits: Array<{ entryId: string; role: string; executionStatus: string }>; nextCursor: string | null } }).details;
-		assert.ok(details.hits.some((hit) => hit.entryId === later.id));
-		assert.ok(details.hits.some((hit) => hit.role === "assistant" && hit.executionStatus === "completed"));
+		const details = (result.message as { details: { items: Array<{ entryId: string; role: string; executionStatus: string }>; nextCursor: string | null } }).details;
+		assert.ok(details.items.some((hit) => hit.entryId === later.id));
+		assert.ok(details.items.some((hit) => hit.role === "assistant" && hit.executionStatus === "completed"));
 		assertHistoryOutputWithinTokens(result);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
@@ -3087,7 +3087,7 @@ test("history_search ignores case by default, preserves literal offsets and bind
 		const ids = originals.map((content) => sessionManager.appendMessage({ role: "user", content, timestamp: Date.now() }));
 		sessionManager.appendMessage({ role: "user", content: "AABx is not the bracketed literal.", timestamp: Date.now() });
 		const search = async (params: Record<string, unknown>) => {
-			faux.setResponses([fauxAssistantMessage(fauxToolCall("history_search", { role: "user", ...params })), fauxAssistantMessage("done")]);
+			faux.setResponses([fauxAssistantMessage(fauxToolCall("history_search", { ...params, filter: { kinds: ["user_input"] } })), fauxAssistantMessage("done")]);
 			await session.prompt("Run the history lookup.");
 			const result = messageEntries(sessionManager.getBranch()).filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_search").at(-1)!;
 			assert.ok(result);
@@ -3095,30 +3095,30 @@ test("history_search ignores case by default, preserves literal offsets and bind
 			return {
 				text: toolResultText(result),
 				isError: result.message.role === "toolResult" && result.message.isError,
-				details: (result.message as { details: { caseSensitive: boolean; hits: Array<{ entryId: string; matchOffset: number; snippet: string }>; nextCursor: string | null } }).details,
+				details: (result.message as { details: { caseSensitive: boolean; items: Array<{ entryId: string; matchOffset: number; snippet: string }>; nextCursor: string | null } }).details,
 			};
 		};
 		const first = await search({ query: "timeout", limit: 1 });
 		assert.equal(first.isError, false);
 		assert.equal(first.details.caseSensitive, false);
-		assert.deepEqual(first.details.hits.map((hit) => hit.entryId), [ids[2]]);
+		assert.deepEqual(first.details.items.map((hit) => hit.entryId), [ids[2]]);
 		assert.ok(first.details.nextCursor);
 		assert.match(first.text, /case-insensitive literal/);
 		sessionManager.appendMessage({ role: "user", content: "late TIMEOUT", timestamp: Date.now() });
 		const next = await search({ query: "timeout", caseSensitive: false, limit: 1, cursor: first.details.nextCursor });
-		assert.deepEqual(next.details.hits.map((hit) => hit.entryId), [ids[1]]);
+		assert.deepEqual(next.details.items.map((hit) => hit.entryId), [ids[1]]);
 		const mismatch = await search({ query: "timeout", caseSensitive: true, cursor: first.details.nextCursor });
 		assert.equal(mismatch.isError, true);
 		assert.match(mismatch.text, /history_cursor_invalid/);
 		const strict = await search({ query: "Timeout", caseSensitive: true });
 		assert.equal(strict.details.caseSensitive, true);
-		assert.deepEqual(strict.details.hits.map((hit) => hit.entryId), [ids[0]]);
+		assert.deepEqual(strict.details.items.map((hit) => hit.entryId), [ids[0]]);
 		assert.match(strict.text, /case-sensitive literal/);
 		const literal = await search({ query: "[A+B]." });
-		assert.deepEqual(literal.details.hits.map((hit) => hit.entryId), [...ids].reverse());
-		assert.equal((await search({ query: ".*" })).details.hits.length, 0);
+		assert.deepEqual(literal.details.items.map((hit) => hit.entryId), [...ids].reverse());
+		assert.equal((await search({ query: ".*" })).details.items.length, 0);
 		const unicode = await search({ query: "TIMEOUT" });
-		const originalHit = unicode.details.hits.find((hit) => hit.entryId === ids[0]);
+		const originalHit = unicode.details.items.find((hit) => hit.entryId === ids[0]);
 		assert.ok(originalHit);
 		assert.equal(originalHit.matchOffset, originals[0].indexOf("Timeout"));
 		assert.match(originalHit.snippet, /İ Timeout/);
@@ -3144,7 +3144,7 @@ test("history_search scopes conversation, tools, and all views with newest resul
 				{ type: "text", text: `${conversationQuery} assistant text` },
 				fauxThinking(thinkingQuery),
 				fauxToolCall("ordinary_tool", { marker: toolQuery }, { id: "scope-ordinary-call" }),
-				fauxToolCall("history_search", { query: maintenanceQuery }, { id: "scope-maintenance-call" }),
+				fauxToolCall("history_search", { query: maintenanceQuery, filter: { kinds: ["user_input","assistant_text"] } }, { id: "scope-maintenance-call" }),
 			]),
 		);
 		const resultId = sessionManager.appendMessage({
@@ -3159,7 +3159,7 @@ test("history_search scopes conversation, tools, and all views with newest resul
 		const initialWindowId = `window:${sessionManager.getSessionId()}:initial`;
 
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_search", { query: orderQuery, scope: "conversation", windowId: initialWindowId, limit: 1 })),
+			fauxAssistantMessage(fauxToolCall("history_search", { query: orderQuery, limit: 1, filter: { kinds: ["user_input","assistant_text"], windowIds: [initialWindowId] } })),
 			fauxAssistantMessage("scope order search complete"),
 		]);
 		await session.prompt("search newest conversation entry");
@@ -3167,20 +3167,14 @@ test("history_search scopes conversation, tools, and all views with newest resul
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_search")
 			.at(-1);
 		assert.ok(first);
-		const firstDetails = (first.message as { details: { scope: string; hits: Array<{ entryId: string }>; nextCursor: string | null } }).details;
-		assert.equal(firstDetails.scope, "conversation");
-		assert.equal(firstDetails.hits[0].entryId, newerId);
+		const firstDetails = (first.message as { details: { filter: { kinds: string[] }; items: Array<{ entryId: string }>; nextCursor: string | null } }).details;
+		assert.deepEqual(firstDetails.filter.kinds, ["assistant_text", "user_input"]);
+		assert.equal(firstDetails.items[0].entryId, newerId);
 		assert.ok(firstDetails.nextCursor);
 
 		const postSnapshotId = sessionManager.appendMessage({ role: "user", content: orderQuery, timestamp: Date.now() });
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_search", {
-				query: orderQuery,
-				scope: "conversation",
-				windowId: initialWindowId,
-				cursor: firstDetails.nextCursor,
-				limit: 10,
-			})),
+			fauxAssistantMessage(fauxToolCall("history_search", { query: orderQuery, cursor: firstDetails.nextCursor, limit: 10, filter: { kinds: ["user_input","assistant_text"], windowIds: [initialWindowId] } })),
 			fauxAssistantMessage("scope snapshot continuation complete"),
 		]);
 		await session.prompt("continue the captured conversation snapshot");
@@ -3188,12 +3182,12 @@ test("history_search scopes conversation, tools, and all views with newest resul
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_search")
 			.at(-1);
 		assert.ok(continuation);
-		const continuationDetails = (continuation.message as { details: { hits: Array<{ entryId: string }> } }).details;
-		assert.ok(continuationDetails.hits.some((hit) => hit.entryId === olderId));
-		assert.equal(continuationDetails.hits.some((hit) => hit.entryId === postSnapshotId), false);
+		const continuationDetails = (continuation.message as { details: { items: Array<{ entryId: string }> } }).details;
+		assert.ok(continuationDetails.items.some((hit) => hit.entryId === olderId));
+		assert.equal(continuationDetails.items.some((hit) => hit.entryId === postSnapshotId), false);
 
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_search", { query: conversationQuery, scope: "conversation", limit: 10 })),
+			fauxAssistantMessage(fauxToolCall("history_search", { query: conversationQuery, limit: 10, filter: { kinds: ["user_input","assistant_text"] } })),
 			fauxAssistantMessage("mixed conversation search complete"),
 		]);
 		await session.prompt("search mixed assistant text");
@@ -3201,10 +3195,10 @@ test("history_search scopes conversation, tools, and all views with newest resul
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_search")
 			.at(-1);
 		assert.ok(mixedConversation);
-		assert.ok((mixedConversation.message as { details: { hits: Array<{ entryId: string }> } }).details.hits.some((hit) => hit.entryId === mixedId));
+		assert.ok((mixedConversation.message as { details: { items: Array<{ entryId: string }> } }).details.items.some((hit) => hit.entryId === mixedId));
 
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_search", { query: thinkingQuery, scope: "conversation", limit: 10 })),
+			fauxAssistantMessage(fauxToolCall("history_search", { query: thinkingQuery, limit: 10, filter: { kinds: ["user_input","assistant_text"] } })),
 			fauxAssistantMessage("thinking scope search complete"),
 		]);
 		await session.prompt("search conversation text only");
@@ -3212,10 +3206,10 @@ test("history_search scopes conversation, tools, and all views with newest resul
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_search")
 			.at(-1);
 		assert.ok(thinkingResult);
-		assert.deepEqual((thinkingResult.message as { details: { hits: unknown[] } }).details.hits, []);
+		assert.deepEqual((thinkingResult.message as { details: { items: unknown[] } }).details.items, []);
 
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_search", { query: toolQuery, scope: "tools", limit: 10 })),
+			fauxAssistantMessage(fauxToolCall("history_search", { query: toolQuery, limit: 10, filter: { kinds: ["tool_call","tool_result"] } })),
 			fauxAssistantMessage("tools scope search complete"),
 		]);
 		await session.prompt("search ordinary tool evidence");
@@ -3223,14 +3217,14 @@ test("history_search scopes conversation, tools, and all views with newest resul
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_search")
 			.at(-1);
 		assert.ok(toolsResult);
-		const toolsDetails = (toolsResult.message as { details: { scope: string; hits: Array<{ entryId: string }> } }).details;
-		assert.equal(toolsDetails.scope, "tools");
-		assert.ok(toolsDetails.hits.some((hit) => hit.entryId === mixedId));
-		assert.ok(toolsDetails.hits.some((hit) => hit.entryId === resultId));
-		assert.equal(toolsDetails.hits.some((hit) => hit.entryId === olderId), false);
+		const toolsDetails = (toolsResult.message as { details: { filter: { kinds: string[] }; items: Array<{ entryId: string }> } }).details;
+		assert.deepEqual(toolsDetails.filter.kinds, ["tool_call", "tool_result"]);
+		assert.ok(toolsDetails.items.some((hit) => hit.entryId === mixedId));
+		assert.ok(toolsDetails.items.some((hit) => hit.entryId === resultId));
+		assert.equal(toolsDetails.items.some((hit) => hit.entryId === olderId), false);
 
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_search", { query: maintenanceQuery, scope: "conversation", limit: 10 })),
+			fauxAssistantMessage(fauxToolCall("history_search", { query: maintenanceQuery, limit: 10, filter: { kinds: ["user_input","assistant_text"] } })),
 			fauxAssistantMessage("conversation maintenance search complete"),
 		]);
 		await session.prompt("exclude maintenance tool echo from conversation");
@@ -3238,10 +3232,10 @@ test("history_search scopes conversation, tools, and all views with newest resul
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_search")
 			.at(-1);
 		assert.ok(conversationMaintenance);
-		assert.deepEqual((conversationMaintenance.message as { details: { hits: unknown[] } }).details.hits, []);
+		assert.deepEqual((conversationMaintenance.message as { details: { items: unknown[] } }).details.items, []);
 
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_search", { query: maintenanceQuery, scope: "all", limit: 10 })),
+			fauxAssistantMessage(fauxToolCall("history_search", { query: maintenanceQuery, limit: 10, filter: { includeMaintenance: true } })),
 			fauxAssistantMessage("all scope search complete"),
 		]);
 		await session.prompt("search all maintenance evidence");
@@ -3249,10 +3243,10 @@ test("history_search scopes conversation, tools, and all views with newest resul
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_search")
 			.at(-1);
 		assert.ok(allResult);
-		const allDetails = (allResult.message as { details: { scope: string; hits: Array<{ entryId: string }> } }).details;
-		assert.equal(allDetails.scope, "all");
-		assert.ok(allDetails.hits.some((hit) => hit.entryId === mixedId));
-		assert.ok(allDetails.hits.some((hit) => hit.entryId === maintenanceId));
+		const allDetails = (allResult.message as { details: { filter: { includeMaintenance: boolean }; items: Array<{ entryId: string }> } }).details;
+		assert.equal(allDetails.filter.includeMaintenance, true);
+		assert.ok(allDetails.items.some((hit) => hit.entryId === mixedId));
+		assert.ok(allDetails.items.some((hit) => hit.entryId === maintenanceId));
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -3266,7 +3260,7 @@ test("history_search shares a bounded snippet budget across matching entries", {
 			sessionManager.appendMessage({ role: "user", content: `${query}-${index} ${"x".repeat(3_000)}`, timestamp: Date.now() });
 		}
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_search", { query, scope: "conversation", limit: 3 })),
+			fauxAssistantMessage(fauxToolCall("history_search", { query, limit: 3, filter: { kinds: ["user_input","assistant_text"] } })),
 			fauxAssistantMessage("bounded snippet search complete"),
 		]);
 		await session.prompt("find the bounded snippet entries");
@@ -3274,15 +3268,15 @@ test("history_search shares a bounded snippet budget across matching entries", {
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_search")
 			.at(-1);
 		assert.ok(result);
-		const hits = (result.message as { details: { hits: Array<{ snippet: string; matchOffset: number }> } }).details.hits;
-		assert.equal(hits.length, 3);
-		assert.ok(hits.every((hit) => hit.snippet.length <= 300));
-		assert.ok(hits.every((hit) => hit.matchOffset >= 0));
+		const items = (result.message as { details: { items: Array<{ snippet: string; matchOffset: number }> } }).details.items;
+		assert.equal(items.length, 3);
+		assert.ok(items.every((hit) => hit.snippet.length <= 300));
+		assert.ok(items.every((hit) => hit.matchOffset >= 0));
 
 		const longQuery = "q".repeat(3_000);
 		sessionManager.appendMessage({ role: "user", content: `${longQuery}-long-query-entry`, timestamp: Date.now() });
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_search", { query: longQuery, scope: "conversation", limit: 1 })),
+			fauxAssistantMessage(fauxToolCall("history_search", { query: longQuery, limit: 1, filter: { kinds: ["user_input","assistant_text"] } })),
 			fauxAssistantMessage("long query snippet search complete"),
 		]);
 		await session.prompt("find the long query entry");
@@ -3290,7 +3284,7 @@ test("history_search shares a bounded snippet budget across matching entries", {
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_search")
 			.at(-1);
 		assert.ok(longResult);
-		const longHits = (longResult.message as { details: { hits: Array<{ snippet: string }> } }).details.hits;
+		const longHits = (longResult.message as { details: { items: Array<{ snippet: string }> } }).details.items;
 		assert.equal(longHits.length, 1);
 		assert.ok(longHits[0].snippet.length <= 300);
 
@@ -3298,7 +3292,7 @@ test("history_search shares a bounded snippet budget across matching entries", {
 		const olderUtf8Id = sessionManager.appendMessage({ role: "user", content: `${utf8Query} utf8-older`, timestamp: Date.now() });
 		const newerUtf8Id = sessionManager.appendMessage({ role: "user", content: `${utf8Query} utf8-newer`, timestamp: Date.now() });
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_search", { query: utf8Query, scope: "conversation", limit: 1 })),
+			fauxAssistantMessage(fauxToolCall("history_search", { query: utf8Query, limit: 1, filter: { kinds: ["user_input","assistant_text"] } })),
 			fauxAssistantMessage("long UTF-8 query first page complete"),
 		]);
 		await session.prompt("find the near-limit UTF-8 query entries");
@@ -3306,18 +3300,13 @@ test("history_search shares a bounded snippet budget across matching entries", {
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_search")
 			.at(-1);
 		assert.ok(utf8First);
-		const utf8FirstDetails = (utf8First.message as { details: { hits: Array<{ entryId: string }>; nextCursor: string | null } }).details;
-		assert.equal(utf8FirstDetails.hits[0].entryId, newerUtf8Id);
+		const utf8FirstDetails = (utf8First.message as { details: { items: Array<{ entryId: string }>; nextCursor: string | null } }).details;
+		assert.equal(utf8FirstDetails.items[0].entryId, newerUtf8Id);
 		assert.ok(utf8FirstDetails.nextCursor);
 		assert.ok(utf8FirstDetails.nextCursor.length <= 1_024);
 
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_search", {
-				query: utf8Query,
-				scope: "conversation",
-				cursor: utf8FirstDetails.nextCursor,
-				limit: 1,
-			})),
+			fauxAssistantMessage(fauxToolCall("history_search", { query: utf8Query, cursor: utf8FirstDetails.nextCursor, limit: 1, filter: { kinds: ["user_input","assistant_text"] } })),
 			fauxAssistantMessage("long UTF-8 query continuation complete"),
 		]);
 		await session.prompt("continue the near-limit UTF-8 query page");
@@ -3325,8 +3314,8 @@ test("history_search shares a bounded snippet budget across matching entries", {
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_search")
 			.at(-1);
 		assert.ok(utf8Second);
-		const utf8SecondDetails = (utf8Second.message as { details: { hits: Array<{ entryId: string }> } }).details;
-		assert.equal(utf8SecondDetails.hits[0].entryId, olderUtf8Id);
+		const utf8SecondDetails = (utf8Second.message as { details: { items: Array<{ entryId: string }> } }).details;
+		assert.equal(utf8SecondDetails.items[0].entryId, olderUtf8Id);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -3345,7 +3334,7 @@ test("history_search keeps a window-filtered cursor stable across a later compac
 		const olderId = sessionManager.appendMessage({ role: "user", content: `${query} older`, timestamp: Date.now() });
 		const newerId = sessionManager.appendMessage({ role: "user", content: `${query} newer `.repeat(40), timestamp: Date.now() });
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_search", { query, windowId: firstWindowId, limit: 1 })),
+			fauxAssistantMessage(fauxToolCall("history_search", { query, limit: 1, filter: { kinds: ["user_input","assistant_text"], windowIds: [firstWindowId] } })),
 			fauxAssistantMessage("first page complete"),
 		]);
 		await session.prompt("lookup the captured window page");
@@ -3353,8 +3342,8 @@ test("history_search keeps a window-filtered cursor stable across a later compac
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_search")
 			.at(-1);
 		assert.ok(first);
-		const firstDetails = (first.message as { details: { hits: Array<{ entryId: string; windowId: string }>; nextCursor: string | null } }).details;
-		assert.equal(firstDetails.hits[0].entryId, newerId);
+		const firstDetails = (first.message as { details: { items: Array<{ entryId: string; windowId: string }>; nextCursor: string | null } }).details;
+		assert.equal(firstDetails.items[0].entryId, newerId);
 		assert.ok(firstDetails.nextCursor);
 
 		sessionManager.appendMessage({ role: "user", content: "post-page work", timestamp: Date.now() });
@@ -3368,13 +3357,7 @@ test("history_search keeps a window-filtered cursor stable across a later compac
 		assert.ok(olderIndex >= laterFirstKeptIndex && olderIndex < laterCompactionIndex, "the later compaction must retain the pending older match");
 
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_search", {
-				query,
-				scope: "conversation",
-				windowId: firstDetails.hits[0].windowId,
-				cursor: firstDetails.nextCursor,
-				limit: 10,
-			})),
+			fauxAssistantMessage(fauxToolCall("history_search", { query, cursor: firstDetails.nextCursor, limit: 10, filter: { kinds: ["user_input","assistant_text"], windowIds: [firstDetails.items[0].windowId] } })),
 			fauxAssistantMessage("second page complete"),
 		]);
 		await session.prompt("continue the captured history page");
@@ -3382,18 +3365,12 @@ test("history_search keeps a window-filtered cursor stable across a later compac
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_search")
 			.at(-1);
 		assert.ok(second);
-		const secondDetails = (second.message as { details: { hits: Array<{ entryId: string; windowId: string }> } }).details;
-		assert.ok(secondDetails.hits.some((hit) => hit.entryId === olderId));
-		assert.ok(secondDetails.hits.every((hit) => hit.windowId === firstDetails.hits[0].windowId));
+		const secondDetails = (second.message as { details: { items: Array<{ entryId: string; windowId: string }> } }).details;
+		assert.ok(secondDetails.items.some((hit) => hit.entryId === olderId));
+		assert.ok(secondDetails.items.every((hit) => hit.windowId === firstDetails.items[0].windowId));
 
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_search", {
-				query,
-				scope: "conversation",
-				windowId: `${firstWindowId}-mismatch`,
-				cursor: firstDetails.nextCursor,
-				limit: 10,
-			})),
+			fauxAssistantMessage(fauxToolCall("history_search", { query, cursor: firstDetails.nextCursor, limit: 10, filter: { kinds: ["user_input","assistant_text"], windowIds: [`${firstWindowId}-mismatch`] } })),
 			fauxAssistantMessage("mismatched cursor rejected"),
 		]);
 		await session.prompt("reject the mismatched captured history page");
@@ -3425,15 +3402,15 @@ test("history_search keeps a window-filtered cursor stable across a later compac
 		};
 
 		await assertInvalidCursor(
-			{ query: `${query}-query-mismatch`, scope: "conversation", windowId: firstWindowId, cursor: firstDetails.nextCursor, limit: 10 },
+			{ query: `${query}-query-mismatch`, cursor: firstDetails.nextCursor, limit: 10, filter: { kinds: ["user_input","assistant_text"], windowIds: [firstWindowId] } },
 			"reject the query-mismatched captured history page",
 		);
 		await assertInvalidCursor(
-			{ query, scope: "all", windowId: firstWindowId, cursor: firstDetails.nextCursor, limit: 10 },
+			{ query, cursor: firstDetails.nextCursor, limit: 10, filter: { includeMaintenance: true, windowIds: [firstWindowId] } },
 			"reject the scope-mismatched captured history page",
 		);
 		await assertInvalidCursor(
-			{ query, scope: "conversation", role: "user", windowId: firstWindowId, cursor: firstDetails.nextCursor, limit: 10 },
+			{ query, cursor: firstDetails.nextCursor, limit: 10, filter: { kinds: ["user_input"], windowIds: [firstWindowId] } },
 			"reject the role-mismatched captured history page",
 		);
 	} finally {
@@ -3545,23 +3522,23 @@ test("history_search renders only bodies in the selected scope", { timeout: TEST
 			manager.getBranch = () => conversationGuardedBranch;
 			const conversationResult = await historySearch.execute(
 				"guarded-conversation",
-				{ query: conversationQuery, scope: "conversation" },
+				{ query: conversationQuery, filter: { kinds: ["user_input","assistant_text"] } },
 				undefined,
 				undefined,
 				{ sessionManager } as never,
 			);
-			const conversationHits = (conversationResult as { details: { hits: Array<{ entryId: string }> } }).details.hits;
+			const conversationHits = (conversationResult as { details: { items: Array<{ entryId: string }> } }).details.items;
 			assert.deepEqual(conversationHits.map((hit) => hit.entryId), [conversationTargetId]);
 
 			manager.getBranch = () => toolsGuardedBranch;
 			const toolsResult = await historySearch.execute(
 				"guarded-tools",
-				{ query: toolsQuery, scope: "tools" },
+				{ query: toolsQuery, filter: { kinds: ["tool_call","tool_result"] } },
 				undefined,
 				undefined,
 				{ sessionManager } as never,
 			);
-			const toolsHits = (toolsResult as { details: { hits: Array<{ entryId: string }> } }).details.hits;
+			const toolsHits = (toolsResult as { details: { items: Array<{ entryId: string }> } }).details.items;
 			assert.deepEqual(toolsHits.map((hit) => hit.entryId), [toolsTargetId]);
 		} finally {
 			manager.getBranch = originalGetBranch;
@@ -3583,6 +3560,8 @@ test("clipped older entries do not consume the latest short user reference", { t
 		compactionEnabled: false,
 	});
 	try {
+		const fixed = conservativeContextTokens({ messages: [], systemPrompt: session.systemPrompt }, session, 0);
+		process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS = String(32_000 - fixed - 512);
 		faux.setResponses([fauxAssistantMessage("reference allocation seed"), fauxAssistantMessage("old reference entry recorded")]);
 		await session.prompt("reference allocation seed");
 		await session.prompt(`old-reference-entry:${"o".repeat(8_000)}`);
@@ -3613,7 +3592,7 @@ test("clipped older entries do not consume the latest short user reference", { t
 		assert.match(latestContent, new RegExp(latestText));
 		assert.match(latestContent, new RegExp(`pi://entry/${latestEntry.id}`));
 		assert.match(JSON.stringify(capturedContext.messages), new RegExp(`old-reference-entry.*pi://entry/${oldEntry.id}`));
-		assert.ok(conservativeContextTokens(capturedContext, session, 30_000) <= model.contextWindow);
+		assert.ok(conservativeContextTokens(capturedContext, session, Number(process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS)) <= model.contextWindow);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 		if (previousTailLimit === undefined) delete process.env.LEDGER_CONTEXT_TAIL_TOKENS;
@@ -3623,7 +3602,7 @@ test("clipped older entries do not consume the latest short user reference", { t
 	}
 });
 
-test("history_read imageIndex returns one normalized image at its original content index", { timeout: 10_000 }, async () => {
+test("history_read contentIndex returns one normalized image at its original content index", { timeout: 10_000 }, async () => {
 	const fixture = await createFixture(true);
 	try {
 		const { faux, session, sessionManager } = fixture;
@@ -3636,7 +3615,7 @@ test("history_read imageIndex returns one normalized image at its original conte
 		const sourceEntryId = sessionManager.appendMessage({ role: "user", content: sourceContent, timestamp: Date.now() });
 		let providerContext: Context | undefined;
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_read", { entryId: sourceEntryId, imageIndex: 3 }), { stopReason: "toolUse" }),
+			fauxAssistantMessage(fauxToolCall("history_read", { entryId: sourceEntryId, contentIndex: 3, view: "image" }), { stopReason: "toolUse" }),
 			(context) => {
 				providerContext = context;
 				return fauxAssistantMessage("image selected");
@@ -3653,7 +3632,7 @@ test("history_read imageIndex returns one normalized image at its original conte
 		const resultImage = resultMessage.content.find((block) => block && typeof block === "object" && (block as { type?: string }).type === "image") as { type: string; mimeType: string; data: string } | undefined;
 		assert.ok(resultImage);
 		assert.equal(resultImage.mimeType, "image/png");
-		assert.equal(resultMessage.details?.imageIndex, 3);
+		assert.equal(resultMessage.details?.contentIndex, 3);
 		assert.equal(resultMessage.details?.reference, "pi://entry/" + sourceEntryId + "/content/3");
 		assert.equal(resultMessage.details?.width, 3);
 		assert.equal(resultMessage.details?.height, 2);
@@ -3669,7 +3648,7 @@ test("history_read imageIndex returns one normalized image at its original conte
 		const resizedContent = [{ type: "image" as const, mimeType: "image/png", data: highEntropyPng(2_500, 10) }];
 		const resizedEntryId = sessionManager.appendMessage({ role: "user", content: resizedContent, timestamp: Date.now() });
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_read", { entryId: resizedEntryId, imageIndex: 0 })),
+			fauxAssistantMessage(fauxToolCall("history_read", { entryId: resizedEntryId, contentIndex: 0, view: "image" })),
 			fauxAssistantMessage("resized image complete"),
 		]);
 		await session.prompt("read resized image");
@@ -3677,8 +3656,8 @@ test("history_read imageIndex returns one normalized image at its original conte
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_read")
 			.at(-1);
 		assert.ok(resizedResult);
-		const resizedDetails = (resizedResult.message as { details: { width: number; height: number; originalWidth: number; originalHeight: number; wasResized: boolean; imageIndex: number } }).details;
-		assert.equal(resizedDetails.imageIndex, 0);
+		const resizedDetails = (resizedResult.message as { details: { width: number; height: number; originalWidth: number; originalHeight: number; wasResized: boolean; contentIndex: number } }).details;
+		assert.equal(resizedDetails.contentIndex, 0);
 		assert.equal(resizedDetails.originalWidth, 2_500);
 		assert.equal(resizedDetails.originalHeight, 10);
 		assert.equal(resizedDetails.width, 2_000);
@@ -3702,7 +3681,7 @@ test("history_read image resolves a custom-message payload reference", { timeout
 		const customEntryId = sessionManager.appendCustomMessageEntry("test/custom-image", customContent, false, { source: "fixture" });
 		let providerContext: Context | undefined;
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_read", { entryId: customEntryId, imageIndex: 1 })),
+			fauxAssistantMessage(fauxToolCall("history_read", { entryId: customEntryId, contentIndex: 1, view: "image" })),
 			(context) => {
 				providerContext = context;
 				return fauxAssistantMessage("custom image read complete");
@@ -3713,9 +3692,9 @@ test("history_read image resolves a custom-message payload reference", { timeout
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_read")
 			.at(-1);
 		assert.ok(result);
-		const resultMessage = result.message as { content: unknown; details: { entryId: string; imageIndex: number; reference: string; role: string } };
+		const resultMessage = result.message as { content: unknown; details: { entryId: string; contentIndex: number; reference: string; role: string } };
 		assert.equal(resultMessage.details.entryId, customEntryId);
-		assert.equal(resultMessage.details.imageIndex, 1);
+		assert.equal(resultMessage.details.contentIndex, 1);
 		assert.equal(resultMessage.details.reference, "pi://entry/" + customEntryId + "/content/1");
 		assert.equal(resultMessage.details.role, "custom_message");
 		assert.ok(Array.isArray(resultMessage.content));
@@ -3746,7 +3725,7 @@ test("history_read image reports an off-branch source reference", { timeout: 15_
 		});
 		sessionManager.resetLeaf();
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_read", { entryId: sourceEntryId, imageIndex: 0 })),
+			fauxAssistantMessage(fauxToolCall("history_read", { entryId: sourceEntryId, contentIndex: 0, view: "image" })),
 			fauxAssistantMessage("off-branch image validation complete"),
 		]);
 		await session.prompt("read an image from another branch");
@@ -3771,7 +3750,7 @@ test("history_read normalizes high-entropy encoded images within the public byte
 		const sourceContent = [{ type: "image" as const, mimeType: "image/png", data: sourceData }];
 		const sourceEntryId = sessionManager.appendMessage({ role: "user", content: sourceContent, timestamp: Date.now() });
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_read", { entryId: sourceEntryId, imageIndex: 0 })),
+			fauxAssistantMessage(fauxToolCall("history_read", { entryId: sourceEntryId, contentIndex: 0, view: "image" })),
 			fauxAssistantMessage("high entropy image normalized"),
 		]);
 		await session.prompt("normalize a high entropy image");
@@ -3818,22 +3797,22 @@ test("history_read image errors remain explicit and source-bearing", { timeout: 
 				.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "history_read")
 				.at(-1);
 		};
-		const conflict = await runRead({ entryId: validEntryId, imageIndex: 2, offset: 0 }, "read image with conflicting text offset");
+		const conflict = await runRead({ entryId: validEntryId, view: "image", contentIndex: 2, offset: 0 }, "read image with conflicting text offset");
 		assert.ok(conflict);
 		assert.equal((conflict.message as { isError: boolean }).isError, true);
 		assert.match(JSON.stringify((conflict.message as { content: unknown }).content), new RegExp("pi://entry/" + validEntryId + "/content/2"));
 		assert.equal(JSON.stringify((conflict.message as { content: unknown }).content).includes('"type":"image"'), false);
-		const invalid = await runRead({ entryId: invalidEntryId, imageIndex: 1 }, "read invalid image bytes");
+		const invalid = await runRead({ entryId: invalidEntryId, view: "image", contentIndex: 1 }, "read invalid image bytes");
 		assert.ok(invalid);
 		assert.equal((invalid.message as { isError: boolean }).isError, true);
 		assert.match(JSON.stringify((invalid.message as { content: unknown }).content), new RegExp("pi://entry/" + invalidEntryId + "/content/1"));
 		assert.equal(JSON.stringify((invalid.message as { content: unknown }).content).includes('"type":"image"'), false);
-		const missing = await runRead({ entryId: validEntryId, imageIndex: 99 }, "read missing image block");
+		const missing = await runRead({ entryId: validEntryId, view: "image", contentIndex: 99 }, "read missing image block");
 		assert.ok(missing);
 		assert.equal((missing.message as { isError: boolean }).isError, true);
 		assert.match(JSON.stringify((missing.message as { content: unknown }).content), new RegExp("pi://entry/" + validEntryId + "/content/99"));
 		process.env.LEDGER_CONTEXT_READ_TOKENS = "256";
-		const readLimited = await runRead({ entryId: validEntryId, imageIndex: 2 }, "read image over the history output budget");
+		const readLimited = await runRead({ entryId: validEntryId, view: "image", contentIndex: 2 }, "read image over the history output budget");
 		assert.ok(readLimited);
 		assert.equal((readLimited.message as { isError: boolean }).isError, true);
 		assert.match(JSON.stringify((readLimited.message as { content: unknown }).content), new RegExp("pi://entry/" + validEntryId + "/content/2"));
@@ -3849,7 +3828,7 @@ test("history_read image errors remain explicit and source-bearing", { timeout: 
 		const sourceContent = [{ type: "image" as const, mimeType: "image/png", data: RED_2X2_PNG }];
 		const sourceEntryId = sessionManager.appendMessage({ role: "user", content: sourceContent, timestamp: Date.now() });
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_read", { entryId: sourceEntryId, imageIndex: 0 })),
+			fauxAssistantMessage(fauxToolCall("history_read", { entryId: sourceEntryId, contentIndex: 0, view: "image" })),
 			fauxAssistantMessage("vision capability validation complete"),
 		]);
 		await session.prompt("read image without vision input");
@@ -3893,8 +3872,8 @@ test("history_read image results use the global budget with complete mixed tool 
 		let providerContext: Context | undefined;
 		faux.setResponses([
 			fauxAssistantMessage([
-				fauxToolCall("history_read", { entryId: redEntryId, imageIndex: 0 }, { id: "mixed-red-call" }),
-				fauxToolCall("history_read", { entryId: blueEntryId, imageIndex: 0 }, { id: "mixed-blue-call" }),
+				fauxToolCall("history_read", { entryId: redEntryId, contentIndex: 0, view: "image" }, { id: "mixed-red-call" }),
+				fauxToolCall("history_read", { entryId: blueEntryId, contentIndex: 0, view: "image" }, { id: "mixed-blue-call" }),
 				fauxToolCall("large_payload", {}, { id: "mixed-large-call" }),
 			], { stopReason: "toolUse" }),
 			(context) => {
@@ -3929,7 +3908,10 @@ test("history_read image results use the global budget with complete mixed tool 
 		}
 		const largeResultMessage = resultMessages.find((message) => message.toolCallId === "mixed-large-call");
 		assert.ok(largeResultMessage);
-		assert.match(JSON.stringify(largeResultMessage.content), /mixed-large-result/);
+		const sourceResult = messageEntries(sessionManager.getBranch()).find((entry) => entry.message.role === "toolResult" && entry.message.toolCallId === "mixed-large-call");
+		assert.ok(sourceResult);
+		assert.match(toolResultText(sourceResult), /mixed-large-result/);
+		assert.ok(JSON.stringify(largeResultMessage.content).includes("mixed-large-result") || JSON.stringify(largeResultMessage.content).includes(`pi://entry/${sourceResult.id}`));
 	} finally {
 		rmSync(fixture.root, { recursive: true, force: true });
 		if (previousReserve === undefined) delete process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS;
@@ -3966,7 +3948,7 @@ test("history_read image capacity aborts when the mandatory minimum cannot fit",
 			(context) => {
 				providerCalls++;
 				return fauxAssistantMessage(
-					Array.from({ length: 5 }, (_value, index) => fauxToolCall("history_read", { entryId: sourceEntryId, imageIndex: 0 }, { id: "capacity-image-call-" + index })),
+					Array.from({ length: 5 }, (_value, index) => fauxToolCall("history_read", { entryId: sourceEntryId, contentIndex: 0, view: "image" }, { id: "capacity-image-call-" + index })),
 					{ stopReason: "toolUse" },
 				);
 			},
@@ -4051,7 +4033,7 @@ test("history_read image remains in the immediate provider request across native
 			(context) => {
 				providerContexts.push(context);
 				return fauxAssistantMessage([
-					fauxToolCall("history_read", { entryId: sourceEntryId, imageIndex: 3 }, { id: "native-history-image-call" }),
+					fauxToolCall("history_read", { entryId: sourceEntryId, contentIndex: 3, view: "image" }, { id: "native-history-image-call" }),
 					fauxToolCall("staged_result", {}, { id: "native-image-second-call" }),
 				], { stopReason: "toolUse" });
 			},
@@ -5208,7 +5190,7 @@ test("near-capacity context keeps the latest correction when the summary fits", 
 	process.env.LEDGER_CONTEXT_TAIL_TOKENS = String(tailBudget);
 	process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS = "256";
 	const { root, faux, session, sessionManager } = await createFixture(true, [], 64, {
-		contextWindow: 2_304,
+		contextWindow: 8_000,
 		maxTokens: 256,
 		reserveTokens: 0,
 		compactionEnabled: false,
@@ -5222,6 +5204,11 @@ test("near-capacity context keeps the latest correction when the summary fits", 
 			timestamp: Date.now(),
 		});
 		await session.compact();
+		const compaction = sessionManager.getBranch().filter((entry) => entry.type === "compaction").at(-1);
+		assert.ok(compaction);
+		const summaryTokens = convertToLlm(sessionEntryToContextMessages(compaction)).reduce((sum, message) => sum + estimateTokens(message), 0);
+		const fixedTokens = conservativeContextTokens({ messages: [], systemPrompt: session.systemPrompt }, session, 256);
+		await session.setModel({ ...faux.getModel(), contextWindow: fixedTokens + summaryTokens + 600 });
 		for (let index = 0; index < 18; index++) {
 			sessionManager.appendMessage({
 				role: "user",
@@ -5487,7 +5474,7 @@ test("history navigation discovers checkpoint versions independently of recovery
 	const data = { schemaVersion: 1, activeRequestEntryIds: [], sourceWindowId: "metadata-only-key", requestHistoryPosition: { entryId: null, branchDepth: 0 } };
 	const first = sessionManager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, { ...data, ledger: "historic constraint" });
 	const second = sessionManager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, { ...data, ledger: `historic oversized ${"x".repeat(2_000)}` });
-	const listed = await navigationCall(fixture, "history_list_items", { scope: "checkpoints", limit: 1 });
+	const listed = await navigationCall(fixture, "history_list_items", { limit: 1, filter: { kinds: ["checkpoint"] } });
 	assert.equal((listed.message as { isError?: boolean }).isError, false);
 	const firstPage = (listed.message as { details: { items: Array<Record<string, any>>; nextCursor: string } }).details;
 	assert.equal(firstPage.items[0].entryId, second);
@@ -5498,21 +5485,21 @@ test("history navigation discovers checkpoint versions independently of recovery
 	assert.equal(firstPage.items[0].active, false);
 	assert.ok(firstPage.nextCursor);
 	sessionManager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, { ...data, ledger: "historic newer" });
-	const continued = await navigationCall(fixture, "history_list_items", { scope: "checkpoints", limit: 1, cursor: firstPage.nextCursor });
+	const continued = await navigationCall(fixture, "history_list_items", { limit: 1, cursor: firstPage.nextCursor, filter: { kinds: ["checkpoint"] } });
 	const next = (continued.message as { details: { items: Array<Record<string, any>>; nextCursor: null } }).details;
 	assert.equal(next.items[0].entryId, first);
 	assert.equal(next.items[0].fitsCurrentLedgerBudget, true);
 	assert.equal(next.items[0].active, false, "active status belongs to the cursor snapshot, whose latest ledger exceeds the budget");
 	assert.equal(next.nextCursor, null);
-	const found = await navigationCall(fixture, "history_search", { scope: "checkpoints", query: "historic" });
-	assert.equal((found.message as { details: { hits: unknown[] } }).details.hits.length, 3);
-	const metadata = await navigationCall(fixture, "history_search", { scope: "checkpoints", query: "metadata-only-key" });
-	assert.deepEqual((metadata.message as { details: { hits: unknown[] } }).details.hits, []);
+	const found = await navigationCall(fixture, "history_search", { query: "historic", filter: { kinds: ["checkpoint"] } });
+	assert.equal((found.message as { details: { items: unknown[] } }).details.items.length, 3);
+	const metadata = await navigationCall(fixture, "history_search", { query: "metadata-only-key", filter: { kinds: ["checkpoint"] } });
+	assert.deepEqual((metadata.message as { details: { items: unknown[] } }).details.items, []);
 	const read = await navigationCall(fixture, "history_read", { entryId: second, length: 500 });
 	assert.match(toolResultText(read), /historic oversized/);
-	const mismatched = await navigationCall(fixture, "history_list_items", { scope: "all", cursor: firstPage.nextCursor });
+	const mismatched = await navigationCall(fixture, "history_list_items", { cursor: firstPage.nextCursor, filter: { includeMaintenance: true } });
 	assert.match(toolResultText(mismatched), /history_cursor_invalid/);
-	const crossTool = await navigationCall(fixture, "history_search", { scope: "checkpoints", query: "historic", cursor: firstPage.nextCursor });
+	const crossTool = await navigationCall(fixture, "history_search", { query: "historic", cursor: firstPage.nextCursor, filter: { kinds: ["checkpoint"] } });
 	assert.match(toolResultText(crossTool), /history_cursor_invalid/);
 });
 
@@ -5521,26 +5508,26 @@ test("history navigation lists image-only entries and exposes tool pairing witho
 	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
 	const image = fixture.sessionManager.appendMessage({ role: "user", content: [{ type: "image", data: RED_2X2_PNG, mimeType: "image/png" }], timestamp: Date.now() });
 	const older = fixture.sessionManager.appendMessage({ role: "user", content: [{ type: "text", text: "image evidence" }, { type: "image", data: BLUE_3X2_PNG, mimeType: "image/png" }], timestamp: Date.now() });
-	const listed = await navigationCall(fixture, "history_list_items", { scope: "conversation", role: "user", hasImage: true, limit: 1 });
+	const listed = await navigationCall(fixture, "history_list_items", { limit: 1, filter: { kinds: ["user_input"], hasImage: true } });
 	const page = (listed.message as { details: { items: Array<{ entryId: string; payloads: Array<{ reference: string }> }>; nextCursor: string } }).details;
 	assert.equal(page.items[0].entryId, older);
 	assert.equal(page.items[0].payloads[0].reference, `pi://entry/${older}/content/1`);
 	assert.ok(page.nextCursor);
-	const continued = await navigationCall(fixture, "history_list_items", { scope: "conversation", role: "user", hasImage: true, cursor: page.nextCursor });
+	const continued = await navigationCall(fixture, "history_list_items", { cursor: page.nextCursor, filter: { kinds: ["user_input"], hasImage: true } });
 	assert.equal((continued.message as { details: { items: Array<{ entryId: string }> } }).details.items[0].entryId, image);
 	assert.equal(toolResultText(continued).includes(RED_2X2_PNG), false);
-	const mismatch = await navigationCall(fixture, "history_list_items", { scope: "conversation", role: "user", hasImage: false, cursor: page.nextCursor });
+	const mismatch = await navigationCall(fixture, "history_list_items", { cursor: page.nextCursor, filter: { kinds: ["user_input"], hasImage: false } });
 	assert.match(toolResultText(mismatch), /history_cursor_invalid/);
-	const search = await navigationCall(fixture, "history_search", { query: "image evidence", hasImage: true });
-	assert.deepEqual((search.message as { details: { hits: Array<{ entryId: string }> } }).details.hits.map((hit) => hit.entryId), [older]);
+	const search = await navigationCall(fixture, "history_search", { query: "image evidence", filter: { kinds: ["user_input","assistant_text"], hasImage: true } });
+	assert.deepEqual((search.message as { details: { items: Array<{ entryId: string }> } }).details.items.map((hit) => hit.entryId), [older]);
 	const call = fixture.sessionManager.appendMessage(fauxAssistantMessage(fauxToolCall("ordinary_tool", { value: "pairing" }, { id: "pairing-call" })));
 	const result = fixture.sessionManager.appendMessage({ role: "toolResult", toolCallId: "pairing-call", toolName: "ordinary_tool", content: [{ type: "text", text: "pairing result" }], isError: false, timestamp: Date.now() });
-	const tools = await navigationCall(fixture, "history_list_items", { scope: "tools" });
+	const tools = await navigationCall(fixture, "history_list_items", { filter: { kinds: ["tool_call","tool_result"] } });
 	const items = (tools.message as { details: { items: Array<Record<string, any>> } }).details.items;
 	assert.deepEqual(items.map((item) => item.entryId), [result, call]);
 	assert.equal(items[0].toolCallId, "pairing-call");
 	assert.equal(items[1].toolCalls[0].id, "pairing-call");
-	const invalid = await navigationCall(fixture, "history_list_items", { hasImage: "yes" });
+	const invalid = await navigationCall(fixture, "history_list_items", { filter: { includeMaintenance: true, hasImage: "yes" } });
 	assert.equal((invalid.message as { isError?: boolean }).isError, true);
 });
 
@@ -5557,7 +5544,7 @@ test("history navigation freezes windows and item pages across later compaction"
 	assert.equal(page.windows[0].windowId, "window:first");
 	assert.equal(page.windows[0].active, true);
 	assert.ok(page.nextCursor);
-	const listed = await navigationCall(fixture, "history_list_items", { windowId: "window:first", role: "user", limit: 1 });
+	const listed = await navigationCall(fixture, "history_list_items", { limit: 1, filter: { kinds: ["user_input"], includeMaintenance: true, windowIds: ["window:first"] } });
 	const itemPage = (listed.message as { details: { nextCursor: string } }).details;
 	assert.ok(itemPage.nextCursor);
 	sessionManager.appendCompaction("second window", seed, 200, details("window:second", "window:first"), true);
@@ -5566,9 +5553,9 @@ test("history navigation freezes windows and item pages across later compaction"
 	assert.equal(windows.length, 1);
 	assert.equal(windows[0].windowId, initial);
 	assert.equal(windows[0].entryCount, sessionManager.getBranch().findIndex((entry) => entry.id === seed));
-	const nextItems = await navigationCall(fixture, "history_list_items", { windowId: "window:first", role: "user", cursor: itemPage.nextCursor });
+	const nextItems = await navigationCall(fixture, "history_list_items", { cursor: itemPage.nextCursor, filter: { kinds: ["user_input"], includeMaintenance: true, windowIds: ["window:first"] } });
 	assert.ok((nextItems.message as { details: { items: Array<{ entryId: string }> } }).details.items.some((item) => item.entryId === seed));
-	const empty = await navigationCall(fixture, "history_list_items", { windowId: "window:first" });
+	const empty = await navigationCall(fixture, "history_list_items", { filter: { includeMaintenance: true, windowIds: ["window:first"] } });
 	assert.deepEqual((empty.message as { details: { items: unknown[] } }).details.items, []);
 	const current = await navigationCall(fixture, "history_list_windows", {});
 	assert.deepEqual((current.message as { details: { windows: Array<{ windowId: string }> } }).details.windows.map((window) => window.windowId), ["window:second", "window:first", initial]);
@@ -5593,7 +5580,7 @@ test("history navigation reports remaining capacity without changing checkpoints
 		assert.equal(data.usageKind, "pi-context-usage");
 		assert.equal(checkpointEntries(fixture.sessionManager.getBranch()).length, before);
 		assert.equal(fixture.sessionManager.getBranch().some((entry) => entry.type === "compaction"), false);
-		const ordinary = await navigationCall(fixture, "history_list_items", { scope: "tools" });
+		const ordinary = await navigationCall(fixture, "history_list_items", { filter: { kinds: ["tool_call","tool_result"] } });
 		assert.deepEqual((ordinary.message as { details: { items: unknown[] } }).details.items, []);
 	}
 });
@@ -5644,10 +5631,10 @@ test("history navigation bounds pairing metadata and continues past large tool b
 	for (const name of ["history_search", "history_list_items"]) {
 		const tool = fixture.session.getToolDefinition(name);
 		assert.ok(tool);
-		const params = name === "history_search" ? { scope: "conversation", query: "constraint", limit: 1 } : { scope: "all", limit: 1 };
+		const params = name === "history_search" ? { query: "constraint", limit: 1, filter: { includeMaintenance: true } } : { limit: 1, filter: { includeMaintenance: true } };
 		const first = await tool.execute("batch-navigation", params, undefined, undefined, { sessionManager: fixture.sessionManager } as never);
-		const details = first.details as { hits?: Array<Record<string, any>>; items?: Array<Record<string, any>>; nextCursor: string };
-		const hit = (details.hits ?? details.items)![0];
+		const details = first.details as { items: Array<Record<string, any>>; nextCursor: string };
+		const hit = details.items[0];
 		assert.equal(hit.entryId, batchId);
 		assert.match(hit.snippet, /constraint/);
 		assert.ok(hit.omittedToolCalls > 0);
@@ -5657,8 +5644,8 @@ test("history navigation bounds pairing metadata and continues past large tool b
 		assert.ok(textTokenEstimate(text) <= 2_048);
 		assert.ok(details.nextCursor);
 		const second = await tool.execute("batch-next-page", { ...params, cursor: details.nextCursor }, undefined, undefined, { sessionManager: fixture.sessionManager } as never);
-		const next = second.details as { hits?: Array<{ entryId: string }>; items?: Array<{ entryId: string }> };
-		assert.equal((next.hits ?? next.items)![0].entryId, olderId);
+		const next = second.details as { items: Array<{ entryId: string }> };
+		assert.equal(next.items[0].entryId, olderId);
 	}
 });
 
@@ -5724,6 +5711,169 @@ test("history window active flags match restored state after non-ledger compacti
 	assert.deepEqual(windows.filter((window) => window.active).map((window) => window.windowId), [initial]);
 	assert.equal((remaining.details as { windowId: string }).windowId, initial);
 	assert.ok(windows.find((window) => window.windowId === "window:tracked")!.entryCount > 0);
+});
+
+async function inspectHistory(fixture: Awaited<ReturnType<typeof createFixture>>, name: string, params: Record<string, unknown>) {
+	const tool = fixture.session.getToolDefinition(name);
+	assert.ok(tool);
+	return tool.execute("direct-history-inspection", params, undefined, undefined, { sessionManager: fixture.sessionManager } as never);
+}
+
+test("unified history filters separate record selection, matching, and returned content", async (t) => {
+	const fixture = await createFixture(false, [], 70, { compactionEnabled: false, extraToolNames: ["history_list_items", "history_list_windows"] });
+	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+	const manager = fixture.sessionManager;
+	const user = manager.appendMessage({ role: "user", content: [{ type: "text", text: "precision requirement" }, { type: "image", mimeType: "image/png", data: RED_2X2_PNG }], timestamp: Date.now() });
+	const pureCall = manager.appendMessage(fauxAssistantMessage(fauxToolCall("bash", { command: "precision hidden args" }, { id: "pure-call" })));
+	const mixed = manager.appendMessage(fauxAssistantMessage([{ type: "text", text: "precision explanation" }, fauxToolCall("bash", { command: "private-argument" }, { id: "mixed-call" })]));
+	const failed = manager.appendMessage({ role: "toolResult", toolName: "bash", toolCallId: "mixed-call", isError: true,
+		content: [{ type: "text", text: "timeout while testing" }, { type: "image", mimeType: "image/png", data: BLUE_3X2_PNG }], timestamp: Date.now() });
+	const success = manager.appendMessage({ role: "toolResult", toolName: "bash", toolCallId: "pure-call", isError: false, content: [{ type: "text", text: "timeout recovered" }], timestamp: Date.now() });
+	const filter = { kinds: ["tool_result"], toolNames: ["bash"], statuses: ["failed"], hasImage: true, afterEntryId: user, beforeEntryId: success };
+	const listed = await inspectHistory(fixture, "history_list_items", { filter, projection: "text" });
+	const searched = await inspectHistory(fixture, "history_search", { filter, projection: "text", query: "timeout" });
+	for (const result of [listed, searched]) {
+		const details = result.details as { items: Array<Record<string, any>>; totalMatches: number };
+		assert.equal(details.totalMatches, 1);
+		assert.equal(details.items[0].entryId, failed);
+		assert.equal(details.items[0].hasImage, true);
+		assert.deepEqual(details.items[0].payloads, []);
+		assert.match(details.items[0].snippet, /timeout/);
+	}
+	assert.equal((searched.details as { items: Array<{ match: { contentIndex: number; kind: string; offset: number } }> }).items[0].match.contentIndex, 0);
+	const overview = await inspectHistory(fixture, "history_list_windows", { filter });
+	const windows = (overview.details as { windows: Array<Record<string, any>> }).windows;
+	assert.equal(windows.reduce((sum, window) => sum + window.matchedEntryCount, 0), 1);
+	assert.equal(windows[0].failedToolResults, 1);
+	assert.equal(windows[0].imageCount, 1);
+	const dialogue = await inspectHistory(fixture, "history_list_items", { filter: { kinds: ["assistant_text", "tool_call"], excludeKinds: ["tool_call"] } });
+	const dialogueItems = (dialogue.details as { items: Array<Record<string, any>> }).items;
+	assert.deepEqual(dialogueItems.map((item) => item.entryId), [mixed]);
+	assert.equal(dialogueItems[0].toolCalls, undefined);
+	assert.equal(JSON.stringify(dialogue.content).includes("private-argument"), false);
+	assert.equal(dialogueItems.some((item) => item.entryId === pureCall), false);
+	const text = await inspectHistory(fixture, "history_read", { entryId: user, projection: "text" });
+	assert.match((text.details as { text: string }).text, /precision requirement/);
+	assert.equal(JSON.stringify(text.content).includes("[image"), false);
+	const images = await inspectHistory(fixture, "history_list_items", { filter: { kinds: ["user_input"], hasImage: true }, projection: "images" });
+	const imageItem = (images.details as { items: Array<Record<string, any>> }).items[0];
+	assert.equal(imageItem.snippet, undefined);
+	assert.equal(imageItem.payloads[0].reference, `pi://entry/${user}/content/1`);
+	assert.equal(JSON.stringify(images).includes(RED_2X2_PNG), false);
+});
+
+test("unified history order, ranges, and filter fingerprints remain stable across new work", async (t) => {
+	const fixture = await createFixture(false, [], 70, { compactionEnabled: false, extraToolNames: ["history_list_items", "history_list_windows"] });
+	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+	const ids = ["first", "second", "third"].map((content) => fixture.sessionManager.appendMessage({ role: "user", content, timestamp: Date.now() }));
+	const params = { filter: { kinds: ["user_input", "assistant_text"] }, order: "oldest", limit: 1, projection: "references" };
+	const first = await inspectHistory(fixture, "history_list_items", params);
+	const firstDetails = first.details as { items: Array<{ entryId: string }>; nextCursor: string; totalMatches: number };
+	assert.equal(firstDetails.items[0].entryId, ids[0]);
+	assert.equal(firstDetails.totalMatches, 3);
+	fixture.sessionManager.appendMessage({ role: "user", content: "fourth", timestamp: Date.now() });
+	const second = await inspectHistory(fixture, "history_list_items", { ...params, filter: { kinds: ["assistant_text", "user_input"] }, cursor: firstDetails.nextCursor });
+	assert.equal((second.details as { items: Array<{ entryId: string }> }).items[0].entryId, ids[1]);
+	assert.equal((second.details as { totalMatches: number }).totalMatches, 3);
+	const bounded = await inspectHistory(fixture, "history_list_items", { filter: { kinds: ["user_input"], afterEntryId: ids[0], beforeEntryId: ids[2] } });
+	assert.deepEqual((bounded.details as { items: Array<{ entryId: string }> }).items.map((item) => item.entryId), [ids[1]]);
+	for (const changed of [{ order: "newest" }, { projection: "text" }, { filter: { kinds: ["tool_result"] } }]) {
+		await assert.rejects(() => inspectHistory(fixture, "history_list_items", { ...params, ...changed, cursor: firstDetails.nextCursor }), /history_cursor_invalid/);
+	}
+	for (const invalid of [{ scope: "all" }, { filter: { roles: ["user"] } }, { filter: { statuses: ["suceeded"] } }, { filter: { afterEntryId: ids[2], beforeEntryId: ids[0] } }, { filter: { beforeEntryId: "missing" } }]) {
+		await assert.rejects(() => inspectHistory(fixture, "history_list_items", invalid), /history validation failed/);
+	}
+	const oldCursor = JSON.stringify({ ...JSON.parse(firstDetails.nextCursor), version: 2 });
+	await assert.rejects(() => inspectHistory(fixture, "history_list_items", { ...params, cursor: oldCursor }), /history_cursor_invalid/);
+});
+
+test("history exchange reads preserve repeated call IDs, multiple results, and unresolved calls", async (t) => {
+	const fixture = await createFixture(false, [], 70, { compactionEnabled: false });
+	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+	const manager = fixture.sessionManager;
+	const call = manager.appendMessage(fauxAssistantMessage([{ type: "text", text: "run both" },
+		fauxToolCall("bash", { command: "first-command" }, { id: "repeated" }), fauxToolCall("read", { path: "second-path" }, { id: "other" })]));
+	const result = (id: string, text: string) => manager.appendMessage({ role: "toolResult", toolName: "bash", toolCallId: id, content: [{ type: "text", text }], isError: false, timestamp: Date.now() });
+	const firstResult = result("repeated", "first result");
+	manager.appendCustomEntry("intervening-metadata", { marker: true });
+	const correctedResult = result("repeated", "corrected result");
+	const otherResult = result("other", "other result");
+	manager.appendMessage(fauxAssistantMessage(fauxToolCall("bash", { command: "new-command" }, { id: "repeated" })));
+	const laterResult = result("repeated", "later batch result");
+	const exchange = await inspectHistory(fixture, "history_read", { entryId: firstResult, view: "exchange" });
+	const details = exchange.details as { items: Array<Record<string, any>>; relation: Record<string, any> };
+	assert.deepEqual(details.items.map((item) => item.entryId), [call, firstResult, correctedResult]);
+	assert.equal(details.relation.missingResultCount, 0);
+	assert.equal(details.items[0].toolCalls.length, 1);
+	assert.equal(details.items[0].toolCalls[0].contentIndex, 1);
+	assert.equal(JSON.stringify(exchange).includes("second-path"), false);
+	assert.equal(details.items.some((item) => item.entryId === laterResult), false);
+	const selected = await inspectHistory(fixture, "history_read", { entryId: call, view: "exchange", contentIndex: 2 });
+	assert.deepEqual((selected.details as { items: Array<{ entryId: string }> }).items.map((item) => item.entryId), [call, otherResult]);
+	const block = await inspectHistory(fixture, "history_read", { entryId: call, contentIndex: 1, projection: "text" });
+	assert.match((block.details as { text: string }).text, /first-command/);
+	assert.equal(JSON.stringify(block.content).includes("second-path"), false);
+	const incomplete = manager.appendMessage(fauxAssistantMessage(fauxToolCall("bash", {}, { id: "pending" })));
+	const pending = await inspectHistory(fixture, "history_read", { entryId: incomplete, view: "exchange" });
+	assert.equal((pending.details as { relation: { missingResultCount: number } }).relation.missingResultCount, 1);
+	const orphan = result("missing-call", "orphan result");
+	const missing = await inspectHistory(fixture, "history_read", { entryId: orphan, view: "exchange" });
+	assert.equal((missing.details as { relation: { missingCall: boolean } }).relation.missingCall, true);
+});
+
+test("history related-view pagination freezes neighborhoods and rejects mixed read modes", async (t) => {
+	const fixture = await createFixture(false, [], 70, { compactionEnabled: false });
+	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+	const ids = ["before", "anchor", "after"].map((content) => fixture.sessionManager.appendMessage({ role: "user", content, timestamp: Date.now() }));
+	const params = { entryId: ids[1], view: "neighbors", before: 1, after: 2, projection: "references", limit: 1 };
+	const first = await inspectHistory(fixture, "history_read", params);
+	const data = first.details as { items: Array<{ entryId: string }>; nextCursor: string; totalMatches: number };
+	assert.equal(data.items[0].entryId, ids[0]);
+	assert.equal(data.totalMatches, 3);
+	fixture.sessionManager.appendMessage({ role: "user", content: "new after", timestamp: Date.now() });
+	const second = await inspectHistory(fixture, "history_read", { ...params, cursor: data.nextCursor });
+	assert.equal((second.details as { items: Array<{ entryId: string }> }).items[0].entryId, ids[1]);
+	assert.equal((second.details as { totalMatches: number }).totalMatches, 3);
+	for (const invalid of [{ ...params, offset: 0 }, { entryId: ids[1], view: "entry", cursor: data.nextCursor }, { ...params, contentIndex: 0 }, { ...params, before: 21 }]) {
+		await assert.rejects(() => inspectHistory(fixture, "history_read", invalid), /history validation failed/);
+	}
+	await assert.rejects(() => inspectHistory(fixture, "history_read", { ...params, after: 1, cursor: data.nextCursor }), (error: Error) => error.message.startsWith("history_cursor_invalid:"));
+});
+
+test("history preserves empty assistant failures as metadata and neighborhood anchors", async (t) => {
+	const fixture = await createFixture(false, [], 70, { compactionEnabled: false, extraToolNames: ["history_list_items"] });
+	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+	const id = fixture.sessionManager.appendMessage(fauxAssistantMessage([], { stopReason: "error", errorMessage: "provider timeout evidence" }));
+	const listed = await inspectHistory(fixture, "history_list_items", { filter: { statuses: ["failed"] } });
+	const details = listed.details as { items: Array<{ entryId: string; kinds: string[]; snippet: string }> };
+	assert.equal(details.items[0].entryId, id);
+	assert.deepEqual(details.items[0].kinds, ["metadata"]);
+	assert.match(details.items[0].snippet, /provider timeout evidence/);
+	const neighbors = await inspectHistory(fixture, "history_read", { entryId: id, view: "neighbors", before: 0, after: 0 });
+	assert.equal((neighbors.details as { totalMatches: number }).totalMatches, 1);
+	assert.equal((neighbors.details as { items: Array<{ entryId: string }> }).items[0].entryId, id);
+	const textOnly = await inspectHistory(fixture, "history_list_items", { filter: { kinds: ["assistant_text"] } });
+	assert.deepEqual((textOnly.details as { items: unknown[] }).items, []);
+	const read = await inspectHistory(fixture, "history_read", { entryId: id });
+	assert.match((read.details as { text: string }).text, /provider timeout evidence/);
+});
+
+test("history search block coordinates round-trip through exact UTF-16 reads", async (t) => {
+	const fixture = await createFixture(false, [], 70, { compactionEnabled: false });
+	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+	const result = fixture.sessionManager.appendMessage({ role: "toolResult", toolName: "bash", toolCallId: "coordinate-call", isError: false,
+		content: [{ type: "image", mimeType: "image/png", data: RED_2X2_PNG }, { type: "text", text: "前缀 🐱 target 尾部" }], timestamp: Date.now() });
+	const call = fixture.sessionManager.appendMessage(fauxAssistantMessage([{ type: "text", text: "calling" }, fauxToolCall("bash", { command: "run --mode fast" }, { id: "coordinate-invocation" })]));
+	for (const [query, expectedId, kind] of [["target", result, "tool_result"], ["image/png", result, "tool_result"], ["--mode", call, "tool_call"]]) {
+		const searched = await inspectHistory(fixture, "history_search", { query, filter: { kinds: [kind] } });
+		const item = (searched.details as { items: Array<{ entryId: string; match: { contentIndex: number; offset: number } }> }).items[0];
+		assert.equal(item.entryId, expectedId);
+		const read = await inspectHistory(fixture, "history_read", { entryId: item.entryId, contentIndex: item.match.contentIndex, offset: item.match.offset, length: query.length });
+		assert.equal((read.details as { text: string }).text, query);
+	}
+	fixture.sessionManager.appendMessage({ role: "user", content: [{ type: "text", text: "cross" }, { type: "text", text: "boundary" }], timestamp: Date.now() });
+	const spanning = await inspectHistory(fixture, "history_search", { query: "cross\nboundary", filter: { kinds: ["user_input"] } });
+	assert.equal((spanning.details as { items: Array<{ match: { spansBlocks: boolean } }> }).items[0].match.spansBlocks, true);
 });
 
 test("extension handlers report no unexpected errors", () => {

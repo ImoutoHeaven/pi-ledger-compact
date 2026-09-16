@@ -47,49 +47,61 @@ const checkpointParameters = Type.Object({
 	),
 });
 
-type HistoryScope = "conversation" | "tools" | "checkpoints" | "all";
-type HistoryPageTool = "history_search" | "history_list_items" | "history_list_windows";
-
-const historyReadParameters = Type.Object({
-	entryId: Type.String({ minLength: 1, description: "Entry ID on the current session branch." }),
-	offset: Type.Optional(
-		Type.Integer({ minimum: 0, description: "UTF-16 text offset within the rendered entry." }),
-	),
-	length: Type.Optional(
-		Type.Integer({ minimum: 1, maximum: MAX_HISTORY_READ_LENGTH, description: "Maximum UTF-16 characters to return." }),
-	),
-	imageIndex: Type.Optional(
-		Type.Integer({ minimum: 0, description: "Original content-array image block index." }),
-	),
-});
+const HISTORY_KINDS = ["user_input", "assistant_text", "tool_call", "tool_result", "checkpoint", "metadata"] as const;
+type HistoryKind = typeof HISTORY_KINDS[number];
+type HistoryPageTool = "history_search" | "history_list_items" | "history_list_windows" | "history_read";
+const historyKindSchema = Type.Union([Type.Literal("user_input"), Type.Literal("assistant_text"), Type.Literal("tool_call"), Type.Literal("tool_result"), Type.Literal("checkpoint"), Type.Literal("metadata")]);
+const historyFilterSchema = Type.Object({
+	kinds: Type.Optional(Type.Array(historyKindSchema, { minItems: 1, maxItems: 6 })),
+	excludeKinds: Type.Optional(Type.Array(historyKindSchema, { minItems: 1, maxItems: 6 })),
+	toolNames: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 32 })),
+	statuses: Type.Optional(Type.Array(Type.Union([Type.Literal("received"), Type.Literal("requested"), Type.Literal("completed"), Type.Literal("failed"), Type.Literal("saved"), Type.Literal("committed"), Type.Literal("metadata")]), { minItems: 1, maxItems: 7 })),
+	windowIds: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 32 })),
+	afterEntryId: Type.Optional(Type.String({ minLength: 1 })),
+	beforeEntryId: Type.Optional(Type.String({ minLength: 1 })),
+	hasImage: Type.Optional(Type.Boolean()),
+	includeMaintenance: Type.Optional(Type.Boolean({ description: "Include checkpoint/history/budget tool traffic; default false." })),
+}, { additionalProperties: false });
+const historyProjectionSchema = Type.Union([Type.Literal("references"), Type.Literal("text"), Type.Literal("images"), Type.Literal("all")]);
 
 const historyPageFields = {
 	cursor: Type.Optional(Type.String({ minLength: 1, description: "Snapshot cursor from the same history tool and filters." })),
 	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_HISTORY_PAGE_SIZE, description: "Maximum number of results." })),
+	order: Type.Optional(Type.Union([Type.Literal("newest"), Type.Literal("oldest")])),
 };
 
 const historyItemFields = {
 	...historyPageFields,
-	scope: Type.Optional(
-		Type.Union([Type.Literal("conversation"), Type.Literal("tools"), Type.Literal("checkpoints"), Type.Literal("all")]),
-	),
-	windowId: Type.Optional(Type.String({ minLength: 1, description: "Only return entries attributed to this committed window." })),
-	role: Type.Optional(Type.String({ minLength: 1, description: "Only return entries with this source role or entry type." })),
-	hasImage: Type.Optional(Type.Boolean({ description: "Filter by presence of original image blocks; this does not search image content." })),
+	filter: Type.Optional(historyFilterSchema),
+	projection: Type.Optional(historyProjectionSchema),
+	maxChars: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_HISTORY_READ_LENGTH, description: "Per-entry text preview ceiling; default 256 UTF-16 units." })),
 };
 
-const historyListItemsParameters = Type.Object(historyItemFields);
-const historyListWindowsParameters = Type.Object(historyPageFields);
+const historyListItemsParameters = Type.Object(historyItemFields, { additionalProperties: false });
+const historyListWindowsParameters = Type.Object({ ...historyPageFields, filter: Type.Optional(historyFilterSchema) }, { additionalProperties: false });
 const historySearchParameters = Type.Object({
 	...historyItemFields,
 	query: Type.String({ minLength: 1, description: "Literal text to find, ignoring case by default." }),
 	caseSensitive: Type.Optional(Type.Boolean({ description: "Match letter case exactly; defaults to false." })),
-});
+}, { additionalProperties: false });
+const historyReadParameters = Type.Object({
+	entryId: Type.String({ minLength: 1 }),
+	view: Type.Optional(Type.Union([Type.Literal("entry"), Type.Literal("image"), Type.Literal("exchange"), Type.Literal("neighbors")])),
+	contentIndex: Type.Optional(Type.Integer({ minimum: 0, description: "Original content block; required for image and for selecting one call in a multi-call exchange." })),
+	projection: Type.Optional(historyProjectionSchema),
+	offset: Type.Optional(Type.Integer({ minimum: 0 })),
+	length: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_HISTORY_READ_LENGTH })),
+	before: Type.Optional(Type.Integer({ minimum: 0, maximum: 20 })),
+	after: Type.Optional(Type.Integer({ minimum: 0, maximum: 20 })),
+	...historyPageFields,
+}, { additionalProperties: false });
 
 type CheckpointParameters = Static<typeof checkpointParameters>;
 type HistoryReadParameters = Static<typeof historyReadParameters>;
 type HistoryListItemsParameters = Static<typeof historyListItemsParameters>;
 type HistoryListWindowsParameters = Static<typeof historyListWindowsParameters>;
+type HistoryFilter = Static<typeof historyFilterSchema>;
+type HistoryProjection = "references" | "text" | "images" | "all";
 type ContextMessage = Parameters<typeof convertToLlm>[0][number];
 type MessageLike = {
 	role?: string;
@@ -99,6 +111,7 @@ type MessageLike = {
 	toolName?: string;
 	isError?: boolean;
 	stopReason?: string;
+	errorMessage?: string;
 	details?: unknown;
 };
 
@@ -911,28 +924,68 @@ function isMaintenanceToolName(name: string | undefined): boolean {
 		name === "history_list_items" || name === "history_list_windows" || name === "get_context_remaining";
 }
 
-function historySearchText(entry: SessionEntry, scope: HistoryScope, listing = false): string | undefined {
-	if (scope === "all") return renderEntry(entry);
-	if (scope === "checkpoints") {
-		return entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY_TYPE
-			? parseCheckpointData(entry.data)?.ledger ?? (listing ? "" : undefined)
-			: undefined;
-	}
+interface HistoryPart {
+	kind: HistoryKind;
+	contentIndex?: number;
+	toolName?: string;
+	toolCallId?: string;
+	text: (projection: HistoryProjection) => string;
+}
+
+function historyBlockText(block: any, entryId: string, index: number, projection: HistoryProjection): string {
+	if (block?.type === "image") return projection === "text" ? "" :
+		`[image mimeType=${block.mimeType ?? "unknown"} bytes=${encodedPayloadBytes(block.data)} ref=${payloadReference(entryId, index)}]`;
+	return contentText([block], entryId);
+}
+
+function historyParts(entry: SessionEntry, filter: HistoryFilter): HistoryPart[] {
+	const accepts = (kind: HistoryKind, toolName?: string) =>
+		(!filter.kinds || filter.kinds.includes(kind)) && !filter.excludeKinds?.includes(kind) &&
+		(!filter.toolNames || (toolName !== undefined && filter.toolNames.includes(toolName))) &&
+		(filter.includeMaintenance === true || !isMaintenanceToolName(toolName));
 	const message = entryMessage(entry);
-	if (!message) return undefined;
-	if (scope === "conversation") {
-		return message.role === "user" || message.role === "assistant"
-			? textOnlyContent(message.content) || (listing ? "" : undefined)
-			: undefined;
+	if (message?.role === "user" || message?.role === "toolResult") {
+		const kind = message.role === "user" ? "user_input" : "tool_result";
+		if (!accepts(kind, message.toolName)) return [];
+		const base = { kind: kind as HistoryKind, toolName: message.toolName, toolCallId: message.toolCallId };
+		return Array.isArray(message.content) && message.content.length > 0
+			? message.content.map((block: any, index: number) => ({ ...base, contentIndex: index, text: (projection) => historyBlockText(block, entry.id, index, projection) }))
+			: [{ ...base, text: () => contentText(message.content, entry.id) }];
 	}
-	if (message.role === "assistant" && Array.isArray(message.content)) {
-		const toolCalls = message.content.filter((block: any) => block?.type === "toolCall" && !isMaintenanceToolName(block.name));
-		return toolCalls.length > 0 ? contentText(toolCalls, entry.id) : undefined;
+	if (message?.role === "assistant") {
+		if (!Array.isArray(message.content) || message.content.length === 0) return accepts("metadata") ? [{ kind: "metadata", text: () => renderEntry(entry) }] : [];
+		return message.content.flatMap((block: any, index: number) => {
+			const kind: HistoryKind = block?.type === "text" ? "assistant_text" : block?.type === "toolCall" ? "tool_call" : "metadata";
+			const toolName = kind === "tool_call" ? block.name : undefined;
+			if (!accepts(kind, toolName)) return [];
+			return [{ kind, contentIndex: index, toolName, toolCallId: kind === "tool_call" ? block.id : undefined,
+				text: (projection: HistoryProjection) => historyBlockText(block, entry.id, index, projection) }];
+		});
 	}
-	if (message.role === "toolResult" && !isMaintenanceToolName(message.toolName)) {
-		return [`[tool result ${message.toolName ?? "unknown"}]`, contentText(message.content, entry.id)].filter(Boolean).join("\n");
+	if (entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY_TYPE) {
+		return accepts("checkpoint") ? [{ kind: "checkpoint", text: () => parseCheckpointData(entry.data)?.ledger ?? "" }] : [];
 	}
-	return undefined;
+	if (!accepts("metadata")) return [];
+	return [{ kind: "metadata", text: (projection) => {
+		if (projection === "text" && entry.type === "custom_message" && Array.isArray(entry.content)) {
+			return contentText(entry.content.filter((block: any) => block?.type !== "image"), entry.id);
+		}
+		return renderEntry(entry);
+	} }];
+}
+
+function historyPartText(parts: HistoryPart[], projection: HistoryProjection): string {
+	return parts.map((part) => part.text(projection)).join("\n");
+}
+
+function selectedHistoryEntry(entry: SessionEntry, index: number, windowId: string, filter: HistoryFilter, bounds: { after: number; before: number }) {
+	if (index <= bounds.after || index >= bounds.before || (filter.windowIds && !filter.windowIds.includes(windowId))) return undefined;
+	if (filter.statuses && !filter.statuses.includes(historyExecutionStatus(entry))) return undefined;
+	const parts = historyParts(entry, filter);
+	if (parts.length === 0) return undefined;
+	const payloads = imagePayloads(entry);
+	if (filter.hasImage !== undefined && (payloads.length > 0) !== filter.hasImage) return undefined;
+	return { parts, payloads };
 }
 
 function entryMessage(entry: SessionEntry): MessageLike | undefined {
@@ -1455,7 +1508,8 @@ function renderEntry(entry: SessionEntry): string {
 	if (entry.type === "message") {
 		const message = entry.message as MessageLike;
 		const role = message.role ?? "unknown";
-		const body = contentText(message.content, entry.id);
+		const body = contentText(message.content, entry.id) || (role === "assistant"
+			? [message.stopReason ? `stopReason: ${message.stopReason}` : "", message.errorMessage].filter(Boolean).join("\n") : "");
 		if (role === "toolResult") {
 			const error = message.isError ? " error" : "";
 			return `[entry ${entry.id}] ${role}${error} tool=${message.toolName ?? "unknown"} call=${message.toolCallId ?? "unknown"}\n${body}`;
@@ -1550,16 +1604,16 @@ function branchWindowIds(entries: SessionEntry[], ctx: ExtensionContext, endInde
 	return windowIds;
 }
 
-function historyViewAt(entries: SessionEntry[], ctx: ExtensionContext, index: number): HistoryEntryView {
+function historyViewAt(entries: SessionEntry[], ctx: ExtensionContext, index: number, projection: HistoryProjection, contentIndex?: number): HistoryEntryView {
 	const entry = entries[index];
 	const windowIds = branchWindowIds(entries, ctx);
 	return {
 		entry,
-		text: renderEntry(entry),
+		text: projectedHistoryEntry(entry, projection, contentIndex),
 		role: historyRole(entry),
 		windowId: windowIds[index],
 		executionStatus: historyExecutionStatus(entry),
-		payloads: imagePayloads(entry),
+		payloads: projection === "images" || projection === "all" ? imagePayloads(entry).filter((payload) => contentIndex === undefined || payload.reference === payloadReference(entry.id, contentIndex)) : [],
 	};
 }
 
@@ -1636,8 +1690,57 @@ function estimatedOutputTokens(text: string): number {
 	return ledgerTokenEstimate(text);
 }
 
-function isHistoryScope(value: unknown): value is HistoryScope {
-	return value === "conversation" || value === "tools" || value === "checkpoints" || value === "all";
+function historyObject(value: unknown, keys: string[], label: string): asserts value is Record<string, unknown> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw historyValidationError(`${label} must be an object`);
+	const unknown = Object.keys(value).find((key) => !keys.includes(key));
+	if (unknown) throw historyValidationError(`unknown ${label} field: ${unknown}`);
+}
+
+function normalizedHistoryFilter(value: unknown): HistoryFilter {
+	if (value === undefined) return { includeMaintenance: false };
+	historyObject(value, ["kinds", "excludeKinds", "toolNames", "statuses", "windowIds", "afterEntryId", "beforeEntryId", "hasImage", "includeMaintenance"], "filter");
+	const result: Record<string, unknown> = { includeMaintenance: false };
+	for (const key of ["kinds", "excludeKinds", "toolNames", "statuses", "windowIds"] as const) {
+		const values = value[key];
+		if (values === undefined) continue;
+		const allowed = key === "kinds" || key === "excludeKinds" ? [...HISTORY_KINDS] : key === "statuses" ? ["received", "requested", "completed", "failed", "saved", "committed", "metadata"] : undefined;
+		if (!Array.isArray(values) || values.length === 0 || values.length > (allowed?.length ?? 32) || values.some((item) => typeof item !== "string" || item.length === 0 || item.length > MAX_HISTORY_IDENTIFIER_LENGTH || (allowed && !allowed.includes(item)))) {
+			throw historyValidationError(`filter.${key} must contain bounded supported values`);
+		}
+		result[key] = [...new Set(values)].sort();
+	}
+	for (const key of ["afterEntryId", "beforeEntryId"] as const) {
+		if (value[key] === undefined) continue;
+		if (typeof value[key] !== "string" || value[key].length === 0 || value[key].length > MAX_HISTORY_IDENTIFIER_LENGTH) throw historyValidationError(`filter.${key} must be a bounded entry ID`);
+		result[key] = value[key];
+	}
+	for (const key of ["hasImage", "includeMaintenance"] as const) {
+		if (value[key] === undefined) continue;
+		if (typeof value[key] !== "boolean") throw historyValidationError(`filter.${key} must be a boolean`);
+		result[key] = value[key];
+	}
+	return result as HistoryFilter;
+}
+
+function historyProjection(value: unknown): HistoryProjection {
+	if (value === undefined) return "all";
+	if (value !== "references" && value !== "text" && value !== "images" && value !== "all") throw historyValidationError("projection must be references, text, images, or all");
+	return value;
+}
+
+function historyFilterBounds(entries: SessionEntry[], filter: HistoryFilter, ctx: ExtensionContext): { after: number; before: number } {
+	const starts = historyWindowStarts(entries, ctx);
+	if (filter.windowIds?.some((id) => !starts.has(id))) throw historyValidationError("filter.windowIds includes a window outside the branch snapshot");
+	const position = (id: string | undefined, fallback: number) => {
+		if (id === undefined) return fallback;
+		const index = entries.findIndex((entry) => entry.id === id);
+		if (index < 0) throw historyValidationError(`range entry ${id} is outside the branch snapshot`);
+		return index;
+	};
+	const after = position(filter.afterEntryId, -1);
+	const before = position(filter.beforeEntryId, entries.length);
+	if (after >= before) throw historyValidationError("afterEntryId must precede beforeEntryId");
+	return { after, before };
 }
 
 function displayedHistoryQuery(query: string): string {
@@ -1645,14 +1748,14 @@ function displayedHistoryQuery(query: string): string {
 }
 
 interface HistoryCursor {
-	version: 2;
+	version: 3;
 	after: string;
 	through: string | null;
 	filterKey: string;
 }
 
-function historySearchFilterKey(query: string | null, scope: HistoryScope, windowId: string | null, role: string | null, caseSensitive: boolean, hasImage?: boolean): string {
-	return createHash("sha256").update(JSON.stringify({ query, scope, windowId, role, caseSensitive, ...(hasImage === undefined ? {} : { hasImage }) }), "utf8").digest("hex");
+function historyFilterKey(value: unknown): string {
+	return createHash("sha256").update(safeJson(value), "utf8").digest("hex");
 }
 
 function encodeHistoryCursor(
@@ -1660,14 +1763,14 @@ function encodeHistoryCursor(
 	through: string | null,
 	filterKey: string,
 ): string {
-	return JSON.stringify({ version: 2, after, through, filterKey });
+	return JSON.stringify({ version: 3, after, through, filterKey });
 }
 
 function decodeHistoryCursor(value: string, tool: HistoryPageTool = "history_search"): HistoryCursor {
 	try {
 		const parsed = JSON.parse(value) as Record<string, unknown>;
 		if (
-			parsed.version !== 2 ||
+			parsed.version !== 3 ||
 			typeof parsed.after !== "string" ||
 			parsed.after.length === 0 ||
 			typeof parsed.filterKey !== "string" ||
@@ -1677,7 +1780,7 @@ function decodeHistoryCursor(value: string, tool: HistoryPageTool = "history_sea
 		}
 		if (parsed.through !== null && typeof parsed.through !== "string") throw new Error("invalid cursor snapshot");
 		return {
-			version: 2,
+			version: 3,
 			after: parsed.after,
 			through: parsed.through as string | null,
 			filterKey: parsed.filterKey,
@@ -1707,14 +1810,14 @@ function historySnapshot(entries: SessionEntry[], toolCallId?: string): { throug
 async function historyReadImageResult(
 	entry: SessionEntry,
 	view: HistoryEntryView,
-	imageIndex: number,
+	contentIndex: number,
 	ctx: ExtensionContext,
 	signal: AbortSignal | undefined,
 ): Promise<{
 	content: Array<{ type: "text"; text: string } | { type: "image"; mimeType: string; data: string }>;
 	details: Record<string, unknown>;
 }> {
-	const reference = payloadReference(entry.id, imageIndex);
+	const reference = payloadReference(entry.id, contentIndex);
 	signal?.throwIfAborted();
 	if (!ctx.model?.input.includes("image")) {
 		throw historyValidationError("image source " + reference + " requires a model with image input support");
@@ -1723,7 +1826,7 @@ async function historyReadImageResult(
 	if (!sourceContent) {
 		throw historyValidationError("image source " + reference + " is not an entry content block");
 	}
-	const sourceBlock = sourceContent[imageIndex] as any;
+	const sourceBlock = sourceContent[contentIndex] as any;
 	if (!sourceBlock || sourceBlock.type !== "image") {
 		throw historyValidationError("image source " + reference + " is not an image block at the original content index");
 	}
@@ -1761,7 +1864,7 @@ async function historyReadImageResult(
 	let note = clippedText([
 		"Image history entry.",
 		"source: " + reference,
-		"entryId: " + entry.id + " imageIndex: " + imageIndex + " windowId: " + view.windowId + " status: " + view.executionStatus,
+		"entryId: " + entry.id + " contentIndex: " + contentIndex + " windowId: " + view.windowId + " status: " + view.executionStatus,
 		"source mimeType: " + sourceMimeType + " decoded bytes: " + sourceDecodedBytes + " encoded bytes: " + utf8Bytes(sourceBlock.data),
 		"normalized mimeType: " + normalized.mimeType + " dimensions: " + normalized.width + "x" + normalized.height +
 			" original: " + normalized.originalWidth + "x" + normalized.originalHeight +
@@ -1794,7 +1897,7 @@ async function historyReadImageResult(
 			schemaVersion: LEDGER_SCHEMA_VERSION,
 			entryId: entry.id,
 			reference,
-			imageIndex,
+			contentIndex,
 			role: view.role,
 			windowId: view.windowId,
 			executionStatus: view.executionStatus,
@@ -1812,16 +1915,86 @@ async function historyReadImageResult(
 	};
 }
 
-async function historyReadResult(params: HistoryReadParameters, ctx: ExtensionContext, signal: AbortSignal | undefined): Promise<{
+function historyRelatedEntries(entries: SessionEntry[], params: HistoryReadParameters) {
+	const anchor = entries.findIndex((entry) => entry.id === params.entryId);
+	if (anchor < 0) throw historyValidationError("entry is not on the current branch snapshot");
+	const entryIds = new Set<string>();
+	const callIds = new Set<string>();
+	let callEntryId: string | undefined;
+	if (params.view === "neighbors") {
+		for (const entry of entries.slice(Math.max(0, anchor - (params.before ?? 2)), anchor + (params.after ?? 2) + 1)) entryIds.add(entry.id);
+		return { entryIds, callIds, callEntryId, summary: { view: "neighbors", anchorEntryId: params.entryId, entryCount: entryIds.size } };
+	}
+	let callIndex = anchor;
+	const resultId = messageToolResultId(entries[anchor]);
+	if (resultId !== undefined) {
+		if (params.contentIndex !== undefined) throw historyValidationError("contentIndex selects a tool call, not a result block, in exchange view");
+		callIds.add(resultId);
+		callIndex--;
+		while (callIndex >= 0 && !messageToolCallIds(entries[callIndex]).includes(resultId)) callIndex--;
+	} else {
+		const message = entryMessage(entries[anchor]);
+		if (message?.role !== "assistant" || !Array.isArray(message.content)) throw historyValidationError("exchange view requires a tool invocation or result entry");
+		for (const [index, block] of message.content.entries()) {
+			if (block?.type === "toolCall" && typeof block.id === "string" && (params.contentIndex === undefined || params.contentIndex === index)) callIds.add(block.id);
+		}
+		if (callIds.size === 0) throw historyValidationError("exchange selection contains no tool calls");
+	}
+	if (callIndex < 0) {
+		entryIds.add(params.entryId);
+		return { entryIds, callIds, callEntryId, summary: { view: "exchange", anchorEntryId: params.entryId, missingCall: true, resultCount: 1 } };
+	}
+	callEntryId = entries[callIndex].id;
+	entryIds.add(callEntryId);
+	const open = new Set(callIds);
+	const answered = new Set<string>();
+	for (let index = callIndex + 1; index < entries.length && open.size > 0; index++) {
+		const entry = entries[index];
+		for (const reused of messageToolCallIds(entry)) open.delete(reused);
+		const id = messageToolResultId(entry);
+		if (id !== undefined && open.has(id)) { entryIds.add(entry.id); answered.add(id); }
+	}
+	return { entryIds, callIds, callEntryId, summary: { view: "exchange", anchorEntryId: params.entryId, callEntryId, callCount: callIds.size,
+		resultCount: entryIds.size - 1, missingCall: false, missingResultCount: callIds.size - answered.size } };
+}
+
+function projectedHistoryEntry(entry: SessionEntry, projection: HistoryProjection, contentIndex?: number): string {
+	const content = originalContentArray(entry);
+	if (contentIndex !== undefined && (!content || contentIndex >= content.length)) throw historyValidationError("contentIndex is outside the original content array");
+	if (projection === "references" || projection === "images") return "";
+	if (contentIndex !== undefined) {
+		if (!content || contentIndex >= content.length) throw historyValidationError("contentIndex is outside the original content array");
+		return historyBlockText(content[contentIndex], entry.id, contentIndex, projection);
+	}
+	if (projection === "all" || !content) return renderEntry(entry);
+	const textContent = content.filter((block: any) => block?.type !== "image");
+	if (entry.type === "message") return renderEntry({ ...entry, message: { ...entry.message, content: textContent } } as SessionEntry);
+	if (entry.type === "custom_message") return renderEntry({ ...entry, content: textContent } as SessionEntry);
+	return renderEntry(entry);
+}
+
+async function historyReadResult(params: HistoryReadParameters, ctx: ExtensionContext, signal: AbortSignal | undefined, toolCallId?: string): Promise<{
 	content: Array<{ type: "text"; text: string } | { type: "image"; mimeType: string; data: string }>;
 	details: Record<string, unknown>;
 }> {
+	historyObject(params, ["entryId", "view", "contentIndex", "projection", "offset", "length", "before", "after", "cursor", "limit", "order"], "history_read");
 	if (!params || typeof params.entryId !== "string" || params.entryId.length === 0) {
 		throw historyValidationError("entryId must be a non-empty current-branch entry ID");
 	}
 	if (params.entryId.length > MAX_HISTORY_IDENTIFIER_LENGTH) throw historyValidationError("entryId is too long");
-	const requestedImageReference = params.imageIndex !== undefined
-		? payloadReference(params.entryId, Number.isSafeInteger(params.imageIndex) && params.imageIndex >= 0 ? params.imageIndex : 0)
+	const viewMode = params.view ?? "entry";
+	if (!["entry", "image", "exchange", "neighbors"].includes(viewMode)) throw historyValidationError("unsupported history_read view");
+	const projection = historyProjection(params.projection);
+	if (params.contentIndex !== undefined && (!Number.isSafeInteger(params.contentIndex) || params.contentIndex < 0)) throw historyValidationError(`image or content source ${historyEntryReference(params.entryId)} requires a non-negative original content index`);
+	const relatedView = viewMode === "exchange" || viewMode === "neighbors";
+	if (relatedView && (params.offset !== undefined || params.length !== undefined)) throw historyValidationError("exchange and neighbors views use cursor pagination");
+	if (!relatedView && [params.before, params.after, params.cursor, params.limit, params.order].some((value) => value !== undefined)) throw historyValidationError("entry and image views do not accept related-view pagination");
+	if (viewMode !== "neighbors" && (params.before !== undefined || params.after !== undefined)) throw historyValidationError("before and after require neighbors view");
+	if (viewMode === "neighbors" && params.contentIndex !== undefined) throw historyValidationError("contentIndex requires entry, image, or exchange view");
+	for (const value of [params.before, params.after]) if (value !== undefined && (!Number.isSafeInteger(value) || value < 0 || value > 20)) throw historyValidationError("before and after must be integers from 0 to 20");
+	if (viewMode === "image" && (params.contentIndex === undefined || params.projection !== undefined)) throw historyValidationError(`image source ${historyEntryReference(params.entryId)} requires contentIndex and has no projection option`);
+	const requestedImageReference = viewMode === "image"
+		? payloadReference(params.entryId, params.contentIndex ?? 0)
 		: undefined;
 	if (requestedImageReference && (params.offset !== undefined || params.length !== undefined)) {
 		throw historyValidationError("image source " + requestedImageReference + " cannot be combined with offset or length");
@@ -1833,16 +2006,15 @@ async function historyReadResult(params: HistoryReadParameters, ctx: ExtensionCo
 		throw historyValidationError(`length must be an integer between 1 and ${MAX_HISTORY_READ_LENGTH}`);
 	}
 
+	if (relatedView) return historyItemsResult({ filter: { includeMaintenance: true, ...(viewMode === "exchange" ? { kinds: ["tool_call", "tool_result"] as HistoryKind[] } : {}) }, projection,
+		cursor: params.cursor, limit: params.limit, order: params.order ?? "oldest" }, ctx, toolCallId, "history_read", params);
 	const branchEntries = ctx.sessionManager.getBranch();
 	const entryIndex = branchEntries.findIndex((entry) => entry.id === params.entryId);
 	if (entryIndex < 0) {
 		if (requestedImageReference) throw historyValidationError("image source " + requestedImageReference + " is not on the current branch");
 		throw historyValidationError("entry is not on the current branch");
 	}
-	if (params.imageIndex !== undefined) {
-		if (!Number.isSafeInteger(params.imageIndex) || params.imageIndex < 0) {
-			throw historyValidationError("image source " + payloadReference(params.entryId, Number.isSafeInteger(params.imageIndex) ? params.imageIndex : 0) + " requires a non-negative original content index");
-		}
+	if (viewMode === "image") {
 		const entry = branchEntries[entryIndex];
 		const windowIds = branchWindowIds(branchEntries, ctx);
 		return historyReadImageResult(
@@ -1855,13 +2027,13 @@ async function historyReadResult(params: HistoryReadParameters, ctx: ExtensionCo
 				executionStatus: historyExecutionStatus(entry),
 				payloads: [],
 			},
-			params.imageIndex,
+			params.contentIndex!,
 			ctx,
 			signal,
 		);
 	}
 
-	const view = historyViewAt(branchEntries, ctx, entryIndex);
+	const view = historyViewAt(branchEntries, ctx, entryIndex, projection, params.contentIndex);
 	const tokenLimit = historyReadTokenLimit();
 	const offset = params.offset ?? 0;
 	if (offset > view.text.length) throw historyValidationError("offset is beyond the rendered entry");
@@ -1876,6 +2048,8 @@ async function historyReadResult(params: HistoryReadParameters, ctx: ExtensionCo
 		`role: ${view.role}`,
 		`windowId: ${view.windowId}`,
 		`executionStatus: ${view.executionStatus}`,
+		`projection: ${projection}`,
+		...(params.contentIndex !== undefined ? [`contentIndex: ${params.contentIndex}`] : []),
 		...Object.entries(checkpoint ?? {}).map(([key, value]) => `${key}: ${safeJson(value)}`),
 		`offset: ${offset}`,
 	].join("\n");
@@ -1919,6 +2093,8 @@ async function historyReadResult(params: HistoryReadParameters, ctx: ExtensionCo
 			...checkpoint,
 			entryId: view.entry.id,
 			reference: historyEntryReference(view.entry.id),
+			projection,
+			contentIndex: params.contentIndex,
 			role: view.role,
 			windowId: view.windowId,
 			executionStatus: view.executionStatus,
@@ -1943,6 +2119,7 @@ function historyPageSnapshot(
 	tool: HistoryPageTool,
 ): { through: string | null; endIndex: number; after?: string } {
 	if (!params || typeof params !== "object") throw historyValidationError("parameters must be an object");
+	if (params.order !== undefined && params.order !== "newest" && params.order !== "oldest") throw historyValidationError("order must be newest or oldest");
 	if (params.limit !== undefined && (!Number.isSafeInteger(params.limit) || params.limit < 1 || params.limit > MAX_HISTORY_PAGE_SIZE)) {
 		throw historyValidationError(`limit must be an integer between 1 and ${MAX_HISTORY_PAGE_SIZE}`);
 	}
@@ -2006,11 +2183,9 @@ function checkpointHistoryDetails(entries: SessionEntry[]): Map<string, Checkpoi
 	return versions;
 }
 
-function historyItemMetadata(entry: SessionEntry, checkpoints: Map<string, CheckpointHistoryDetails>): Record<string, unknown> {
+function historyItemMetadata(entry: SessionEntry, checkpoints: Map<string, CheckpointHistoryDetails>, parts: HistoryPart[]): Record<string, unknown> {
 	const message = entryMessage(entry);
-	const calls = message?.role === "assistant" && Array.isArray(message.content)
-		? message.content.filter((block: any) => block?.type === "toolCall").map((block: any) => ({ id: block.id, name: block.name }))
-		: [];
+	const calls = parts.filter((part) => part.kind === "tool_call").map((part) => ({ id: part.toolCallId, name: part.toolName, contentIndex: part.contentIndex }));
 	return {
 		...(checkpoints.get(entry.id) ?? {}),
 		...(calls.length > 0 ? { toolCalls: calls } : {}),
@@ -2022,12 +2197,14 @@ function historyItemsResult(
 	params: HistoryListItemsParameters & { query?: string; caseSensitive?: boolean },
 	ctx: ExtensionContext,
 	toolCallId?: string,
-	tool: "history_search" | "history_list_items" = "history_search",
+	tool: HistoryPageTool = "history_search",
+	selection?: HistoryReadParameters,
 ): {
 	content: [{ type: "text"; text: string }];
 	details: Record<string, unknown>;
 } {
-	const listing = tool === "history_list_items";
+	const listing = tool !== "history_search";
+	historyObject(params, ["filter", "projection", "maxChars", "cursor", "limit", "order", ...(!listing ? ["query", "caseSensitive"] : [])], tool);
 	if (!params || (!listing && (typeof params.query !== "string" || params.query.length === 0))) {
 		throw historyValidationError("query must be a non-empty literal string");
 	}
@@ -2035,28 +2212,20 @@ function historyItemsResult(
 	if (query !== null && (query.length > MAX_HISTORY_SEARCH_QUERY_LENGTH || utf8Bytes(query) > MAX_HISTORY_SEARCH_QUERY_LENGTH)) {
 		throw historyValidationError(`query exceeds ${MAX_HISTORY_SEARCH_QUERY_LENGTH} bytes`);
 	}
-	if (params.scope !== undefined && !isHistoryScope(params.scope)) {
-		throw historyValidationError("scope must be conversation, tools, checkpoints, or all");
-	}
+	const filter = normalizedHistoryFilter(params.filter);
+	const projection = historyProjection(params.projection);
+	const order = params.order ?? "newest";
+	const maxChars = params.maxChars ?? MAX_HISTORY_SEARCH_SNIPPET_LENGTH;
+	if (!Number.isSafeInteger(maxChars) || maxChars < 1 || maxChars > MAX_HISTORY_READ_LENGTH) throw historyValidationError("maxChars must be between 1 and 65536");
 	if (params.caseSensitive !== undefined && typeof params.caseSensitive !== "boolean") {
 		throw historyValidationError("caseSensitive must be a boolean");
 	}
 	const caseSensitive = params.caseSensitive ?? false;
-	if (params.hasImage !== undefined && typeof params.hasImage !== "boolean") throw historyValidationError("hasImage must be a boolean");
 	const literalPattern = (query ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 	const insensitiveQuery = new RegExp(literalPattern, "iu");
-	const searchHeading = listing ? "History items (newest first)" : `History search: ${JSON.stringify(displayedHistoryQuery(query!))} (${caseSensitive ? "case-sensitive" : "case-insensitive"} literal)`;
-	const scope: HistoryScope = params.scope ?? (listing ? "all" : "conversation");
-	if (params.windowId !== undefined && (typeof params.windowId !== "string" || params.windowId.length === 0)) {
-		throw historyValidationError("windowId must be a non-empty string");
-	}
-	if (params.windowId !== undefined && params.windowId.length > MAX_HISTORY_IDENTIFIER_LENGTH) throw historyValidationError("windowId is too long");
-	if (params.role !== undefined && (typeof params.role !== "string" || params.role.length === 0)) {
-		throw historyValidationError("role must be a non-empty string");
-	}
-	if (params.role !== undefined && params.role.length > MAX_HISTORY_IDENTIFIER_LENGTH) throw historyValidationError("role is too long");
+	const searchHeading = listing ? "History items" : `History search: ${JSON.stringify(displayedHistoryQuery(query!))} (${caseSensitive ? "case-sensitive" : "case-insensitive"} literal)`;
 	const branchEntries = ctx.sessionManager.getBranch();
-	const filterKey = historySearchFilterKey(query, scope, params.windowId ?? null, params.role ?? null, caseSensitive, params.hasImage);
+	const filterKey = historyFilterKey({ tool, query, filter, projection, maxChars, order, caseSensitive, selection: selection ? { entryId: selection.entryId, view: selection.view, contentIndex: selection.contentIndex, before: selection.before ?? 2, after: selection.after ?? 2 } : undefined });
 	const snapshot = historyPageSnapshot(params, branchEntries, toolCallId, filterKey, tool);
 	const snapshotThrough = snapshot.through;
 	const snapshotEndIndex = snapshot.endIndex;
@@ -2069,52 +2238,71 @@ function historyItemsResult(
 	}
 	const windowIds = branchWindowIds(branchEntries, ctx, snapshotEndIndex);
 	const snapshotEntries = branchEntries.slice(0, snapshotEndIndex + 1);
-	const checkpoints = scope === "all" || scope === "checkpoints" ? checkpointHistoryDetails(snapshotEntries) : new Map<string, CheckpointHistoryDetails>();
-	if (params.windowId !== undefined && !historyWindowStarts(snapshotEntries, ctx).has(params.windowId)) {
-		throw historyValidationError("window is not on the current branch snapshot");
-	}
+	const checkpoints = !filter.kinds || filter.kinds.includes("checkpoint") ? checkpointHistoryDetails(snapshotEntries) : new Map<string, CheckpointHistoryDetails>();
+	const bounds = historyFilterBounds(snapshotEntries, filter, ctx);
+	const related = selection ? historyRelatedEntries(snapshotEntries, selection) : undefined;
 
 	const tokenLimit = historyReadTokenLimit();
 	const limit = params.limit ?? 20;
-	const candidates: Array<{ view: HistoryEntryView; index: number; text: string; matchOffset: number }> = [];
+	const candidates: Array<{ view: HistoryEntryView; index: number; parts: HistoryPart[]; text: string; matchOffset: number; match?: { kind: HistoryKind; contentIndex?: number; offset: number; spansBlocks?: boolean } }> = [];
+	let totalMatches = 0;
 	for (let index = Math.min(snapshotEndIndex, branchEntries.length - 1); index >= 0; index--) {
-		if (afterIndex !== undefined && index >= afterIndex) continue;
 		const entry = branchEntries[index];
+		if (related && !related.entryIds.has(entry.id)) continue;
+		const selected = selectedHistoryEntry(entry, index, windowIds[index], filter, bounds);
+		if (!selected) continue;
 		const role = historyRole(entry);
-		if ((params.windowId !== undefined && windowIds[index] !== params.windowId) || (params.role !== undefined && role !== params.role)) continue;
-		const text = historySearchText(entry, scope, listing);
-		if (text === undefined) continue;
-		const payloads = imagePayloads(entry);
-		if (params.hasImage !== undefined && (payloads.length > 0) !== params.hasImage) continue;
+		let { parts } = selected;
+		const { payloads } = selected;
+		if (related?.callEntryId === entry.id) parts = parts.filter((part) => part.kind === "tool_call" && related.callIds.has(part.toolCallId ?? ""));
+		if (parts.length === 0) continue;
+		const text = listing && (projection === "references" || projection === "images") ? "" : historyPartText(parts, "all");
 		const matchOffset = listing ? 0 : caseSensitive ? text.indexOf(query!) : text.search(insensitiveQuery);
 		if (matchOffset < 0) continue;
+		totalMatches++;
+		if (afterIndex !== undefined && (order === "newest" ? index >= afterIndex : index <= afterIndex)) continue;
+		let offset = matchOffset;
+		let match: { kind: HistoryKind; contentIndex?: number; offset: number; spansBlocks?: boolean } | undefined;
+		if (!listing) for (const part of parts) {
+			const size = part.text("all").length;
+			if (offset <= size) { match = { kind: part.kind, contentIndex: part.contentIndex, offset, ...(offset + query!.length > size ? { spansBlocks: true } : {}) }; break; }
+			offset -= size + 1;
+		}
 		candidates.push({
 			view: { entry, text, role, windowId: windowIds[index], executionStatus: historyExecutionStatus(entry), payloads },
 			index,
+			parts,
 			text,
 			matchOffset,
+			match,
 		});
 	}
+	if (order === "oldest") candidates.reverse();
+	const header = [searchHeading, `filter: ${safeJson(filter)}`, `projection: ${projection}; order: ${order}`, `snapshotThrough: ${snapshotThrough ?? "(none)"}`, `totalMatches: ${totalMatches}`,
+		...(related ? [`relation: ${safeJson(related.summary)}`] : [])];
 	const hits: Array<Record<string, unknown>> = [];
 	const blocks: string[] = [];
 	const metadataOutput = [
-		searchHeading,
-		`scope: ${scope}`,
-		`${listing ? "items" : "hits"}: 0`,
+		...header,
+		"items: 0",
 		"nextCursor: (none)",
 	].join("\n\n");
 	const metadataTokens = estimatedOutputTokens(metadataOutput);
 	if (metadataTokens > tokenLimit) throw historyCapacityError(tool, tokenLimit, metadataTokens);
 	for (let candidateIndex = 0; candidateIndex < Math.min(candidates.length, limit); candidateIndex++) {
-		const { view, text, matchOffset } = candidates[candidateIndex];
+		const { view, text, matchOffset, match, parts } = candidates[candidateIndex];
 		if (text === undefined) continue;
 		const potentialNextCursor = candidateIndex + 1 < candidates.length
 			? encodeHistoryCursor(view.entry.id, snapshotThrough, filterKey)
 			: null;
-		const metadata = historyItemMetadata(view.entry, checkpoints);
+		const metadata = historyItemMetadata(view.entry, checkpoints, parts);
+		const kinds = [...new Set(parts.map((part) => part.kind))];
+		const includeText = projection === "text" || projection === "all";
+		const payloads = projection === "images" || projection === "all" ? view.payloads : [];
 		const toolCallCount = Array.isArray(metadata.toolCalls) ? metadata.toolCalls.length : 0;
-		const displayText = text || "(no text)";
-		let snippetLength = Math.min(displayText.length, MAX_HISTORY_SEARCH_SNIPPET_LENGTH);
+		const displayText = (projection === "text" ? historyPartText(parts, "text") : text) || "(no text)";
+		const displayOffset = listing ? 0 : Math.max(0, caseSensitive ? displayText.indexOf(query!) : displayText.search(insensitiveQuery));
+		let snippetLength = Math.min(displayText.length, maxChars);
 		let selectedSnippet: string | undefined;
 		let candidateTokens = metadataTokens;
 		while (snippetLength > 0) {
@@ -2124,21 +2312,21 @@ function historyItemsResult(
 				`role: ${view.role}`,
 				`windowId: ${view.windowId}`,
 				`executionStatus: ${view.executionStatus}`,
-				...(listing ? [] : [`matchOffset: ${matchOffset}`]),
+				`kinds: ${kinds.join(",")}; hasImage: ${view.payloads.length > 0}`,
+				...(match ? [`match: ${safeJson(match)}`] : []),
 				...Object.entries(metadata).map(([key, value]) => `${key}: ${safeJson(value)}`),
-				payloadSummary(view.payloads),
-				"snippet:",
+				payloadSummary(payloads),
+				...(includeText ? ["snippet:"] : []),
 			].filter(Boolean).join("\n");
-			const snippetStart = Math.max(0, Math.min(matchOffset - Math.floor(snippetLength / 2), displayText.length - snippetLength));
+			const snippetStart = Math.max(0, Math.min(displayOffset - Math.floor(snippetLength / 2), displayText.length - snippetLength));
 			const rawSnippet = displayText.slice(snippetStart, snippetStart + snippetLength);
-			const snippet = snippetLength < displayText.length ? `${rawSnippet}\n[truncated; use history_read with this entryId]` : rawSnippet;
+			const snippet = !includeText ? "" : snippetLength < displayText.length ? `${rawSnippet}\n[truncated; use history_read with this entryId]` : rawSnippet;
 			const block = `${hitPrefix}\n${snippet}`;
 			const proposedHits = hits.length + 1;
 			const proposedBlocks = [...blocks, block];
 			const proposedOutput = [
-				searchHeading,
-				`scope: ${scope}`,
-				`${listing ? "items" : "hits"}: ${proposedHits}`,
+				...header,
+				`items: ${proposedHits}`,
 				`nextCursor: ${potentialNextCursor ?? "(none)"}`,
 				...proposedBlocks,
 			].join("\n\n");
@@ -2166,24 +2354,24 @@ function historyItemsResult(
 			entryId: view.entry.id,
 			reference: historyEntryReference(view.entry.id),
 			role: view.role,
+			kinds,
+			hasImage: view.payloads.length > 0,
 			windowId: view.windowId,
 			executionStatus: view.executionStatus,
-			...(listing ? {} : { matchOffset }),
-			snippet: selectedSnippet,
-			payloads: view.payloads,
+			...(listing ? {} : { matchOffset, match }),
+			...(includeText ? { snippet: selectedSnippet, truncated: selectedSnippet.length < displayText.length } : {}),
+			payloads,
 		});
 	}
 
 	const lastHit = hits.at(-1);
-	const lastHitIndex = lastHit ? branchEntries.findIndex((entry) => entry.id === lastHit.entryId) : -1;
-	const hasMore = lastHitIndex >= 0 && candidates.some(({ index }) => index < lastHitIndex);
+	const hasMore = hits.length > 0 && hits.length < candidates.length;
 	const nextCursor = hasMore && typeof lastHit?.entryId === "string"
 		? encodeHistoryCursor(lastHit.entryId, snapshotThrough, filterKey)
 		: null;
 	const output = [
-		searchHeading,
-		`scope: ${scope}`,
-		`${listing ? "items" : "hits"}: ${hits.length}`,
+		...header,
+		`items: ${hits.length}`,
 		`nextCursor: ${nextCursor ?? "(none)"}`,
 		...blocks,
 	].join("\n\n");
@@ -2193,12 +2381,16 @@ function historyItemsResult(
 		details: {
 			schemaVersion: LEDGER_SCHEMA_VERSION,
 			...(listing ? {} : { query }),
-			scope,
+			filter,
+			projection,
+			order,
+			totalMatches,
+			returnedCount: hits.length,
+			relation: related?.summary,
 			caseSensitive,
-			hasImage: params.hasImage,
 			limit,
 			snapshotThrough,
-			...(listing ? { items: hits } : { hits }),
+			items: hits,
 			nextCursor,
 			readTokenLimit: tokenLimit,
 		},
@@ -2207,11 +2399,15 @@ function historyItemsResult(
 
 function historyWindowsResult(params: HistoryListWindowsParameters, ctx: ExtensionContext, toolCallId?: string) {
 	const tool = "history_list_windows";
-	const filterKey = createHash("sha256").update(tool).digest("hex");
+	historyObject(params, ["filter", "cursor", "limit", "order"], tool);
+	const filter = normalizedHistoryFilter(params.filter);
+	const order = params.order ?? "newest";
+	const filterKey = historyFilterKey({ tool, filter, order });
 	const branch = ctx.sessionManager.getBranch();
 	const snapshot = historyPageSnapshot(params, branch, toolCallId, filterKey, tool);
 	const entries = branch.slice(0, snapshot.endIndex + 1);
 	const starts = historyWindowStarts(entries, ctx);
+	const bounds = historyFilterBounds(entries, filter, ctx);
 	const latestCompaction = latestLedgerCompaction(entries);
 	const currentWindowId = latestCompaction && isLedgerCompactionDetails(latestCompaction.details)
 		? latestCompaction.details.windowId
@@ -2221,8 +2417,14 @@ function historyWindowsResult(params: HistoryListWindowsParameters, ctx: Extensi
 		active: windowId === currentWindowId,
 		compactionEntryId,
 		entryCount: 0,
+		matchedEntryCount: 0,
+		kindCounts: {} as Partial<Record<HistoryKind, number>>,
+		failedToolResults: 0,
+		imageCount: 0,
 		firstEntryId: null as string | null,
 		lastEntryId: null as string | null,
+		latestUserEntryId: null as string | null,
+		latestUserPreview: "",
 		checkpointCount: 0,
 		latestCheckpointEntryId: null as string | null,
 		checkpointPreview: "",
@@ -2233,6 +2435,19 @@ function historyWindowsResult(params: HistoryListWindowsParameters, ctx: Extensi
 		summary.entryCount++;
 		summary.firstEntryId ??= entry.id;
 		summary.lastEntryId = entry.id;
+		const selected = selectedHistoryEntry(entry, index, windowIds[index], filter, bounds);
+		if (selected) {
+			summary.matchedEntryCount++;
+			summary.imageCount += selected.payloads.length;
+			for (const kind of new Set(selected.parts.map((part) => part.kind))) {
+				summary.kindCounts[kind] = (summary.kindCounts[kind] ?? 0) + (kind === "tool_call" ? selected.parts.filter((part) => part.kind === kind).length : 1);
+			}
+			if (selected.parts.some((part) => part.kind === "tool_result") && historyExecutionStatus(entry) === "failed") summary.failedToolResults++;
+			if (selected.parts.some((part) => part.kind === "user_input")) {
+				summary.latestUserEntryId = entry.id;
+				summary.latestUserPreview = historyPartText(selected.parts, "text").slice(0, MAX_HISTORY_SEARCH_SNIPPET_LENGTH);
+			}
+		}
 		if (entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY_TYPE) {
 			const data = parseCheckpointData(entry.data);
 			const source = data ? summaries.get(data.sourceWindowId) : undefined;
@@ -2243,7 +2458,8 @@ function historyWindowsResult(params: HistoryListWindowsParameters, ctx: Extensi
 			}
 		}
 	}
-	const ordered = [...summaries.values()].reverse();
+	const ordered = [...summaries.values()].filter((window) => !filter.windowIds || filter.windowIds.includes(window.windowId));
+	if (order === "newest") ordered.reverse();
 	const afterIndex = snapshot.after === undefined ? -1 : ordered.findIndex((window) => window.windowId === snapshot.after);
 	if (snapshot.after !== undefined && afterIndex < 0) throw historyCursorError("cursor window is not on the current branch snapshot", tool);
 	const remaining = ordered.slice(afterIndex + 1);
@@ -2251,14 +2467,15 @@ function historyWindowsResult(params: HistoryListWindowsParameters, ctx: Extensi
 	const tokenLimit = historyReadTokenLimit();
 	const windows: typeof ordered = [];
 	let nextCursor: string | null = null;
-	const render = () => JSON.stringify({ windows, nextCursor, snapshotThrough: snapshot.through }, null, 2);
+	const render = () => JSON.stringify({ filter, order, windows, nextCursor, snapshotThrough: snapshot.through }, null, 2);
 	for (const window of remaining.slice(0, limit)) {
 		const previousCursor = nextCursor;
 		windows.push(window);
 		nextCursor = windows.length < remaining.length ? encodeHistoryCursor(window.windowId, snapshot.through, filterKey) : null;
 		let candidateTokens = estimatedOutputTokens(render());
-		while (candidateTokens > tokenLimit && window.checkpointPreview.length > 0) {
+		while (candidateTokens > tokenLimit && (window.checkpointPreview.length > 0 || window.latestUserPreview.length > 0)) {
 			window.checkpointPreview = window.checkpointPreview.slice(0, Math.floor(window.checkpointPreview.length / 2));
+			window.latestUserPreview = window.latestUserPreview.slice(0, Math.floor(window.latestUserPreview.length / 2));
 			candidateTokens = estimatedOutputTokens(render());
 		}
 		if (candidateTokens <= tokenLimit) continue;
@@ -2271,7 +2488,7 @@ function historyWindowsResult(params: HistoryListWindowsParameters, ctx: Extensi
 	if (estimatedOutputTokens(output) > tokenLimit) throw historyCapacityError(tool, tokenLimit, estimatedOutputTokens(output));
 	return {
 		content: [{ type: "text" as const, text: output }],
-		details: { schemaVersion: LEDGER_SCHEMA_VERSION, windows, nextCursor, snapshotThrough: snapshot.through, readTokenLimit: tokenLimit },
+		details: { schemaVersion: LEDGER_SCHEMA_VERSION, filter, order, windows, nextCursor, snapshotThrough: snapshot.through, readTokenLimit: tokenLimit },
 	};
 }
 
@@ -3598,19 +3815,19 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 	pi.registerTool({
 		name: "history_read",
 		label: "History Read",
-		description: "Read bounded text or one normalized image from a current-branch entry; use imageIndex for the original content block.",
+		description: "Read current-branch evidence: entry text, one image, a tool exchange, or neighboring log entries. contentIndex identifies an original block. Text uses offset/length; related views use cursors.",
 		promptSnippet: "read a bounded current-branch history entry",
 		promptGuidelines: [
-			"Use a known entryId directly; use imageIndex for one original image block, with offset and length reserved for text. Use history_search only when the source entry is unknown; continue text reads with the returned nextOffset.",
+			"Use view=image with contentIndex to load pixels. Projection text keeps text from mixed image entries; images returns references; all returns both. Exchange follows actual call/result links; neighbors is chronological context, not proof of causation. Continue with nextOffset or nextCursor.",
 		],
 		parameters: historyReadParameters,
 		executionMode: "sequential",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			try {
-				return await historyReadResult(params, ctx, _signal);
+				return await historyReadResult(params, ctx, _signal, _toolCallId);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				throw message.startsWith("history validation failed:") || message.startsWith("history_output_capacity:")
+				throw message.startsWith("history validation failed:") || message.startsWith("history_output_capacity:") || message.startsWith("history_cursor_invalid:")
 					? error
 					: historyValidationError(message);
 			}
@@ -3620,11 +3837,10 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 	pi.registerTool({
 		name: "history_search",
 		label: "History Search",
-		description: "Search current-branch conversation, tools, checkpoint ledger bodies, or all entries by literal text; ignores case by default. Filter by role, windowId, or hasImage and paginate with nextCursor.",
+		description: "Search selected history parts by literal substring; ignores case by default. Shared filter supports kinds, exclusions, tools, statuses, window IDs, exclusive entry ranges, and image presence. Returns one item per source entry.",
 		promptSnippet: "search current-branch history with a literal query",
 		promptGuidelines: [
-			"Search literal text ignoring case by default; set caseSensitive: true for exact case. Scope defaults to conversation; checkpoints searches ledger bodies. Use history_read on returned IDs. Cursors preserve the snapshot and all filters.",
-			"Results are limited to the current branch and include committed window, source role, execution status, and nextCursor.",
+			"Filter fields combine with AND, values within an array with OR; exclusions win. Maintenance tool traffic is excluded unless includeMaintenance=true. Projection controls returned content independently of matching; image content is searched only as metadata. Read single-block matches with contentIndex and offset; use entryId for spansBlocks or matches without a block index. Continue with nextCursor.",
 		],
 		parameters: historySearchParameters,
 		executionMode: "sequential",
@@ -3643,9 +3859,9 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 	pi.registerTool({
 		name: "history_list_items",
 		label: "History List Items",
-		description: "Browse bounded current-branch entries newest first, without a query. Scope defaults to all; supports conversation, tools, checkpoints, role, windowId, hasImage, and snapshot cursors.",
+		description: "Browse one item per source entry using the same filter and projection as history_search. Supports newest/oldest order, image-only entries, bounded previews, and snapshot cursors.",
 		promptSnippet: "browse history and checkpoint versions",
-		promptGuidelines: ["Use listing when no search phrase is known. Checkpoint active flags refer to the page snapshot; fitsCurrentLedgerBudget checks the current ledger budget, while full recovery capacity is checked at compaction. Read known entry IDs with history_read."],
+		promptGuidelines: ["Use kinds=[checkpoint] to browse ledger versions, kinds=[user_input] for requests, toolNames for exact tools, and statuses for outcomes. hasImage selects entire entries; projection=text keeps their text while omitting image references. Checkpoint active is snapshot-relative; fitsCurrentLedgerBudget checks schema/ledger capacity, with full recovery checked at compaction."],
 		parameters: historyListItemsParameters,
 		executionMode: "sequential",
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
@@ -3656,9 +3872,9 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 	pi.registerTool({
 		name: "history_list_windows",
 		label: "History List Windows",
-		description: "List initial and committed current-branch windows newest first, including empty windows. Returns snapshot-stable attributed entry counts, entry IDs, and checkpoints by source window.",
+		description: "Browse initial and committed windows, including empty ones. Returns attributed entry counts, filter-matched counts/kinds, failed results, images, latest user wording and checkpoint previews. Supports shared filters, order and snapshot cursors.",
 		promptSnippet: "browse context windows",
-		promptGuidelines: ["Use a returned windowId with history_list_items or history_search. Retained entries can be attributed to a newer window; checkpoint summaries use their original sourceWindowId. Continue with nextCursor."],
+		promptGuidelines: ["Use returned IDs in filter.windowIds to zoom into a window. matchedEntryCount uses the same filter as item listing; tool_call kindCounts counts invocations, other kinds count entries. Raw entry counts retain native attribution; checkpoints use sourceWindowId. Previews quote original user or ledger text."],
 		parameters: historyListWindowsParameters,
 		executionMode: "sequential",
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
