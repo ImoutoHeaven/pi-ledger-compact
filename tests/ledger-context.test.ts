@@ -1610,6 +1610,11 @@ test("stale volume counts ordinary work while excluding maintenance entries", { 
 			isError: false,
 			timestamp: Date.now(),
 		});
+		for (const name of ["history_list_items", "history_list_windows", "get_context_remaining"]) {
+			sessionManager.appendMessage(fauxAssistantMessage(fauxToolCall(name, {}, { id: `maintenance-${name}` })));
+			sessionManager.appendMessage({ role: "toolResult", toolCallId: `maintenance-${name}`, toolName: name,
+				content: [{ type: "text", text: "m".repeat(4_000) }], isError: false, timestamp: Date.now() });
+		}
 		sessionManager.appendCustomEntry("test/non-context-volume-metadata", { ignored: true });
 		let resumedContext: Context | undefined;
 		faux.setResponses([(context) => {
@@ -3949,6 +3954,8 @@ test("history_read image capacity aborts when the mandatory minimum cannot fit",
 	});
 	try {
 		const { faux, session, sessionManager } = fixture;
+		const fixedTokens = conservativeContextTokens({ messages: [], systemPrompt: session.systemPrompt }, session, 1);
+		await session.setModel({ ...faux.getModel(), contextWindow: fixedTokens + 128 });
 		const sourceEntryId = sessionManager.appendMessage({
 			role: "user",
 			content: [{ type: "image", mimeType: "image/png", data: RED_2X2_PNG }],
@@ -5452,6 +5459,271 @@ test("context capacity failure aborts the active provider request", { timeout: T
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
+});
+
+async function navigationCall(fixture: Awaited<ReturnType<typeof createFixture>>, name: string, args: Record<string, unknown>) {
+	fixture.faux.setResponses([
+		fauxAssistantMessage(fauxToolCall(name, args)),
+		fauxAssistantMessage("navigation complete"),
+	]);
+	await fixture.session.prompt("inspect history");
+	const result = messageEntries(fixture.sessionManager.getBranch())
+		.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === name).at(-1);
+	assert.ok(result);
+	assertHistoryOutputWithinTokens(result);
+	return result;
+}
+
+test("history navigation discovers checkpoint versions independently of recovery capacity", async (t) => {
+	const previous = process.env.LEDGER_CONTEXT_LEDGER_TOKENS;
+	process.env.LEDGER_CONTEXT_LEDGER_TOKENS = "64";
+	t.after(() => {
+		if (previous === undefined) delete process.env.LEDGER_CONTEXT_LEDGER_TOKENS;
+		else process.env.LEDGER_CONTEXT_LEDGER_TOKENS = previous;
+	});
+	const fixture = await createFixture(false, [], 70, { compactionEnabled: false, extraToolNames: ["history_list_items"] });
+	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+	const { sessionManager } = fixture;
+	const data = { schemaVersion: 1, activeRequestEntryIds: [], sourceWindowId: "metadata-only-key", requestHistoryPosition: { entryId: null, branchDepth: 0 } };
+	const first = sessionManager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, { ...data, ledger: "historic constraint" });
+	const second = sessionManager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, { ...data, ledger: `historic oversized ${"x".repeat(2_000)}` });
+	const listed = await navigationCall(fixture, "history_list_items", { scope: "checkpoints", limit: 1 });
+	assert.equal((listed.message as { isError?: boolean }).isError, false);
+	const firstPage = (listed.message as { details: { items: Array<Record<string, any>>; nextCursor: string } }).details;
+	assert.equal(firstPage.items[0].entryId, second);
+	assert.equal(firstPage.items[0].previousCheckpointEntryId, first);
+	assert.equal(firstPage.items[0].sourceWindowId, "metadata-only-key");
+	assert.equal(firstPage.items[0].fitsCurrentLedgerBudget, false);
+	assert.match(firstPage.items[0].recoveryIssue, /estimated tokens/);
+	assert.equal(firstPage.items[0].active, false);
+	assert.ok(firstPage.nextCursor);
+	sessionManager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, { ...data, ledger: "historic newer" });
+	const continued = await navigationCall(fixture, "history_list_items", { scope: "checkpoints", limit: 1, cursor: firstPage.nextCursor });
+	const next = (continued.message as { details: { items: Array<Record<string, any>>; nextCursor: null } }).details;
+	assert.equal(next.items[0].entryId, first);
+	assert.equal(next.items[0].fitsCurrentLedgerBudget, true);
+	assert.equal(next.items[0].active, false, "active status belongs to the cursor snapshot, whose latest ledger exceeds the budget");
+	assert.equal(next.nextCursor, null);
+	const found = await navigationCall(fixture, "history_search", { scope: "checkpoints", query: "historic" });
+	assert.equal((found.message as { details: { hits: unknown[] } }).details.hits.length, 3);
+	const metadata = await navigationCall(fixture, "history_search", { scope: "checkpoints", query: "metadata-only-key" });
+	assert.deepEqual((metadata.message as { details: { hits: unknown[] } }).details.hits, []);
+	const read = await navigationCall(fixture, "history_read", { entryId: second, length: 500 });
+	assert.match(toolResultText(read), /historic oversized/);
+	const mismatched = await navigationCall(fixture, "history_list_items", { scope: "all", cursor: firstPage.nextCursor });
+	assert.match(toolResultText(mismatched), /history_cursor_invalid/);
+	const crossTool = await navigationCall(fixture, "history_search", { scope: "checkpoints", query: "historic", cursor: firstPage.nextCursor });
+	assert.match(toolResultText(crossTool), /history_cursor_invalid/);
+});
+
+test("history navigation lists image-only entries and exposes tool pairing without payload bytes", async (t) => {
+	const fixture = await createFixture(false, [], 70, { compactionEnabled: false, extraToolNames: ["history_list_items"] });
+	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+	const image = fixture.sessionManager.appendMessage({ role: "user", content: [{ type: "image", data: RED_2X2_PNG, mimeType: "image/png" }], timestamp: Date.now() });
+	const older = fixture.sessionManager.appendMessage({ role: "user", content: [{ type: "text", text: "image evidence" }, { type: "image", data: BLUE_3X2_PNG, mimeType: "image/png" }], timestamp: Date.now() });
+	const listed = await navigationCall(fixture, "history_list_items", { scope: "conversation", role: "user", hasImage: true, limit: 1 });
+	const page = (listed.message as { details: { items: Array<{ entryId: string; payloads: Array<{ reference: string }> }>; nextCursor: string } }).details;
+	assert.equal(page.items[0].entryId, older);
+	assert.equal(page.items[0].payloads[0].reference, `pi://entry/${older}/content/1`);
+	assert.ok(page.nextCursor);
+	const continued = await navigationCall(fixture, "history_list_items", { scope: "conversation", role: "user", hasImage: true, cursor: page.nextCursor });
+	assert.equal((continued.message as { details: { items: Array<{ entryId: string }> } }).details.items[0].entryId, image);
+	assert.equal(toolResultText(continued).includes(RED_2X2_PNG), false);
+	const mismatch = await navigationCall(fixture, "history_list_items", { scope: "conversation", role: "user", hasImage: false, cursor: page.nextCursor });
+	assert.match(toolResultText(mismatch), /history_cursor_invalid/);
+	const search = await navigationCall(fixture, "history_search", { query: "image evidence", hasImage: true });
+	assert.deepEqual((search.message as { details: { hits: Array<{ entryId: string }> } }).details.hits.map((hit) => hit.entryId), [older]);
+	const call = fixture.sessionManager.appendMessage(fauxAssistantMessage(fauxToolCall("ordinary_tool", { value: "pairing" }, { id: "pairing-call" })));
+	const result = fixture.sessionManager.appendMessage({ role: "toolResult", toolCallId: "pairing-call", toolName: "ordinary_tool", content: [{ type: "text", text: "pairing result" }], isError: false, timestamp: Date.now() });
+	const tools = await navigationCall(fixture, "history_list_items", { scope: "tools" });
+	const items = (tools.message as { details: { items: Array<Record<string, any>> } }).details.items;
+	assert.deepEqual(items.map((item) => item.entryId), [result, call]);
+	assert.equal(items[0].toolCallId, "pairing-call");
+	assert.equal(items[1].toolCalls[0].id, "pairing-call");
+	const invalid = await navigationCall(fixture, "history_list_items", { hasImage: "yes" });
+	assert.equal((invalid.message as { isError?: boolean }).isError, true);
+});
+
+test("history navigation freezes windows and item pages across later compaction", async (t) => {
+	const fixture = await createFixture(false, [], 70, { compactionEnabled: false, extraToolNames: ["history_list_windows", "history_list_items"] });
+	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+	const { sessionManager } = fixture;
+	const initial = `window:${sessionManager.getSessionId()}:initial`;
+	const seed = sessionManager.appendMessage({ role: "user", content: "window seed", timestamp: Date.now() });
+	const details = (windowId: string, sourceWindowId: string) => ({ schemaVersion: 1, kind: "ledger-context", windowId, sourceWindowId, checkpointEntryId: null, sourceBranchTip: seed, firstKeptEntryId: seed, requestHistoryPosition: null, pendingHistoryRange: { fromEntryId: seed, toEntryId: seed } });
+	sessionManager.appendCompaction("first window", seed, 100, details("window:first", initial), true);
+	const before = await navigationCall(fixture, "history_list_windows", { limit: 1 });
+	const page = (before.message as { details: { windows: Array<Record<string, any>>; nextCursor: string } }).details;
+	assert.equal(page.windows[0].windowId, "window:first");
+	assert.equal(page.windows[0].active, true);
+	assert.ok(page.nextCursor);
+	const listed = await navigationCall(fixture, "history_list_items", { windowId: "window:first", role: "user", limit: 1 });
+	const itemPage = (listed.message as { details: { nextCursor: string } }).details;
+	assert.ok(itemPage.nextCursor);
+	sessionManager.appendCompaction("second window", seed, 200, details("window:second", "window:first"), true);
+	const remaining = await navigationCall(fixture, "history_list_windows", { cursor: page.nextCursor });
+	const windows = (remaining.message as { details: { windows: Array<Record<string, any>> } }).details.windows;
+	assert.equal(windows.length, 1);
+	assert.equal(windows[0].windowId, initial);
+	assert.equal(windows[0].entryCount, sessionManager.getBranch().findIndex((entry) => entry.id === seed));
+	const nextItems = await navigationCall(fixture, "history_list_items", { windowId: "window:first", role: "user", cursor: itemPage.nextCursor });
+	assert.ok((nextItems.message as { details: { items: Array<{ entryId: string }> } }).details.items.some((item) => item.entryId === seed));
+	const empty = await navigationCall(fixture, "history_list_items", { windowId: "window:first" });
+	assert.deepEqual((empty.message as { details: { items: unknown[] } }).details.items, []);
+	const current = await navigationCall(fixture, "history_list_windows", {});
+	assert.deepEqual((current.message as { details: { windows: Array<{ windowId: string }> } }).details.windows.map((window) => window.windowId), ["window:second", "window:first", initial]);
+	assert.equal((current.message as { details: { windows: Array<{ entryCount: number }> } }).details.windows[1].entryCount, 0);
+	sessionManager.branch(seed);
+	const offBranch = await navigationCall(fixture, "history_list_windows", { cursor: page.nextCursor });
+	assert.match(toolResultText(offBranch), /history_cursor_invalid/);
+});
+
+test("history navigation reports remaining capacity without changing checkpoints or windows", async (t) => {
+	for (const enabled of [true, false]) {
+		const fixture = await createFixture(false, [], 70, { contextWindow: 500_000, reserveTokens: 27_200, compactionEnabled: enabled, extraToolNames: ["get_context_remaining", "history_list_items"] });
+		t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+		const before = checkpointEntries(fixture.sessionManager.getBranch()).length;
+		const result = await navigationCall(fixture, "get_context_remaining", {});
+		const data = (result.message as { details: Record<string, any> }).details;
+		assert.equal(data.contextWindowTokens, 500_000);
+		assert.equal(data.modelRemainingTokens, Math.max(0, 500_000 - data.usedTokens));
+		assert.equal(data.effectiveBoundaryTokens, enabled ? 472_800 : 483_616);
+		assert.equal(data.tokensUntilBoundary, Math.max(0, data.effectiveBoundaryTokens - data.usedTokens));
+		assert.equal(data.nativeCompactionMode, enabled ? "native" : "disabled");
+		assert.equal(data.usageKind, "pi-context-usage");
+		assert.equal(checkpointEntries(fixture.sessionManager.getBranch()).length, before);
+		assert.equal(fixture.sessionManager.getBranch().some((entry) => entry.type === "compaction"), false);
+		const ordinary = await navigationCall(fixture, "history_list_items", { scope: "tools" });
+		assert.deepEqual((ordinary.message as { details: { items: unknown[] } }).details.items, []);
+	}
+});
+
+test("history navigation handles estimated and unavailable capacity and bounded list errors", async (t) => {
+	const fixture = await createFixture(false, [], 70, {
+		compactionEnabled: false,
+		extraToolNames: ["get_context_remaining", "history_list_items", "history_list_windows"],
+		settingsReader: () => ({ error: "settings unavailable" }),
+	});
+	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+	const budget = fixture.session.getToolDefinition("get_context_remaining");
+	assert.ok(budget);
+	const context = { sessionManager: fixture.sessionManager, model: fixture.faux.getModel(), getContextUsage: () => undefined, getSystemPrompt: () => "" };
+	const estimated = await budget.execute("estimate", {}, undefined, undefined, context as never);
+	const details = estimated.details as { usageKind: string; usedTokens: number; nativeCompactionMode: string; effectiveBoundaryTokens: number };
+	assert.equal(details.usageKind, "bounded-content-estimate");
+	assert.ok(details.usedTokens > 0);
+	assert.equal(details.nativeCompactionMode, "unknown");
+	assert.equal(details.effectiveBoundaryTokens, 115_200);
+	const unavailable = await budget.execute("unknown", {}, undefined, undefined, { ...context, model: undefined } as never);
+	assert.equal((unavailable.details as { usageKind: string }).usageKind, "unavailable");
+	assert.equal((unavailable.details as { modelRemainingTokens: null }).modelRemainingTokens, null);
+	const previous = process.env.LEDGER_CONTEXT_READ_TOKENS;
+	process.env.LEDGER_CONTEXT_READ_TOKENS = "1";
+	try {
+		for (const name of ["history_list_items", "history_list_windows"]) {
+			const tool = fixture.session.getToolDefinition(name);
+			assert.ok(tool);
+			await assert.rejects(() => tool.execute("small-budget", {}, undefined, undefined, context as never), /history_output_capacity/);
+		}
+	} finally {
+		if (previous === undefined) delete process.env.LEDGER_CONTEXT_READ_TOKENS;
+		else process.env.LEDGER_CONTEXT_READ_TOKENS = previous;
+	}
+	const invalid = await navigationCall(fixture, "history_list_windows", { limit: 0 });
+	assert.equal((invalid.message as { isError?: boolean }).isError, true);
+});
+
+test("history navigation bounds pairing metadata and continues past large tool batches", async (t) => {
+	const fixture = await createFixture(false, [], 70, { compactionEnabled: false, extraToolNames: ["history_list_items"] });
+	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+	const olderId = fixture.sessionManager.appendMessage(fauxAssistantMessage("constraint before the batch"));
+	const batchId = fixture.sessionManager.appendMessage(fauxAssistantMessage([
+		{ type: "text", text: "constraint in the batch" },
+		...Array.from({ length: 100 }, (_, index) => fauxToolCall("ordinary_tool", { index }, { id: `batch-${index}-${"x".repeat(48)}` })),
+	]));
+	for (const name of ["history_search", "history_list_items"]) {
+		const tool = fixture.session.getToolDefinition(name);
+		assert.ok(tool);
+		const params = name === "history_search" ? { scope: "conversation", query: "constraint", limit: 1 } : { scope: "all", limit: 1 };
+		const first = await tool.execute("batch-navigation", params, undefined, undefined, { sessionManager: fixture.sessionManager } as never);
+		const details = first.details as { hits?: Array<Record<string, any>>; items?: Array<Record<string, any>>; nextCursor: string };
+		const hit = (details.hits ?? details.items)![0];
+		assert.equal(hit.entryId, batchId);
+		assert.match(hit.snippet, /constraint/);
+		assert.ok(hit.omittedToolCalls > 0);
+		assert.equal(hit.toolCalls.length + hit.omittedToolCalls, 100);
+		assert.equal(hit.reference, `pi://entry/${batchId}`);
+		const text = first.content.map((block) => block.type === "text" ? block.text : "").join("\n");
+		assert.ok(textTokenEstimate(text) <= 2_048);
+		assert.ok(details.nextCursor);
+		const second = await tool.execute("batch-next-page", { ...params, cursor: details.nextCursor }, undefined, undefined, { sessionManager: fixture.sessionManager } as never);
+		const next = second.details as { hits?: Array<{ entryId: string }>; items?: Array<{ entryId: string }> };
+		assert.equal((next.hits ?? next.items)![0].entryId, olderId);
+	}
+});
+
+test("history window listing shrinks optional previews before rejecting mandatory metadata", async (t) => {
+	const fixture = await createFixture(false, [], 70, { compactionEnabled: false, extraToolNames: ["history_list_windows"] });
+	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+	const initial = `window:${fixture.sessionManager.getSessionId()}:initial`;
+	const checkpointId = fixture.sessionManager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, {
+		schemaVersion: 1, activeRequestEntryIds: [], sourceWindowId: initial,
+		requestHistoryPosition: { entryId: null, branchDepth: 0 }, ledger: "A".repeat(256),
+	});
+	const tool = fixture.session.getToolDefinition("history_list_windows");
+	assert.ok(tool);
+	const read = () => tool.execute("preview-capacity", {}, undefined, undefined, { sessionManager: fixture.sessionManager } as never);
+	const full = await read();
+	const fullText = full.content.map((block) => block.type === "text" ? block.text : "").join("\n");
+	const bare = JSON.parse(fullText);
+	bare.windows[0].checkpointPreview = "";
+	const bareTokens = textTokenEstimate(JSON.stringify(bare, null, 2));
+	const tokenLimit = Math.floor((bareTokens + textTokenEstimate(fullText)) / 2);
+	const previous = process.env.LEDGER_CONTEXT_READ_TOKENS;
+	try {
+		process.env.LEDGER_CONTEXT_READ_TOKENS = String(tokenLimit);
+		const bounded = await read();
+		const text = bounded.content.map((block) => block.type === "text" ? block.text : "").join("\n");
+		assert.ok(textTokenEstimate(text) <= tokenLimit);
+		const window = (bounded.details as { windows: Array<{ latestCheckpointEntryId: string; checkpointPreview: string; checkpointCount: number }> }).windows[0];
+		assert.equal(window.latestCheckpointEntryId, checkpointId);
+		assert.equal(window.checkpointCount, 1);
+		assert.ok(window.checkpointPreview.length > 0 && window.checkpointPreview.length < 256);
+		process.env.LEDGER_CONTEXT_READ_TOKENS = "1";
+		await assert.rejects(read, (error: Error) => {
+			const data = JSON.parse(error.message.slice("history_output_capacity: ".length));
+			assert.equal(data.metadataTokens, bareTokens);
+			return true;
+		});
+	} finally {
+		if (previous === undefined) delete process.env.LEDGER_CONTEXT_READ_TOKENS;
+		else process.env.LEDGER_CONTEXT_READ_TOKENS = previous;
+	}
+});
+
+test("history window active flags match restored state after non-ledger compaction", async (t) => {
+	const fixture = await createFixture(false, [], 70, { compactionEnabled: false, extraToolNames: ["history_list_windows", "get_context_remaining"] });
+	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+	const { sessionManager } = fixture;
+	const initial = `window:${sessionManager.getSessionId()}:initial`;
+	const seed = sessionManager.appendMessage({ role: "user", content: "window source", timestamp: Date.now() });
+	sessionManager.appendCompaction("ledger summary", seed, 100, {
+		schemaVersion: 1, kind: "ledger-context", windowId: "window:tracked", sourceWindowId: initial,
+		checkpointEntryId: null, sourceBranchTip: seed, firstKeptEntryId: seed,
+		requestHistoryPosition: null, pendingHistoryRange: { fromEntryId: seed, toEntryId: seed },
+	}, true);
+	sessionManager.appendCompaction("native summary", seed, 100);
+	await fixture.session.reload();
+	const list = fixture.session.getToolDefinition("history_list_windows");
+	const budget = fixture.session.getToolDefinition("get_context_remaining");
+	assert.ok(list && budget);
+	const context = { sessionManager, model: fixture.faux.getModel(), getContextUsage: () => undefined, getSystemPrompt: () => "" };
+	const listed = await list.execute("restored-windows", {}, undefined, undefined, context as never);
+	const remaining = await budget.execute("restored-budget", {}, undefined, undefined, context as never);
+	const windows = (listed.details as { windows: Array<{ windowId: string; active: boolean; entryCount: number }> }).windows;
+	assert.deepEqual(windows.filter((window) => window.active).map((window) => window.windowId), [initial]);
+	assert.equal((remaining.details as { windowId: string }).windowId, initial);
+	assert.ok(windows.find((window) => window.windowId === "window:tracked")!.entryCount > 0);
 });
 
 test("extension handlers report no unexpected errors", () => {

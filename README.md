@@ -22,6 +22,9 @@ The package registers these model tools:
 - `checkpoint` saves a complete active ledger and returns its persistence scope and handoff state.
 - `history_search` searches literal text on the current branch, ignoring case by default; `caseSensitive: true` requires exact case.
 - `history_read` reads a bounded text slice or one selected image from a referenced current-branch entry.
+- `history_list_items` browses current-branch entries and checkpoint versions without a search phrase.
+- `history_list_windows` lists initial and committed windows, including windows with zero attributed entries.
+- `get_context_remaining` reports model headroom, effective-boundary headroom, output reserve, and usage provenance.
 
 ## Checkpoints and recovery
 
@@ -39,7 +42,7 @@ Use a known entry ID with `history_read` first. Use `history_search` to locate m
 
 ## Reminders and native boundaries
 
-Ledger Context measures new work from the active checkpoint request position, or from the current window start when no checkpoint exists. Ordinary user messages, assistant work, and tool interactions count toward this volume. Checkpoint, history-tool, and reminder maintenance are excluded from the volume but still consume request capacity. The volume reminder interval is 10% of the current model's context window, rounded down to at least one token. Each new interval queues one notice; a large result crossing several intervals produces one notice for the highest crossed mark. Delivered marks survive reload, and a model change recalculates the interval while preserving already-notified progress. A successful checkpoint resets the volume origin. `LEDGER_CONTEXT_TAIL_TOKENS` controls retained history independently.
+Ledger Context measures new work from the active checkpoint request position, or from the current window start when no checkpoint exists. Ordinary user messages, assistant work, and tool interactions count toward this volume. Checkpoint, history-tool, context-budget, and reminder maintenance are excluded from the volume but still consume request capacity. The volume reminder interval is 10% of the current model's context window, rounded down to at least one token. Each new interval queues one notice; a large result crossing several intervals produces one notice for the highest crossed mark. Delivered marks survive reload, and a model change recalculates the interval while preserving already-notified progress. A successful checkpoint resets the volume origin. `LEDGER_CONTEXT_TAIL_TOKENS` controls retained history independently.
 
 Reminders are triggered by accumulated work volume or budget pressure. After a tool batch, they use pi's native steering; when a run has already ended, pending reminders wait for the next normal user request. Pending reasons are combined into one notice and deduplicated separately. Ordinary work continues while reminders are delivered.
 
@@ -62,9 +65,17 @@ Settings failures mark the native boundary as unknown and use window protection.
 
 ## History recovery
 
-`history_search` searches literal substrings, ignoring case by default. Set `caseSensitive: true` for exact case. It returns newest-first hits with bounded excerpts and `nextCursor`; snippets preserve the original text and offsets. Its `scope` is `conversation` by default for user and assistant text; `tools` selects ordinary tool calls and results; `all` includes every searchable entry. Window and role filters narrow the current branch. Cursors preserve the original snapshot and filters, including `caseSensitive`, across later activity; an invalid cursor returns an error with instructions to search again.
+`history_search` searches literal substrings, ignoring case by default. Set `caseSensitive: true` for exact case. It returns newest-first hits with bounded excerpts and `nextCursor`; snippets preserve the original text and offsets. Its `scope` is `conversation` by default for user and assistant text; `tools` selects ordinary tool calls and results; `checkpoints` searches saved ledger bodies; `all` includes every searchable entry. Window, role, and `hasImage` filters narrow the current branch. `hasImage` tests for original image blocks. Cursors preserve the original snapshot and filters across later activity and are specific to each tool.
+
+`history_list_items` accepts the same scope, window, role, image, limit, and cursor filters, with `scope: "all"` as its default. It lists entries newest first, including image-only messages, and returns tool-call pairing metadata and image references. Checkpoint results include the prior parsed checkpoint ID, source window, request history position, and snapshot-relative `active` flag. `fitsCurrentLedgerBudget` checks the checkpoint schema and current ledger budget; full bootstrap capacity is checked at compaction. Older checkpoints remain discoverable when the current ledger budget shrinks. Use `history_read` for their complete contents.
+
+`history_list_windows` accepts `limit` and `cursor`. It returns snapshot-stable window identities, attributed entry counts and first/last entry IDs, plus checkpoint counts and a bounded latest-ledger preview grouped by original source window. Retained entries follow the existing committed-window attribution. All history lists share `LEDGER_CONTEXT_READ_TOKENS` with history reads and searches.
+
+`get_context_remaining` is a read-only capacity snapshot. `modelRemainingTokens` measures model headroom; `tokensUntilBoundary` measures headroom before the effective boundary. `usageKind` distinguishes pi-reported usage, bounded estimates, and unavailable data; unavailable numeric values are null. Pi controls compaction timing.
 
 `history_read` accepts `offset` and `length` for bounded text pagination and returns `nextOffset` when more text remains. Offsets and lengths use UTF-16 code units. Results identify the source role, window, execution status, entry reference, and payload references. The session log preserves the complete original entries.
+
+Tool-call pairing metadata in listings and search results fits the output budget. `omittedToolCalls` reports calls left out of that metadata; use the entry ID with `history_read` to recover the complete call details.
 
 ### Image reads
 

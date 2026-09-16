@@ -22,6 +22,9 @@ pi install -l .
 - `checkpoint` 保存完整工作账本，并回报持久化范围和交接状态。
 - `history_search` 在当前分支执行字面搜索，默认忽略大小写；`caseSensitive: true` 要求大小写一致。
 - `history_read` 读取当前分支指定条目的有界正文，或选取一个图像。
+- `history_list_items` 浏览当前分支条目与 checkpoint 版本，支持无关键词列举。
+- `history_list_windows` 列出初始窗口和已提交窗口，包含归属条目数为零的窗口。
+- `get_context_remaining` 返回模型余量、有效边界余量、输出预留及用量来源。
 
 ## 检查点与恢复
 
@@ -39,7 +42,7 @@ pi install -l .
 
 ## 提醒与原生边界
 
-Ledger Context 从活动检查点的请求位置统计新增工作量；窗口没有检查点时从当前窗口起点统计。普通用户消息、助手工作和工具交互计入工作量。检查点、历史工具和提醒等维护活动不计入工作量，但仍占用请求容量。体积提醒的间隔为当前模型上下文窗口的 10%，向下取整且至少为一个 token。每跨过一个新区间排队一条提醒；大型结果跨过多个区间时，只按最高到达位置提醒一次。已提醒的位置在重载后保留；模型变化时重新计算间隔，并保留已提醒进度。检查点成功后重置计量起点。`LEDGER_CONTEXT_TAIL_TOKENS` 独立控制历史保留量。
+Ledger Context 从活动检查点的请求位置统计新增工作量；窗口没有检查点时从当前窗口起点统计。普通用户消息、助手工作和工具交互计入工作量。检查点、历史工具、容量查询和提醒等维护活动不计入工作量，但仍占用请求容量。体积提醒的间隔为当前模型上下文窗口的 10%，向下取整且至少为一个 token。每跨过一个新区间排队一条提醒；大型结果跨过多个区间时，只按最高到达位置提醒一次。已提醒的位置在重载后保留；模型变化时重新计算间隔，并保留已提醒进度。检查点成功后重置计量起点。`LEDGER_CONTEXT_TAIL_TOKENS` 独立控制历史保留量。
 
 提醒由累计工作量或预算压力触发。工具批次结束后，通过 pi 原生消息插入机制投递；当前运行已经结束时，待处理提醒留到下一次正常用户请求。多个原因合并为一条提醒，各原因分别去重。提醒投递期间，普通工作继续执行。
 
@@ -62,9 +65,17 @@ const ledgerExtension = createLedgerContext({
 
 ## 历史恢复
 
-`history_search` 搜索连续的字面子串，默认忽略大小写；设置 `caseSensitive: true` 时要求大小写一致。结果按从新到旧排列，包含有界摘录和 `nextCursor`，摘录保留原文及其偏移。`scope` 默认为 `conversation`，搜索用户和助手正文；`tools` 搜索普通工具调用和结果；`all` 包含所有可搜索条目。窗口和角色过滤器可进一步限定当前分支中的搜索范围。游标在后续活动中保留原始快照和过滤条件，包括 `caseSensitive`；无效游标会返回错误及重新搜索指引。
+`history_search` 搜索连续的字面子串，默认忽略大小写；设置 `caseSensitive: true` 时要求大小写一致。结果按从新到旧排列，包含有界摘录和 `nextCursor`，摘录保留原文及其偏移。`scope` 默认为 `conversation`，搜索用户和助手正文；`tools` 搜索普通工具调用和结果；`checkpoints` 搜索已保存的 ledger 正文；`all` 包含所有可搜索条目。窗口、角色和 `hasImage` 过滤器限定当前分支中的范围，`hasImage` 根据原始图像块是否存在筛选。游标保留原始快照及过滤条件，并限定在生成它的工具内使用。
+
+`history_list_items` 接受相同的 scope、窗口、角色、图像、条数和游标过滤条件，默认使用 `scope: "all"`。结果从新到旧排列，包含纯图片消息，并返回工具调用配对元数据与图像引用。Checkpoint 结果还包含前一个可解析版本的 ID、来源窗口、请求历史位置和相对于快照的 `active` 标记。`fitsCurrentLedgerBudget` 检查 checkpoint 格式与当前 ledger 预算，完整 bootstrap 容量在压缩时检查。预算缩小后，旧 checkpoint 仍可被发现，并可通过 `history_read` 读取完整内容。
+
+`history_list_windows` 接受 `limit` 和 `cursor`，返回在分页快照内稳定的窗口身份、归属条目数、首尾条目 ID，以及按原始来源窗口统计的 checkpoint 数量和最新 ledger 的有界预览。保留的尾部条目沿用现有已提交窗口归属规则。历史列表与读取、搜索共同使用 `LEDGER_CONTEXT_READ_TOKENS` 输出预算。
+
+`get_context_remaining` 提供只读容量快照：`modelRemainingTokens` 表示模型窗口余量，`tokensUntilBoundary` 表示有效边界前的余量；`usageKind` 区分 pi 用量、估算和不可用状态，不可用的数值为 null。Pi 管理压缩时机。
 
 `history_read` 接受 `offset` 和 `length` 对正文分页，在仍有后续内容时返回 `nextOffset`。偏移和长度均以 UTF-16 代码单元计量。结果包含来源角色、窗口、执行状态、条目引用和载荷引用。会话日志保留完整原始条目。
+
+列表和搜索结果中的工具调用配对元数据按输出预算截取。`omittedToolCalls` 表示该元数据省略的调用数量；通过条目 ID 调用 `history_read` 可读取完整调用详情。
 
 ### 图像读取
 

@@ -47,7 +47,8 @@ const checkpointParameters = Type.Object({
 	),
 });
 
-type HistoryScope = "conversation" | "tools" | "all";
+type HistoryScope = "conversation" | "tools" | "checkpoints" | "all";
+type HistoryPageTool = "history_search" | "history_list_items" | "history_list_windows";
 
 const historyReadParameters = Type.Object({
 	entryId: Type.String({ minLength: 1, description: "Entry ID on the current session branch." }),
@@ -62,21 +63,33 @@ const historyReadParameters = Type.Object({
 	),
 });
 
-const historySearchParameters = Type.Object({
-	query: Type.String({ minLength: 1, description: "Literal text to find, ignoring case by default." }),
-	caseSensitive: Type.Optional(Type.Boolean({ description: "Match letter case exactly; defaults to false." })),
+const historyPageFields = {
+	cursor: Type.Optional(Type.String({ minLength: 1, description: "Snapshot cursor from the same history tool and filters." })),
+	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_HISTORY_PAGE_SIZE, description: "Maximum number of results." })),
+};
+
+const historyItemFields = {
+	...historyPageFields,
 	scope: Type.Optional(
-		Type.Union([Type.Literal("conversation"), Type.Literal("tools"), Type.Literal("all")]),
+		Type.Union([Type.Literal("conversation"), Type.Literal("tools"), Type.Literal("checkpoints"), Type.Literal("all")]),
 	),
 	windowId: Type.Optional(Type.String({ minLength: 1, description: "Only return entries attributed to this committed window." })),
 	role: Type.Optional(Type.String({ minLength: 1, description: "Only return entries with this source role or entry type." })),
-	cursor: Type.Optional(Type.String({ minLength: 1, description: "Cursor returned by a previous history_search call." })),
-	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_HISTORY_PAGE_SIZE, description: "Maximum number of matching entries." })),
+	hasImage: Type.Optional(Type.Boolean({ description: "Filter by presence of original image blocks; this does not search image content." })),
+};
+
+const historyListItemsParameters = Type.Object(historyItemFields);
+const historyListWindowsParameters = Type.Object(historyPageFields);
+const historySearchParameters = Type.Object({
+	...historyItemFields,
+	query: Type.String({ minLength: 1, description: "Literal text to find, ignoring case by default." }),
+	caseSensitive: Type.Optional(Type.Boolean({ description: "Match letter case exactly; defaults to false." })),
 });
 
 type CheckpointParameters = Static<typeof checkpointParameters>;
 type HistoryReadParameters = Static<typeof historyReadParameters>;
-type HistorySearchParameters = Static<typeof historySearchParameters>;
+type HistoryListItemsParameters = Static<typeof historyListItemsParameters>;
+type HistoryListWindowsParameters = Static<typeof historyListWindowsParameters>;
 type ContextMessage = Parameters<typeof convertToLlm>[0][number];
 type MessageLike = {
 	role?: string;
@@ -894,15 +907,23 @@ function textOnlyContent(content: unknown): string {
 }
 
 function isMaintenanceToolName(name: string | undefined): boolean {
-	return name === "checkpoint" || name === "history_read" || name === "history_search";
+	return name === "checkpoint" || name === "history_read" || name === "history_search" ||
+		name === "history_list_items" || name === "history_list_windows" || name === "get_context_remaining";
 }
 
-function historySearchText(entry: SessionEntry, scope: HistoryScope): string | undefined {
+function historySearchText(entry: SessionEntry, scope: HistoryScope, listing = false): string | undefined {
 	if (scope === "all") return renderEntry(entry);
+	if (scope === "checkpoints") {
+		return entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY_TYPE
+			? parseCheckpointData(entry.data)?.ledger ?? (listing ? "" : undefined)
+			: undefined;
+	}
 	const message = entryMessage(entry);
 	if (!message) return undefined;
 	if (scope === "conversation") {
-		return message.role === "user" || message.role === "assistant" ? textOnlyContent(message.content) || undefined : undefined;
+		return message.role === "user" || message.role === "assistant"
+			? textOnlyContent(message.content) || (listing ? "" : undefined)
+			: undefined;
 	}
 	if (message.role === "assistant" && Array.isArray(message.content)) {
 		const toolCalls = message.content.filter((block: any) => block?.type === "toolCall" && !isMaintenanceToolName(block.name));
@@ -1546,12 +1567,12 @@ function historyValidationError(message: string): Error {
 	return new Error(`history validation failed: ${message}`);
 }
 
-function historyCursorError(message: string): Error {
+function historyCursorError(message: string, tool: HistoryPageTool = "history_search"): Error {
 	return new Error(
 		`history_cursor_invalid: ${JSON.stringify({
 			code: "history_cursor_invalid",
 			message,
-			restart: "Rerun history_search with the original query, scope, role, and window filters.",
+			restart: `Rerun ${tool} with the original query and filters.`,
 		})}`,
 	);
 }
@@ -1572,7 +1593,7 @@ function historyEntryReference(entryId: string): string {
 	return `pi://entry/${entryId}`;
 }
 
-function historyCapacityError(tool: "history_read" | "history_search", tokenLimit: number, metadataTokens: number): Error {
+function historyCapacityError(tool: "history_read" | HistoryPageTool, tokenLimit: number, metadataTokens: number): Error {
 	return new Error(
 		`history_output_capacity: ${JSON.stringify({
 			code: "history_output_capacity",
@@ -1616,7 +1637,7 @@ function estimatedOutputTokens(text: string): number {
 }
 
 function isHistoryScope(value: unknown): value is HistoryScope {
-	return value === "conversation" || value === "tools" || value === "all";
+	return value === "conversation" || value === "tools" || value === "checkpoints" || value === "all";
 }
 
 function displayedHistoryQuery(query: string): string {
@@ -1630,23 +1651,19 @@ interface HistoryCursor {
 	filterKey: string;
 }
 
-function historySearchFilterKey(query: string, scope: HistoryScope, windowId: string | null, role: string | null, caseSensitive: boolean): string {
-	return createHash("sha256").update(JSON.stringify({ query, scope, windowId, role, caseSensitive }), "utf8").digest("hex");
+function historySearchFilterKey(query: string | null, scope: HistoryScope, windowId: string | null, role: string | null, caseSensitive: boolean, hasImage?: boolean): string {
+	return createHash("sha256").update(JSON.stringify({ query, scope, windowId, role, caseSensitive, ...(hasImage === undefined ? {} : { hasImage }) }), "utf8").digest("hex");
 }
 
 function encodeHistoryCursor(
 	after: string,
 	through: string | null,
-	query: string,
-	scope: HistoryScope,
-	windowId: string | null,
-	role: string | null,
-	caseSensitive: boolean,
+	filterKey: string,
 ): string {
-	return JSON.stringify({ version: 2, after, through, filterKey: historySearchFilterKey(query, scope, windowId, role, caseSensitive) });
+	return JSON.stringify({ version: 2, after, through, filterKey });
 }
 
-function decodeHistoryCursor(value: string): HistoryCursor {
+function decodeHistoryCursor(value: string, tool: HistoryPageTool = "history_search"): HistoryCursor {
 	try {
 		const parsed = JSON.parse(value) as Record<string, unknown>;
 		if (
@@ -1667,7 +1684,7 @@ function decodeHistoryCursor(value: string): HistoryCursor {
 		};
 	} catch (error) {
 		const reason = error instanceof Error ? error.message : String(error);
-		throw historyCursorError(`cursor is invalid: ${reason}`);
+		throw historyCursorError(`cursor is invalid: ${reason}`, tool);
 	}
 }
 
@@ -1849,6 +1866,9 @@ async function historyReadResult(params: HistoryReadParameters, ctx: ExtensionCo
 	const offset = params.offset ?? 0;
 	if (offset > view.text.length) throw historyValidationError("offset is beyond the rendered entry");
 	const payloadText = payloadSummary(view.payloads);
+	const checkpoint = view.entry.type === "custom" && view.entry.customType === CHECKPOINT_ENTRY_TYPE
+		? checkpointHistoryDetails(branchEntries).get(view.entry.id)
+		: undefined;
 	const header = [
 		"History entry",
 		`entryId: ${view.entry.id}`,
@@ -1856,6 +1876,7 @@ async function historyReadResult(params: HistoryReadParameters, ctx: ExtensionCo
 		`role: ${view.role}`,
 		`windowId: ${view.windowId}`,
 		`executionStatus: ${view.executionStatus}`,
+		...Object.entries(checkpoint ?? {}).map(([key, value]) => `${key}: ${safeJson(value)}`),
 		`offset: ${offset}`,
 	].join("\n");
 	const metadataOutput = [header, "nextOffset: 1000000", payloadText, "text:", "(empty)"].filter(Boolean).join("\n");
@@ -1895,6 +1916,7 @@ async function historyReadResult(params: HistoryReadParameters, ctx: ExtensionCo
 		content: [{ type: "text", text: output }],
 		details: {
 			schemaVersion: LEDGER_SCHEMA_VERSION,
+			...checkpoint,
 			entryId: view.entry.id,
 			reference: historyEntryReference(view.entry.id),
 			role: view.role,
@@ -1913,27 +1935,118 @@ async function historyReadResult(params: HistoryReadParameters, ctx: ExtensionCo
 	};
 }
 
-function historySearchResult(params: HistorySearchParameters, ctx: ExtensionContext, toolCallId?: string): {
+function historyPageSnapshot(
+	params: HistoryListWindowsParameters,
+	entries: SessionEntry[],
+	toolCallId: string | undefined,
+	filterKey: string,
+	tool: HistoryPageTool,
+): { through: string | null; endIndex: number; after?: string } {
+	if (!params || typeof params !== "object") throw historyValidationError("parameters must be an object");
+	if (params.limit !== undefined && (!Number.isSafeInteger(params.limit) || params.limit < 1 || params.limit > MAX_HISTORY_PAGE_SIZE)) {
+		throw historyValidationError(`limit must be an integer between 1 and ${MAX_HISTORY_PAGE_SIZE}`);
+	}
+	const snapshot = historySnapshot(entries, toolCallId);
+	if (params.cursor === undefined) return snapshot;
+	if (typeof params.cursor !== "string" || params.cursor.length === 0 || params.cursor.length > MAX_HISTORY_IDENTIFIER_LENGTH) {
+		throw historyValidationError("cursor must be a bounded non-empty snapshot cursor");
+	}
+	const cursor = decodeHistoryCursor(params.cursor, tool);
+	if (cursor.filterKey !== filterKey) throw historyCursorError("cursor tool or filters do not match the original request", tool);
+	const endIndex = cursor.through === null ? -1 : entries.findIndex((entry) => entry.id === cursor.through);
+	if (cursor.through !== null && (endIndex < 0 || endIndex > snapshot.endIndex)) {
+		throw historyCursorError("cursor snapshot is not on the current branch snapshot", tool);
+	}
+	return { through: cursor.through, endIndex, after: cursor.after };
+}
+
+function historyWindowStarts(entries: SessionEntry[], ctx: ExtensionContext): Map<string, string | null> {
+	const starts = new Map<string, string | null>([[initialWindowId(ctx), null]]);
+	for (const entry of entries) {
+		if (entry.type === "compaction" && isLedgerCompactionDetails(entry.details)) starts.set(entry.details.windowId, entry.id);
+	}
+	return starts;
+}
+
+interface CheckpointHistoryDetails {
+	checkpointEntryId: string;
+	previousCheckpointEntryId: string | null;
+	active: boolean;
+	sourceWindowId: string | null;
+	requestHistoryPosition: RequestHistoryPosition | null;
+	fitsCurrentLedgerBudget: boolean;
+	recoveryIssue: string | null;
+}
+
+function checkpointHistoryDetails(entries: SessionEntry[]): Map<string, CheckpointHistoryDetails> {
+	const versions = new Map<string, CheckpointHistoryDetails>();
+	const tokenLimit = positiveIntegerEnv("LEDGER_CONTEXT_LEDGER_TOKENS", DEFAULT_LEDGER_TOKEN_LIMIT);
+	let previous: string | null = null;
+	let active: string | null = null;
+	for (const entry of entries) {
+		if (entry.type !== "custom" || entry.customType !== CHECKPOINT_ENTRY_TYPE) continue;
+		const data = parseCheckpointData(entry.data);
+		const issue = data ? ledgerCapacityError(data.ledger, tokenLimit) ?? null : "invalid checkpoint schema";
+		versions.set(entry.id, {
+			checkpointEntryId: entry.id,
+			previousCheckpointEntryId: previous,
+			active: false,
+			sourceWindowId: data?.sourceWindowId ?? null,
+			requestHistoryPosition: data?.requestHistoryPosition ?? null,
+			fitsCurrentLedgerBudget: issue === null,
+			recoveryIssue: issue,
+		});
+		if (data) {
+			previous = entry.id;
+			// Match hydrateState: a latest parsed but oversized checkpoint leaves no active ledger.
+			active = issue === null ? entry.id : null;
+		}
+	}
+	if (active) versions.get(active)!.active = true;
+	return versions;
+}
+
+function historyItemMetadata(entry: SessionEntry, checkpoints: Map<string, CheckpointHistoryDetails>): Record<string, unknown> {
+	const message = entryMessage(entry);
+	const calls = message?.role === "assistant" && Array.isArray(message.content)
+		? message.content.filter((block: any) => block?.type === "toolCall").map((block: any) => ({ id: block.id, name: block.name }))
+		: [];
+	return {
+		...(checkpoints.get(entry.id) ?? {}),
+		...(calls.length > 0 ? { toolCalls: calls } : {}),
+		...(message?.role === "toolResult" ? { toolName: message.toolName, toolCallId: message.toolCallId } : {}),
+	};
+}
+
+function historyItemsResult(
+	params: HistoryListItemsParameters & { query?: string; caseSensitive?: boolean },
+	ctx: ExtensionContext,
+	toolCallId?: string,
+	tool: "history_search" | "history_list_items" = "history_search",
+): {
 	content: [{ type: "text"; text: string }];
 	details: Record<string, unknown>;
 } {
-	if (!params || typeof params.query !== "string" || params.query.length === 0) {
+	const listing = tool === "history_list_items";
+	if (!params || (!listing && (typeof params.query !== "string" || params.query.length === 0))) {
 		throw historyValidationError("query must be a non-empty literal string");
 	}
-	if (params.query.length > MAX_HISTORY_SEARCH_QUERY_LENGTH || utf8Bytes(params.query) > MAX_HISTORY_SEARCH_QUERY_LENGTH) {
+	const query = listing ? null : params.query!;
+	if (query !== null && (query.length > MAX_HISTORY_SEARCH_QUERY_LENGTH || utf8Bytes(query) > MAX_HISTORY_SEARCH_QUERY_LENGTH)) {
 		throw historyValidationError(`query exceeds ${MAX_HISTORY_SEARCH_QUERY_LENGTH} bytes`);
 	}
 	if (params.scope !== undefined && !isHistoryScope(params.scope)) {
-		throw historyValidationError("scope must be conversation, tools, or all");
+		throw historyValidationError("scope must be conversation, tools, checkpoints, or all");
 	}
 	if (params.caseSensitive !== undefined && typeof params.caseSensitive !== "boolean") {
 		throw historyValidationError("caseSensitive must be a boolean");
 	}
 	const caseSensitive = params.caseSensitive ?? false;
-	const literalPattern = params.query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	if (params.hasImage !== undefined && typeof params.hasImage !== "boolean") throw historyValidationError("hasImage must be a boolean");
+	const literalPattern = (query ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 	const insensitiveQuery = new RegExp(literalPattern, "iu");
-	const searchHeading = `History search: ${JSON.stringify(displayedHistoryQuery(params.query))} (${caseSensitive ? "case-sensitive" : "case-insensitive"} literal)`;
-	const scope: HistoryScope = params.scope ?? "conversation";
+	const searchHeading = listing ? "History items (newest first)" : `History search: ${JSON.stringify(displayedHistoryQuery(query!))} (${caseSensitive ? "case-sensitive" : "case-insensitive"} literal)`;
+	const scope: HistoryScope = params.scope ?? (listing ? "all" : "conversation");
 	if (params.windowId !== undefined && (typeof params.windowId !== "string" || params.windowId.length === 0)) {
 		throw historyValidationError("windowId must be a non-empty string");
 	}
@@ -1942,39 +2055,22 @@ function historySearchResult(params: HistorySearchParameters, ctx: ExtensionCont
 		throw historyValidationError("role must be a non-empty string");
 	}
 	if (params.role !== undefined && params.role.length > MAX_HISTORY_IDENTIFIER_LENGTH) throw historyValidationError("role is too long");
-	if (params.cursor !== undefined && (typeof params.cursor !== "string" || params.cursor.length === 0)) {
-		throw historyValidationError("cursor must be a non-empty snapshot cursor");
-	}
-	if (params.cursor !== undefined && params.cursor.length > MAX_HISTORY_IDENTIFIER_LENGTH) throw historyValidationError("cursor is too long");
-	if (params.limit !== undefined && (!Number.isSafeInteger(params.limit) || params.limit < 1 || params.limit > MAX_HISTORY_PAGE_SIZE)) {
-		throw historyValidationError(`limit must be an integer between 1 and ${MAX_HISTORY_PAGE_SIZE}`);
-	}
-
 	const branchEntries = ctx.sessionManager.getBranch();
-	const snapshot = historySnapshot(branchEntries, toolCallId);
-	let snapshotThrough = snapshot.through;
-	let snapshotEndIndex = snapshot.endIndex;
+	const filterKey = historySearchFilterKey(query, scope, params.windowId ?? null, params.role ?? null, caseSensitive, params.hasImage);
+	const snapshot = historyPageSnapshot(params, branchEntries, toolCallId, filterKey, tool);
+	const snapshotThrough = snapshot.through;
+	const snapshotEndIndex = snapshot.endIndex;
 	let afterIndex: number | undefined;
-	if (params.cursor !== undefined) {
-		const cursor = decodeHistoryCursor(params.cursor);
-		const filterKey = historySearchFilterKey(params.query, scope, params.windowId ?? null, params.role ?? null, caseSensitive);
-		if (cursor.filterKey !== filterKey) {
-			throw historyCursorError("cursor filters do not match the original query, caseSensitive, scope, role, or window");
-		}
-		snapshotThrough = cursor.through;
-		if (cursor.through === null) {
-			snapshotEndIndex = -1;
-		} else {
-			snapshotEndIndex = branchEntries.findIndex((entry) => entry.id === cursor.through);
-			if (snapshotEndIndex < 0) throw historyCursorError("cursor snapshot is not on the current branch");
-		}
-		const cursorIndex = branchEntries.findIndex((entry) => entry.id === cursor.after);
-		if (cursorIndex < 0) throw historyCursorError("cursor entry is not on the current branch");
-		if (cursorIndex > snapshotEndIndex) throw historyCursorError("cursor is outside its history snapshot");
+	if (snapshot.after !== undefined) {
+		const cursorIndex = branchEntries.findIndex((entry) => entry.id === snapshot.after);
+		if (cursorIndex < 0) throw historyCursorError("cursor entry is not on the current branch", tool);
+		if (cursorIndex > snapshotEndIndex) throw historyCursorError("cursor is outside its history snapshot", tool);
 		afterIndex = cursorIndex;
 	}
 	const windowIds = branchWindowIds(branchEntries, ctx, snapshotEndIndex);
-	if (params.windowId !== undefined && !windowIds.some((windowId, index) => index <= snapshotEndIndex && windowId === params.windowId)) {
+	const snapshotEntries = branchEntries.slice(0, snapshotEndIndex + 1);
+	const checkpoints = scope === "all" || scope === "checkpoints" ? checkpointHistoryDetails(snapshotEntries) : new Map<string, CheckpointHistoryDetails>();
+	if (params.windowId !== undefined && !historyWindowStarts(snapshotEntries, ctx).has(params.windowId)) {
 		throw historyValidationError("window is not on the current branch snapshot");
 	}
 
@@ -1986,12 +2082,14 @@ function historySearchResult(params: HistorySearchParameters, ctx: ExtensionCont
 		const entry = branchEntries[index];
 		const role = historyRole(entry);
 		if ((params.windowId !== undefined && windowIds[index] !== params.windowId) || (params.role !== undefined && role !== params.role)) continue;
-		const text = historySearchText(entry, scope);
+		const text = historySearchText(entry, scope, listing);
 		if (text === undefined) continue;
-		const matchOffset = caseSensitive ? text.indexOf(params.query) : text.search(insensitiveQuery);
+		const payloads = imagePayloads(entry);
+		if (params.hasImage !== undefined && (payloads.length > 0) !== params.hasImage) continue;
+		const matchOffset = listing ? 0 : caseSensitive ? text.indexOf(query!) : text.search(insensitiveQuery);
 		if (matchOffset < 0) continue;
 		candidates.push({
-			view: { entry, text, role, windowId: windowIds[index], executionStatus: historyExecutionStatus(entry), payloads: imagePayloads(entry) },
+			view: { entry, text, role, windowId: windowIds[index], executionStatus: historyExecutionStatus(entry), payloads },
 			index,
 			text,
 			matchOffset,
@@ -2002,62 +2100,75 @@ function historySearchResult(params: HistorySearchParameters, ctx: ExtensionCont
 	const metadataOutput = [
 		searchHeading,
 		`scope: ${scope}`,
-		"hits: 0",
+		`${listing ? "items" : "hits"}: 0`,
 		"nextCursor: (none)",
 	].join("\n\n");
 	const metadataTokens = estimatedOutputTokens(metadataOutput);
-	if (metadataTokens > tokenLimit) throw historyCapacityError("history_search", tokenLimit, metadataTokens);
+	if (metadataTokens > tokenLimit) throw historyCapacityError(tool, tokenLimit, metadataTokens);
 	for (let candidateIndex = 0; candidateIndex < Math.min(candidates.length, limit); candidateIndex++) {
 		const { view, text, matchOffset } = candidates[candidateIndex];
 		if (text === undefined) continue;
 		const potentialNextCursor = candidateIndex + 1 < candidates.length
-			? encodeHistoryCursor(view.entry.id, snapshotThrough, params.query, scope, params.windowId ?? null, params.role ?? null, caseSensitive)
+			? encodeHistoryCursor(view.entry.id, snapshotThrough, filterKey)
 			: null;
-		const hitPrefix = [
-			`entryId: ${view.entry.id}`,
-			`reference: ${historyEntryReference(view.entry.id)}`,
-			`role: ${view.role}`,
-			`windowId: ${view.windowId}`,
-			`executionStatus: ${view.executionStatus}`,
-			`matchOffset: ${matchOffset}`,
-			payloadSummary(view.payloads),
-			"snippet:",
-		].filter(Boolean).join("\n");
-		let snippetLength = Math.min(text.length, MAX_HISTORY_SEARCH_SNIPPET_LENGTH);
+		const metadata = historyItemMetadata(view.entry, checkpoints);
+		const toolCallCount = Array.isArray(metadata.toolCalls) ? metadata.toolCalls.length : 0;
+		const displayText = text || "(no text)";
+		let snippetLength = Math.min(displayText.length, MAX_HISTORY_SEARCH_SNIPPET_LENGTH);
 		let selectedSnippet: string | undefined;
+		let candidateTokens = metadataTokens;
 		while (snippetLength > 0) {
-			const snippetStart = Math.max(0, Math.min(matchOffset - Math.floor(snippetLength / 2), text.length - snippetLength));
-			const rawSnippet = text.slice(snippetStart, snippetStart + snippetLength);
-			const snippet = snippetLength < text.length ? `${rawSnippet}\n${HISTORY_TRUNCATION_MARKER}` : rawSnippet;
+			const hitPrefix = [
+				`entryId: ${view.entry.id}`,
+				`reference: ${historyEntryReference(view.entry.id)}`,
+				`role: ${view.role}`,
+				`windowId: ${view.windowId}`,
+				`executionStatus: ${view.executionStatus}`,
+				...(listing ? [] : [`matchOffset: ${matchOffset}`]),
+				...Object.entries(metadata).map(([key, value]) => `${key}: ${safeJson(value)}`),
+				payloadSummary(view.payloads),
+				"snippet:",
+			].filter(Boolean).join("\n");
+			const snippetStart = Math.max(0, Math.min(matchOffset - Math.floor(snippetLength / 2), displayText.length - snippetLength));
+			const rawSnippet = displayText.slice(snippetStart, snippetStart + snippetLength);
+			const snippet = snippetLength < displayText.length ? `${rawSnippet}\n[truncated; use history_read with this entryId]` : rawSnippet;
 			const block = `${hitPrefix}\n${snippet}`;
 			const proposedHits = hits.length + 1;
 			const proposedBlocks = [...blocks, block];
 			const proposedOutput = [
 				searchHeading,
 				`scope: ${scope}`,
-				`hits: ${proposedHits}`,
+				`${listing ? "items" : "hits"}: ${proposedHits}`,
 				`nextCursor: ${potentialNextCursor ?? "(none)"}`,
 				...proposedBlocks,
 			].join("\n\n");
-			if (estimatedOutputTokens(proposedOutput) <= tokenLimit) {
+			candidateTokens = estimatedOutputTokens(proposedOutput);
+			if (candidateTokens <= tokenLimit) {
 				selectedSnippet = rawSnippet;
 				blocks.push(block);
 				break;
+			}
+			if (Array.isArray(metadata.toolCalls) && metadata.toolCalls.length > 0) {
+				const retainedCalls = metadata.toolCalls.slice(0, Math.floor(metadata.toolCalls.length / 2));
+				metadata.toolCalls = retainedCalls;
+				metadata.omittedToolCalls = toolCallCount - retainedCalls.length;
+				continue;
 			}
 			if (snippetLength === 1) break;
 			snippetLength = Math.max(1, Math.floor(snippetLength / 2));
 		}
 		if (selectedSnippet === undefined) {
-			if (hits.length === 0) throw historyCapacityError("history_search", tokenLimit, metadataTokens);
+			if (hits.length === 0) throw historyCapacityError(tool, tokenLimit, candidateTokens);
 			break;
 		}
 		hits.push({
+			...metadata,
 			entryId: view.entry.id,
 			reference: historyEntryReference(view.entry.id),
 			role: view.role,
 			windowId: view.windowId,
 			executionStatus: view.executionStatus,
-			matchOffset,
+			...(listing ? {} : { matchOffset }),
 			snippet: selectedSnippet,
 			payloads: view.payloads,
 		});
@@ -2067,30 +2178,118 @@ function historySearchResult(params: HistorySearchParameters, ctx: ExtensionCont
 	const lastHitIndex = lastHit ? branchEntries.findIndex((entry) => entry.id === lastHit.entryId) : -1;
 	const hasMore = lastHitIndex >= 0 && candidates.some(({ index }) => index < lastHitIndex);
 	const nextCursor = hasMore && typeof lastHit?.entryId === "string"
-		? encodeHistoryCursor(lastHit.entryId, snapshotThrough, params.query, scope, params.windowId ?? null, params.role ?? null, caseSensitive)
+		? encodeHistoryCursor(lastHit.entryId, snapshotThrough, filterKey)
 		: null;
 	const output = [
 		searchHeading,
 		`scope: ${scope}`,
-		`hits: ${hits.length}`,
+		`${listing ? "items" : "hits"}: ${hits.length}`,
 		`nextCursor: ${nextCursor ?? "(none)"}`,
 		...blocks,
 	].join("\n\n");
-	if (estimatedOutputTokens(output) > tokenLimit) throw historyCapacityError("history_search", tokenLimit, metadataTokens);
+	if (estimatedOutputTokens(output) > tokenLimit) throw historyCapacityError(tool, tokenLimit, metadataTokens);
 	return {
 		content: [{ type: "text", text: output }],
 		details: {
 			schemaVersion: LEDGER_SCHEMA_VERSION,
-			query: params.query,
+			...(listing ? {} : { query }),
 			scope,
 			caseSensitive,
+			hasImage: params.hasImage,
 			limit,
 			snapshotThrough,
-			hits,
+			...(listing ? { items: hits } : { hits }),
 			nextCursor,
 			readTokenLimit: tokenLimit,
 		},
 	};
+}
+
+function historyWindowsResult(params: HistoryListWindowsParameters, ctx: ExtensionContext, toolCallId?: string) {
+	const tool = "history_list_windows";
+	const filterKey = createHash("sha256").update(tool).digest("hex");
+	const branch = ctx.sessionManager.getBranch();
+	const snapshot = historyPageSnapshot(params, branch, toolCallId, filterKey, tool);
+	const entries = branch.slice(0, snapshot.endIndex + 1);
+	const starts = historyWindowStarts(entries, ctx);
+	const latestCompaction = latestLedgerCompaction(entries);
+	const currentWindowId = latestCompaction && isLedgerCompactionDetails(latestCompaction.details)
+		? latestCompaction.details.windowId
+		: initialWindowId(ctx);
+	const summaries = new Map([...starts].map(([windowId, compactionEntryId]) => [windowId, {
+		windowId,
+		active: windowId === currentWindowId,
+		compactionEntryId,
+		entryCount: 0,
+		firstEntryId: null as string | null,
+		lastEntryId: null as string | null,
+		checkpointCount: 0,
+		latestCheckpointEntryId: null as string | null,
+		checkpointPreview: "",
+	}]));
+	const windowIds = branchWindowIds(entries, ctx);
+	for (const [index, entry] of entries.entries()) {
+		const summary = summaries.get(windowIds[index])!;
+		summary.entryCount++;
+		summary.firstEntryId ??= entry.id;
+		summary.lastEntryId = entry.id;
+		if (entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY_TYPE) {
+			const data = parseCheckpointData(entry.data);
+			const source = data ? summaries.get(data.sourceWindowId) : undefined;
+			if (source && data) {
+				source.checkpointCount++;
+				source.latestCheckpointEntryId = entry.id;
+				source.checkpointPreview = data.ledger.slice(0, MAX_HISTORY_SEARCH_SNIPPET_LENGTH);
+			}
+		}
+	}
+	const ordered = [...summaries.values()].reverse();
+	const afterIndex = snapshot.after === undefined ? -1 : ordered.findIndex((window) => window.windowId === snapshot.after);
+	if (snapshot.after !== undefined && afterIndex < 0) throw historyCursorError("cursor window is not on the current branch snapshot", tool);
+	const remaining = ordered.slice(afterIndex + 1);
+	const limit = params.limit ?? 20;
+	const tokenLimit = historyReadTokenLimit();
+	const windows: typeof ordered = [];
+	let nextCursor: string | null = null;
+	const render = () => JSON.stringify({ windows, nextCursor, snapshotThrough: snapshot.through }, null, 2);
+	for (const window of remaining.slice(0, limit)) {
+		const previousCursor = nextCursor;
+		windows.push(window);
+		nextCursor = windows.length < remaining.length ? encodeHistoryCursor(window.windowId, snapshot.through, filterKey) : null;
+		let candidateTokens = estimatedOutputTokens(render());
+		while (candidateTokens > tokenLimit && window.checkpointPreview.length > 0) {
+			window.checkpointPreview = window.checkpointPreview.slice(0, Math.floor(window.checkpointPreview.length / 2));
+			candidateTokens = estimatedOutputTokens(render());
+		}
+		if (candidateTokens <= tokenLimit) continue;
+		windows.pop();
+		nextCursor = previousCursor;
+		if (windows.length === 0) throw historyCapacityError(tool, tokenLimit, candidateTokens);
+		break;
+	}
+	const output = render();
+	if (estimatedOutputTokens(output) > tokenLimit) throw historyCapacityError(tool, tokenLimit, estimatedOutputTokens(output));
+	return {
+		content: [{ type: "text" as const, text: output }],
+		details: { schemaVersion: LEDGER_SCHEMA_VERSION, windows, nextCursor, snapshotThrough: snapshot.through, readTokenLimit: tokenLimit },
+	};
+}
+
+function contextRemainingResult(pi: ExtensionAPI, ctx: ExtensionContext, state: SessionState, settingsReader?: LedgerContextSettingsReader) {
+	const usage = reminderUsage(pi, ctx, settingsReader);
+	const details = {
+		windowId: state.activeWindowId,
+		contextWindowTokens: usage?.contextWindow ?? ctx.model?.contextWindow ?? null,
+		usedTokens: usage?.tokens ?? null,
+		modelRemainingTokens: usage?.modelRemaining ?? null,
+		effectiveBoundaryTokens: usage?.boundaryTokens ?? null,
+		tokensUntilBoundary: usage ? Math.max(0, usage.boundaryRemaining) : null,
+		outputReserveTokens: usage ? contentBudgets(usage.contextWindow).outputReserveTokens : null,
+		usageKind: usage?.usageKind ?? "unavailable",
+		nativeCompactionMode: usage?.nativeBoundaryMode ?? "unknown",
+		configSource: usage?.configSource ?? null,
+	};
+	return { content: [{ type: "text" as const, text: JSON.stringify(details, null, 2) }], details };
 }
 
 function createTailUnits(entries: SessionEntry[], startIndex: number): TailUnit[] {
@@ -3421,23 +3620,62 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 	pi.registerTool({
 		name: "history_search",
 		label: "History Search",
-		description: "Search the current session branch with a bounded literal query, ignoring case by default; set caseSensitive for exact case. Use conversation, tools, or all scope and nextCursor for more matches.",
+		description: "Search current-branch conversation, tools, checkpoint ledger bodies, or all entries by literal text; ignores case by default. Filter by role, windowId, or hasImage and paginate with nextCursor.",
 		promptSnippet: "search current-branch history with a literal query",
 		promptGuidelines: [
-			"Search literal text ignoring case by default; set caseSensitive: true for exact case. Use conversation, tools, or all scope and history_read on returned IDs. Results are newest first; cursors preserve snapshot filters, including caseSensitive.",
+			"Search literal text ignoring case by default; set caseSensitive: true for exact case. Scope defaults to conversation; checkpoints searches ledger bodies. Use history_read on returned IDs. Cursors preserve the snapshot and all filters.",
 			"Results are limited to the current branch and include committed window, source role, execution status, and nextCursor.",
 		],
 		parameters: historySearchParameters,
 		executionMode: "sequential",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			try {
-				return historySearchResult(params, ctx, _toolCallId);
+				return historyItemsResult(params, ctx, _toolCallId);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				throw message.startsWith("history validation failed:") || message.startsWith("history_output_capacity:") || message.startsWith("history_cursor_invalid:")
 					? error
 					: historyValidationError(message);
 			}
+		},
+	});
+
+	pi.registerTool({
+		name: "history_list_items",
+		label: "History List Items",
+		description: "Browse bounded current-branch entries newest first, without a query. Scope defaults to all; supports conversation, tools, checkpoints, role, windowId, hasImage, and snapshot cursors.",
+		promptSnippet: "browse history and checkpoint versions",
+		promptGuidelines: ["Use listing when no search phrase is known. Checkpoint active flags refer to the page snapshot; fitsCurrentLedgerBudget checks the current ledger budget, while full recovery capacity is checked at compaction. Read known entry IDs with history_read."],
+		parameters: historyListItemsParameters,
+		executionMode: "sequential",
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			return historyItemsResult(params, ctx, toolCallId, "history_list_items");
+		},
+	});
+
+	pi.registerTool({
+		name: "history_list_windows",
+		label: "History List Windows",
+		description: "List initial and committed current-branch windows newest first, including empty windows. Returns snapshot-stable attributed entry counts, entry IDs, and checkpoints by source window.",
+		promptSnippet: "browse context windows",
+		promptGuidelines: ["Use a returned windowId with history_list_items or history_search. Retained entries can be attributed to a newer window; checkpoint summaries use their original sourceWindowId. Continue with nextCursor."],
+		parameters: historyListWindowsParameters,
+		executionMode: "sequential",
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			return historyWindowsResult(params, ctx, toolCallId);
+		},
+	});
+
+	pi.registerTool({
+		name: "get_context_remaining",
+		label: "Context Remaining",
+		description: "Read current context usage, model headroom, effective-boundary headroom, output reserve, and usage/configuration provenance. Unavailable values are null; pi controls compaction.",
+		promptSnippet: "check context capacity",
+		promptGuidelines: ["This is a capacity snapshot. Use tokensUntilBoundary when deciding whether to checkpoint; usageKind distinguishes pi usage, bounded estimates, and unavailable data. Saving a checkpoint continues the current run."],
+		parameters: Type.Object({}),
+		executionMode: "sequential",
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			return contextRemainingResult(pi, ctx, getState(ctx), settingsReader);
 		},
 	});
 
