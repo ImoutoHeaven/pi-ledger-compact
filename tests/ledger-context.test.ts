@@ -6047,3 +6047,46 @@ test("coverage records task references, exact text prefixes and image representa
 		return index >= entries.findIndex(entry => entry.id === range.fromEntryId) && index <= entries.findIndex(entry => entry.id === range.toEntryId);
 	}));
 });
+
+test("ledger refresh projects checkpoint bodies while explicit reads retain complete coverage", async (t) => {
+	const previousTail = process.env.LEDGER_CONTEXT_TAIL_TOKENS;
+	process.env.LEDGER_CONTEXT_TAIL_TOKENS = "128";
+	t.after(() => { if (previousTail === undefined) delete process.env.LEDGER_CONTEXT_TAIL_TOKENS; else process.env.LEDGER_CONTEXT_TAIL_TOKENS = previousTail; });
+	const fixture = await createFixture(false, [], 64, { contextWindow: 32_000, maxTokens: 512, reserveTokens: 0, compactionEnabled: false });
+	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+	const { session, sessionManager: manager, ledgerFaux } = fixture;
+	manager.appendMessage({ role: "user", content: "Preserve the important checkpoint ledger", timestamp: Date.now() });
+	for (let i = 0; i < 180; i++) manager.appendMessage(fauxAssistantMessage(`Evidence ${i}: ${"x".repeat(8000)}`));
+	manager.appendMessage({ role: "user", content: "Save the first window", timestamp: Date.now() });
+	ledgerFaux.setResponses([fauxAssistantMessage("checkpoint-ledger-sentinel: preserve decisions. Skills: none.")]);
+	await session.compact();
+	const first = checkpointEntries(manager.getBranch()).at(-1)!;
+	const original = JSON.stringify(first.data);
+	assert.ok((first.data as any).inputCoverage.partialEntries.length >= 100);
+	assert.ok(original.length > 8000);
+	const invalid = manager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, { schemaVersion: 2, inputCoverage: { payload: "invalid-manifest-sentinel".repeat(500) } });
+	process.env.LEDGER_CONTEXT_TAIL_TOKENS = "4096";
+	manager.appendMessage({ role: "user", content: "Keep fresh-work-sentinel in the next ledger", timestamp: Date.now() });
+	manager.appendMessage(fauxAssistantMessage("Additional recent evidence. ".repeat(30)));
+	let input = "";
+	ledgerFaux.setResponses([(context) => { input = String(context.messages[0].content); return fauxAssistantMessage("New ledger. Skills: none."); }]);
+	await session.compact();
+	assert.match(input, /checkpoint-ledger-sentinel/);
+	assert.match(input, /fresh-work-sentinel/);
+	assert.ok(input.includes(`pi://entry/${first.id}`));
+	assert.ok(input.includes(`pi://entry/${invalid}`));
+	assert.doesNotMatch(input, /"fullRanges":\[|"partialEntries":\[|"outstandingGaps":\[|invalid-manifest-sentinel/);
+	assert.ok(input.length < original.length, "the refresh must not pay for the full manifest");
+	const coverage = (checkpointEntries(manager.getBranch()).at(-1)!.data as any).inputCoverage;
+	for (const id of [first.id, invalid]) assert.equal(coverage.partialEntries.find((part: any) => part.entryId === id).providedChars, 0);
+	assert.equal(JSON.stringify(first.data), original);
+	let params: Record<string, unknown> | null = { entryId: first.id, length: 65536 };
+	let recovered = "";
+	for (let count = 0; params; count++) {
+		assert.ok(count < 100);
+		const result = await inspectHistory(fixture, "history_read", params);
+		recovered += (result.details as any).text;
+		params = (result.details as any).nextRead;
+	}
+	assert.ok(recovered.includes(original));
+});

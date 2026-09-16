@@ -39,11 +39,13 @@ Checkpoint metadata uses schema version 2. Its `inputCoverage` records the input
 | `source`, `baseCheckpointEntryId`, `snapshotThrough` | Generation path, preceding checkpoint used as the coverage basis, and request snapshot tip. |
 | `representation` | `rendered-text-with-image-references`: coverage describes rendered text; image pixels require a separate image read. |
 | `fullRanges` | Inclusive ranges whose complete rendered entry text was supplied to this ledger request. |
-| `partialEntries` | Supplied prefixes with `providedChars` and `totalChars` in UTF-16 units; zero supplied characters indicates a reference-only entry. |
+| `partialEntries` | Supplied prefixes with `providedChars` and `totalChars` in UTF-16 units; zero supplied characters indicates a reference or summary projection of the source entry. |
 | `omittedRanges` | Inclusive ranges omitted from the new history since the preceding checkpoint request. |
 | `outstandingGaps` | Inherited and current gaps, with reason `omitted`, `partial`, or `unknown`; each inclusive range includes its entry count. |
 
 Automatic refresh measures the final task anchors and selected history together. A complete text entry supplied through either path resolves its text-coverage gap. Saving another ledger carries remaining gaps forward. Agent-authored `checkpoint` calls mark the new request interval as `unknown` and preserve preceding gaps. Coverage records supplied input; understanding, retained meaning, and execution verification are separate judgments supported by evidence.
+
+Within automatic refresh input, checkpoint history entries are projected to their ledger text, compact coverage counts, and original-entry reference. Coverage records these projections with zero source-prefix characters. Complete manifests remain available through explicit `history_read` calls.
 
 Checkpoint receipts, listings, window summaries, and recovery bootstraps show compact coverage counts. Read a checkpoint with `history_read` and follow `nextRead` for its complete manifest and gap recovery calls. Those calls convert inclusive coverage ranges to the history filter's exclusive bounds. Inspect gaps relevant to the next decision; the full session log remains available for evidence recovery.
 

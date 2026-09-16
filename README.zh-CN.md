@@ -39,11 +39,13 @@ Checkpoint 元数据使用 schema version 2。`inputCoverage` 独立于账本正
 | `source`、`baseCheckpointEntryId`、`snapshotThrough` | 生成路径、作为覆盖继承依据的上一份 checkpoint，以及请求快照末端。 |
 | `representation` | `rendered-text-with-image-references`：覆盖范围描述渲染文字；图片像素通过独立图像读取获取。 |
 | `fullRanges` | 本次账本请求完整提供了渲染正文的条目范围，包含首尾条目。 |
-| `partialEntries` | 已提供前缀的 `providedChars` 和完整正文的 `totalChars`，单位为 UTF-16；提供字符数为零表示仅提供引用。 |
+| `partialEntries` | 已提供前缀的 `providedChars` 和完整正文的 `totalChars`，单位为 UTF-16；提供字符数为零表示提供了原始条目的引用或摘要投影。 |
 | `omittedRanges` | 从上一份 checkpoint 请求位置之后的新增历史中省略的范围，包含首尾条目。 |
 | `outstandingGaps` | 继承和本次产生的覆盖缺口，原因为 `omitted`、`partial` 或 `unknown`；范围包含首尾条目，并记录条目数。 |
 
 自动刷新统一统计最终任务锚点和选中的历史正文。任一路径完整提供某条目的渲染文字后，其文字覆盖缺口得到补齐；再次保存账本会继承其余缺口。主 agent 调用 `checkpoint` 时，将新增请求区间标为 `unknown`，并保留既有缺口。Coverage 记录实际提供的输入；理解、含义保留和执行核验分别由证据支持。
+
+自动刷新输入中的 checkpoint 历史条目投影为账本正文、简短的覆盖统计和原始条目引用。Coverage 将这类投影记录为零个原文前缀字符。完整 manifest 通过显式 `history_read` 调用读取。
 
 Checkpoint 回执、条目列表、窗口摘要和恢复引导展示简短的覆盖统计。通过 `history_read` 读取 checkpoint，并跟随 `nextRead` 获取完整 manifest 和缺口查询调用。这些调用将包含首尾的覆盖范围转换为历史过滤器的排他边界。按下一步决策的需要补查相关缺口；完整会话日志持续作为证据来源。
 

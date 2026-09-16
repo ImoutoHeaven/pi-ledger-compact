@@ -3642,8 +3642,16 @@ async function generateCompactionCheckpoint(
 			const remaining = inputBudget - used;
 			if (remaining < 64) break;
 			const entry = entries[index];
+			const isCheckpoint = entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY_TYPE;
+			const checkpoint = isCheckpoint ? parseCheckpointData(entry.data) : undefined;
+			const rendered = isCheckpoint ? [
+				`[entry ${entry.id}] checkpoint summary projection; complete entry: ${historyEntryReference(entry.id)}`,
+				`inputCoverage: ${safeJson(coverageSummary(checkpoint?.inputCoverage))}`,
+				checkpoint ? `ledger:\n${checkpoint.ledger}` : "Checkpoint format is invalid; inspect the original entry for evidence.",
+			].join("\n") : renderEntry(entry);
 			let providedChars = 0;
-			const text = clippedText(renderEntry(entry), Math.min(budgets.tailTokens, remaining - 16) * 3, entry.id, (count) => { providedChars = count; });
+			// A checkpoint summary is a projection, not a prefix of the persisted entry.
+			const text = clippedText(rendered, Math.min(budgets.tailTokens, remaining - 16) * 3, entry.id, (count) => { if (!isCheckpoint) providedChars = count; });
 			const cost = ledgerTokenEstimate(text) + 2;
 			if (cost > remaining) break;
 			selected.unshift(text);
