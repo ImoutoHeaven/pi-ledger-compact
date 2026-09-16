@@ -16,7 +16,7 @@ import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-wor
 export const CHECKPOINT_ENTRY_TYPE = "ledger-context/checkpoint";
 export const RAW_TAIL_MARKER_ENTRY_TYPE = "ledger-context/tail-marker";
 export const COMPACTION_DETAILS_KIND = "ledger-context";
-export const LEDGER_SCHEMA_VERSION = 1 as const;
+export const LEDGER_SCHEMA_VERSION = 2 as const;
 export const MAX_ACTIVE_REQUEST_IDS = 8;
 export const LEDGER_BYTE_LIMIT = 65_536;
 export const DEFAULT_LEDGER_TOKEN_LIMIT = 4_096;
@@ -38,7 +38,7 @@ export const MAX_HISTORY_IMAGE_BASE64_BYTES = 4.5 * 1024 * 1024;
 export const MAX_HISTORY_IMAGE_NOTE_LENGTH = 1_024;
 
 const checkpointParameters = Type.Object({
-	ledger: Type.String({ minLength: 1, description: "The complete active working ledger." }),
+	ledger: Type.String({ minLength: 1, description: "Complete active working ledger; at most 65536 UTF-8 bytes and the configured ledger token budget. The receipt reports coverage separately." }),
 	activeRequestEntryIds: Type.Optional(
 		Type.Array(Type.String({ minLength: 1 }), {
 			maxItems: MAX_ACTIVE_REQUEST_IDS,
@@ -54,20 +54,20 @@ const historyKindSchema = Type.Union([Type.Literal("user_input"), Type.Literal("
 const historyFilterSchema = Type.Object({
 	kinds: Type.Optional(Type.Array(historyKindSchema, { minItems: 1, maxItems: 6 })),
 	excludeKinds: Type.Optional(Type.Array(historyKindSchema, { minItems: 1, maxItems: 6 })),
-	toolNames: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 32 })),
+	toolNames: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 32, description: "Exact tool names; matches calls and results." })),
 	statuses: Type.Optional(Type.Array(Type.Union([Type.Literal("received"), Type.Literal("requested"), Type.Literal("completed"), Type.Literal("failed"), Type.Literal("saved"), Type.Literal("committed"), Type.Literal("metadata")]), { minItems: 1, maxItems: 7 })),
-	windowIds: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 32 })),
-	afterEntryId: Type.Optional(Type.String({ minLength: 1 })),
-	beforeEntryId: Type.Optional(Type.String({ minLength: 1 })),
-	hasImage: Type.Optional(Type.Boolean()),
+	windowIds: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 32, description: "IDs returned by history_list_windows on this branch." })),
+	afterEntryId: Type.Optional(Type.String({ minLength: 1, description: "Exclusive lower entry bound in this branch snapshot." })),
+	beforeEntryId: Type.Optional(Type.String({ minLength: 1, description: "Exclusive upper entry bound in this branch snapshot." })),
+	hasImage: Type.Optional(Type.Boolean({ description: "Select by original image presence in the entire entry, independently of projection." })),
 	includeMaintenance: Type.Optional(Type.Boolean({ description: "Include checkpoint/history/budget tool traffic; default false." })),
 }, { additionalProperties: false });
-const historyProjectionSchema = Type.Union([Type.Literal("references"), Type.Literal("text"), Type.Literal("images"), Type.Literal("all")]);
+const historyProjectionSchema = Type.Union([Type.Literal("references"), Type.Literal("text"), Type.Literal("images"), Type.Literal("all")], { description: "Default all: text plus image references. text retains text in mixed entries; images returns references; references returns entry metadata. Pixels require history_read view=image." });
 
 const historyPageFields = {
-	cursor: Type.Optional(Type.String({ minLength: 1, description: "Snapshot cursor from the same history tool and filters." })),
-	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_HISTORY_PAGE_SIZE, description: "Maximum number of results." })),
-	order: Type.Optional(Type.Union([Type.Literal("newest"), Type.Literal("oldest")])),
+	cursor: Type.Optional(Type.String({ minLength: 1, description: "Copy nextCursor and repeat selection arguments. Supported display controls (limit/maxChars/projection) may change. history_read accepts cursor only in exchange/neighbors." })),
+	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_HISTORY_PAGE_SIZE, description: "Result count ceiling, default 20; output budget may return fewer. In history_read, only exchange/neighbors accept limit." })),
+	order: Type.Optional(Type.Union([Type.Literal("newest"), Type.Literal("oldest")], { description: "Default newest for lists/search, oldest for exchange/neighbors. In history_read, only exchange/neighbors accept order." })),
 };
 
 const historyItemFields = {
@@ -81,18 +81,18 @@ const historyListItemsParameters = Type.Object(historyItemFields, { additionalPr
 const historyListWindowsParameters = Type.Object({ ...historyPageFields, filter: Type.Optional(historyFilterSchema) }, { additionalProperties: false });
 const historySearchParameters = Type.Object({
 	...historyItemFields,
-	query: Type.String({ minLength: 1, description: "Literal text to find, ignoring case by default." }),
+	query: Type.String({ minLength: 1, description: "Literal text, ignoring case by default; at most 8192 UTF-8 bytes." }),
 	caseSensitive: Type.Optional(Type.Boolean({ description: "Match letter case exactly; defaults to false." })),
 }, { additionalProperties: false });
 const historyReadParameters = Type.Object({
-	entryId: Type.String({ minLength: 1 }),
-	view: Type.Optional(Type.Union([Type.Literal("entry"), Type.Literal("image"), Type.Literal("exchange"), Type.Literal("neighbors")])),
+	entryId: Type.String({ minLength: 1, description: "Current-branch source entry ID from a history result or recovery reference." }),
+	view: Type.Optional(Type.Union([Type.Literal("entry"), Type.Literal("image"), Type.Literal("exchange"), Type.Literal("neighbors")], { description: "Default entry: offset/length text paging. image: entryId/contentIndex only. exchange/neighbors: limit/cursor/order paging." })),
 	contentIndex: Type.Optional(Type.Integer({ minimum: 0, description: "Original content block; required for image and for selecting one call in a multi-call exchange." })),
 	projection: Type.Optional(historyProjectionSchema),
-	offset: Type.Optional(Type.Integer({ minimum: 0 })),
-	length: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_HISTORY_READ_LENGTH })),
-	before: Type.Optional(Type.Integer({ minimum: 0, maximum: 20 })),
-	after: Type.Optional(Type.Integer({ minimum: 0, maximum: 20 })),
+	offset: Type.Optional(Type.Integer({ minimum: 0, description: "Entry view only: zero-based UTF-16 offset, default 0. Follow nextRead to preserve projection and contentIndex." })),
+	length: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_HISTORY_READ_LENGTH, description: "Entry view only: UTF-16 text length ceiling, default 65536; output budget may return less. This is the text-size control." })),
+	before: Type.Optional(Type.Integer({ minimum: 0, maximum: 20, description: "Neighbors only: preceding log entries, default 2." })),
+	after: Type.Optional(Type.Integer({ minimum: 0, maximum: 20, description: "Neighbors only: following log entries, default 2." })),
 	...historyPageFields,
 }, { additionalProperties: false });
 
@@ -236,6 +236,24 @@ export interface CheckpointData {
 	activeRequestEntryIds: string[];
 	requestHistoryPosition: RequestHistoryPosition;
 	sourceWindowId: string;
+	inputCoverage: InputCoverage;
+}
+
+interface CoverageRange {
+	fromEntryId: string;
+	toEntryId: string;
+	entryCount: number;
+}
+
+interface InputCoverage {
+	source: "ledger-refresh" | "agent-context";
+	representation: "rendered-text-with-image-references";
+	baseCheckpointEntryId: string | null;
+	snapshotThrough: string | null;
+	fullRanges: CoverageRange[];
+	partialEntries: Array<{ entryId: string; providedChars: number; totalChars: number }>;
+	omittedRanges: CoverageRange[];
+	outstandingGaps: Array<CoverageRange & { reason: "omitted" | "partial" | "unknown" }>;
 }
 
 export interface CheckpointReceiptDetails extends CheckpointData {
@@ -756,12 +774,13 @@ function safeJson(value: unknown): string {
 	}
 }
 
-function clippedText(value: string, maxChars: number, entryId?: string): string {
-	if (value.length <= maxChars) return value;
+function clippedText(value: string, maxChars: number, entryId?: string, record?: (providedChars: number) => void): string {
+	if (value.length <= maxChars) { record?.(value.length); return value; }
 	const marker = entryId
 		? `[truncated; complete entry: ${historyEntryReference(entryId)}]`
 		: "[truncated; complete entry remains in the session log]";
 	const prefixLength = Math.max(1, maxChars - marker.length - 1);
+	record?.(prefixLength);
 	return `${value.slice(0, prefixLength)}\n${marker}`;
 }
 
@@ -1607,9 +1626,21 @@ function branchWindowIds(entries: SessionEntry[], ctx: ExtensionContext, endInde
 function historyViewAt(entries: SessionEntry[], ctx: ExtensionContext, index: number, projection: HistoryProjection, contentIndex?: number): HistoryEntryView {
 	const entry = entries[index];
 	const windowIds = branchWindowIds(entries, ctx);
+	let text = projectedHistoryEntry(entry, projection, contentIndex);
+	const checkpoint = entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY_TYPE ? parseCheckpointData(entry.data) : undefined;
+	if (checkpoint && contentIndex === undefined && (projection === "all" || projection === "text")) {
+		const positions = new Map(entries.map((entry, index) => [entry.id, index]));
+		const recovery = checkpoint.inputCoverage.outstandingGaps.map((gap) => {
+			const from = positions.get(gap.fromEntryId);
+			const to = positions.get(gap.toEntryId);
+			if (from === undefined || to === undefined || !entries[to + 1]) return { ...gap, error: "range unavailable on this branch" };
+			return { ...gap, tool: "history_list_items", arguments: { filter: { includeMaintenance: true, ...(from > 0 ? { afterEntryId: entries[from - 1].id } : {}), beforeEntryId: entries[to + 1].id }, order: "oldest", projection: "references" } };
+		});
+		text += `\nCoverage recovery calls (inclusive stored ranges, exclusive query bounds):\n${safeJson(recovery)}`;
+	}
 	return {
 		entry,
-		text: projectedHistoryEntry(entry, projection, contentIndex),
+		text,
 		role: historyRole(entry),
 		windowId: windowIds[index],
 		executionStatus: historyExecutionStatus(entry),
@@ -1621,12 +1652,19 @@ function historyValidationError(message: string): Error {
 	return new Error(`history validation failed: ${message}`);
 }
 
+function historyContinuation(tool: HistoryPageTool): string {
+	if (tool === "history_read") return "Copy nextCursor with the same entryId/view/contentIndex/before/after/order; limit/projection may change.";
+	if (tool === "history_list_windows") return "Copy nextCursor with the same filter/order; limit may change.";
+	return `Copy nextCursor with the same ${tool === "history_search" ? "query/filter/order/caseSensitive" : "filter/order"}; limit/maxChars/projection may change.`;
+}
+
 function historyCursorError(message: string, tool: HistoryPageTool = "history_search"): Error {
 	return new Error(
 		`history_cursor_invalid: ${JSON.stringify({
 			code: "history_cursor_invalid",
 			message,
-			restart: `Rerun ${tool} with the original query and filters.`,
+			continue: historyContinuation(tool),
+			restart: `Rerun ${tool} without cursor to start a new query on the current snapshot.`,
 		})}`,
 	);
 }
@@ -1748,7 +1786,7 @@ function displayedHistoryQuery(query: string): string {
 }
 
 interface HistoryCursor {
-	version: 3;
+	version: 4;
 	after: string;
 	through: string | null;
 	filterKey: string;
@@ -1763,14 +1801,14 @@ function encodeHistoryCursor(
 	through: string | null,
 	filterKey: string,
 ): string {
-	return JSON.stringify({ version: 3, after, through, filterKey });
+	return JSON.stringify({ version: 4, after, through, filterKey });
 }
 
 function decodeHistoryCursor(value: string, tool: HistoryPageTool = "history_search"): HistoryCursor {
 	try {
 		const parsed = JSON.parse(value) as Record<string, unknown>;
 		if (
-			parsed.version !== 3 ||
+			parsed.version !== 4 ||
 			typeof parsed.after !== "string" ||
 			parsed.after.length === 0 ||
 			typeof parsed.filterKey !== "string" ||
@@ -1780,7 +1818,7 @@ function decodeHistoryCursor(value: string, tool: HistoryPageTool = "history_sea
 		}
 		if (parsed.through !== null && typeof parsed.through !== "string") throw new Error("invalid cursor snapshot");
 		return {
-			version: 3,
+			version: 4,
 			after: parsed.after,
 			through: parsed.through as string | null,
 			filterKey: parsed.filterKey,
@@ -1987,8 +2025,10 @@ async function historyReadResult(params: HistoryReadParameters, ctx: ExtensionCo
 	const projection = historyProjection(params.projection);
 	if (params.contentIndex !== undefined && (!Number.isSafeInteger(params.contentIndex) || params.contentIndex < 0)) throw historyValidationError(`image or content source ${historyEntryReference(params.entryId)} requires a non-negative original content index`);
 	const relatedView = viewMode === "exchange" || viewMode === "neighbors";
-	if (relatedView && (params.offset !== undefined || params.length !== undefined)) throw historyValidationError("exchange and neighbors views use cursor pagination");
-	if (!relatedView && [params.before, params.after, params.cursor, params.limit, params.order].some((value) => value !== undefined)) throw historyValidationError("entry and image views do not accept related-view pagination");
+	const textPageFields = (["offset", "length"] as const).filter((field) => params[field] !== undefined);
+	if (relatedView && textPageFields.length) throw historyValidationError(`${textPageFields.join(", ")} unsupported for view=${viewMode}. Remove these fields; use limit for entry counts and cursor to continue, or view=entry for offset/length text paging.`);
+	const paginationFields = (["before", "after", "cursor", "limit", "order"] as const).filter((field) => params[field] !== undefined);
+	if (!relatedView && paginationFields.length) throw historyValidationError(`${paginationFields.join(", ")} unsupported for view=${viewMode}. Remove these fields. Entry text uses offset/length (UTF-16 units); limit/cursor/order require exchange or neighbors.`);
 	if (viewMode !== "neighbors" && (params.before !== undefined || params.after !== undefined)) throw historyValidationError("before and after require neighbors view");
 	if (viewMode === "neighbors" && params.contentIndex !== undefined) throw historyValidationError("contentIndex requires entry, image, or exchange view");
 	for (const value of [params.before, params.after]) if (value !== undefined && (!Number.isSafeInteger(value) || value < 0 || value > 20)) throw historyValidationError("before and after must be integers from 0 to 20");
@@ -2041,6 +2081,10 @@ async function historyReadResult(params: HistoryReadParameters, ctx: ExtensionCo
 	const checkpoint = view.entry.type === "custom" && view.entry.customType === CHECKPOINT_ENTRY_TYPE
 		? checkpointHistoryDetails(branchEntries).get(view.entry.id)
 		: undefined;
+	const requestedLength = params.length ?? MAX_HISTORY_READ_LENGTH;
+	const nextReadFor = (nextOffset: number | null) => nextOffset === null ? null : { entryId: params.entryId, view: "entry", projection, ...(params.contentIndex === undefined ? {} : { contentIndex: params.contentIndex }), offset: nextOffset, length: requestedLength };
+	const pageEndFor = (length: number, nextOffset: number | null) => nextOffset === null ? "complete" : length < requestedLength ? "output_budget" : "length";
+	const pageFields = (length: number, nextOffset: number | null) => `returnedLength: ${length}; totalLength: ${view.text.length}; requestedLength: ${requestedLength}; pageEnd: ${pageEndFor(length, nextOffset)}\nnextRead: ${safeJson(nextReadFor(nextOffset))}`;
 	const header = [
 		"History entry",
 		`entryId: ${view.entry.id}`,
@@ -2053,11 +2097,10 @@ async function historyReadResult(params: HistoryReadParameters, ctx: ExtensionCo
 		...Object.entries(checkpoint ?? {}).map(([key, value]) => `${key}: ${safeJson(value)}`),
 		`offset: ${offset}`,
 	].join("\n");
-	const metadataOutput = [header, "nextOffset: 1000000", payloadText, "text:", "(empty)"].filter(Boolean).join("\n");
+	const metadataOutput = [header, "nextOffset: 1000000", pageFields(0, null), payloadText, "text:", "(empty)"].filter(Boolean).join("\n");
 	const metadataTokens = estimatedOutputTokens(metadataOutput);
 	if (metadataTokens > tokenLimit) throw historyCapacityError("history_read", tokenLimit, metadataTokens);
 
-	const requestedLength = params.length ?? MAX_HISTORY_READ_LENGTH;
 	const maxPageLength = Math.min(requestedLength, view.text.length - offset);
 	let pageLength = maxPageLength;
 	let selected: { output: string; body: string; nextOffset: number | null; truncated: boolean } | undefined;
@@ -2067,7 +2110,7 @@ async function historyReadResult(params: HistoryReadParameters, ctx: ExtensionCo
 		const truncated = endOffset < view.text.length;
 		const visibleBody = truncated ? `${body}\n${HISTORY_TRUNCATION_MARKER}` : body || "(empty)";
 		const nextOffset = truncated ? endOffset : null;
-		const output = [header, `nextOffset: ${nextOffset ?? "(none)"}`, payloadText, "text:", visibleBody].filter(Boolean).join("\n");
+		const output = [header, `nextOffset: ${nextOffset ?? "(none)"}`, pageFields(body.length, nextOffset), payloadText, "text:", visibleBody].filter(Boolean).join("\n");
 		if (estimatedOutputTokens(output) <= tokenLimit) {
 			selected = { output, body, nextOffset, truncated };
 			break;
@@ -2075,13 +2118,13 @@ async function historyReadResult(params: HistoryReadParameters, ctx: ExtensionCo
 		pageLength = Math.floor(pageLength / 2);
 	}
 	if (!selected && maxPageLength === 0) {
-		const output = [header, "nextOffset: (none)", payloadText, "text:", "(empty)"].filter(Boolean).join("\n");
+		const output = [header, "nextOffset: (none)", pageFields(0, null), payloadText, "text:", "(empty)"].filter(Boolean).join("\n");
 		if (estimatedOutputTokens(output) <= tokenLimit) selected = { output, body: "", nextOffset: null, truncated: false };
 	}
 	if (!selected && maxPageLength > 0) {
 		const body = view.text.slice(offset, offset + 1);
 		const nextOffset = offset + body.length < view.text.length ? offset + body.length : null;
-		const output = [header, `nextOffset: ${nextOffset ?? "(none)"}`, payloadText, "text:", body].filter(Boolean).join("\n");
+		const output = [header, `nextOffset: ${nextOffset ?? "(none)"}`, pageFields(body.length, nextOffset), payloadText, "text:", body].filter(Boolean).join("\n");
 		if (estimatedOutputTokens(output) <= tokenLimit) selected = { output, body, nextOffset, truncated: nextOffset !== null };
 	}
 	if (!selected) throw historyCapacityError("history_read", tokenLimit, metadataTokens);
@@ -2101,6 +2144,9 @@ async function historyReadResult(params: HistoryReadParameters, ctx: ExtensionCo
 			isError: view.entry.type === "message" && (view.entry.message as MessageLike).isError === true,
 			offset,
 			length: body.length,
+			requestedLength,
+			pageEnd: pageEndFor(body.length, nextOffset),
+			nextRead: nextReadFor(nextOffset),
 			totalLength: view.text.length,
 			nextOffset,
 			text: body,
@@ -2153,6 +2199,7 @@ interface CheckpointHistoryDetails {
 	requestHistoryPosition: RequestHistoryPosition | null;
 	fitsCurrentLedgerBudget: boolean;
 	recoveryIssue: string | null;
+	coverage: ReturnType<typeof coverageSummary>;
 }
 
 function checkpointHistoryDetails(entries: SessionEntry[]): Map<string, CheckpointHistoryDetails> {
@@ -2172,6 +2219,7 @@ function checkpointHistoryDetails(entries: SessionEntry[]): Map<string, Checkpoi
 			requestHistoryPosition: data?.requestHistoryPosition ?? null,
 			fitsCurrentLedgerBudget: issue === null,
 			recoveryIssue: issue,
+			coverage: coverageSummary(data?.inputCoverage),
 		});
 		if (data) {
 			previous = entry.id;
@@ -2225,7 +2273,7 @@ function historyItemsResult(
 	const insensitiveQuery = new RegExp(literalPattern, "iu");
 	const searchHeading = listing ? "History items" : `History search: ${JSON.stringify(displayedHistoryQuery(query!))} (${caseSensitive ? "case-sensitive" : "case-insensitive"} literal)`;
 	const branchEntries = ctx.sessionManager.getBranch();
-	const filterKey = historyFilterKey({ tool, query, filter, projection, maxChars, order, caseSensitive, selection: selection ? { entryId: selection.entryId, view: selection.view, contentIndex: selection.contentIndex, before: selection.before ?? 2, after: selection.after ?? 2 } : undefined });
+	const filterKey = historyFilterKey({ tool, query, filter, order, caseSensitive, selection: selection ? { entryId: selection.entryId, view: selection.view, contentIndex: selection.contentIndex, before: selection.before ?? 2, after: selection.after ?? 2 } : undefined });
 	const snapshot = historyPageSnapshot(params, branchEntries, toolCallId, filterKey, tool);
 	const snapshotThrough = snapshot.through;
 	const snapshotEndIndex = snapshot.endIndex;
@@ -2278,13 +2326,16 @@ function historyItemsResult(
 		});
 	}
 	if (order === "oldest") candidates.reverse();
-	const header = [searchHeading, `filter: ${safeJson(filter)}`, `projection: ${projection}; order: ${order}`, `snapshotThrough: ${snapshotThrough ?? "(none)"}`, `totalMatches: ${totalMatches}`,
+	const header = [searchHeading, `filter: ${safeJson(filter)}`, `projection: ${projection}; order: ${order}; maxChars: ${maxChars}; limit: ${limit}; readTokenLimit: ${tokenLimit}`, `snapshotThrough: ${snapshotThrough ?? "(none)"}`, `totalMatches: ${totalMatches}`,
+		`${historyContinuation(tool)} Images are references; view=image loads pixels.`,
 		...(related ? [`relation: ${safeJson(related.summary)}`] : [])];
+	const pageEnd = (count: number) => count >= candidates.length ? "complete" : count >= limit ? "limit" : "output_budget";
 	const hits: Array<Record<string, unknown>> = [];
 	const blocks: string[] = [];
 	const metadataOutput = [
 		...header,
 		"items: 0",
+		`pageEnd: ${pageEnd(0)}`,
 		"nextCursor: (none)",
 	].join("\n\n");
 	const metadataTokens = estimatedOutputTokens(metadataOutput);
@@ -2327,6 +2378,7 @@ function historyItemsResult(
 			const proposedOutput = [
 				...header,
 				`items: ${proposedHits}`,
+				`pageEnd: ${pageEnd(proposedHits)}`,
 				`nextCursor: ${potentialNextCursor ?? "(none)"}`,
 				...proposedBlocks,
 			].join("\n\n");
@@ -2372,6 +2424,7 @@ function historyItemsResult(
 	const output = [
 		...header,
 		`items: ${hits.length}`,
+		`pageEnd: ${pageEnd(hits.length)}`,
 		`nextCursor: ${nextCursor ?? "(none)"}`,
 		...blocks,
 	].join("\n\n");
@@ -2386,6 +2439,8 @@ function historyItemsResult(
 			order,
 			totalMatches,
 			returnedCount: hits.length,
+			pageEnd: pageEnd(hits.length),
+			maxChars,
 			relation: related?.summary,
 			caseSensitive,
 			limit,
@@ -2425,9 +2480,12 @@ function historyWindowsResult(params: HistoryListWindowsParameters, ctx: Extensi
 		lastEntryId: null as string | null,
 		latestUserEntryId: null as string | null,
 		latestUserPreview: "",
+		latestUserPreviewTruncated: false,
 		checkpointCount: 0,
 		latestCheckpointEntryId: null as string | null,
 		checkpointPreview: "",
+		checkpointPreviewTruncated: false,
+		checkpointCoverage: null as ReturnType<typeof coverageSummary> | null,
 	}]));
 	const windowIds = branchWindowIds(entries, ctx);
 	for (const [index, entry] of entries.entries()) {
@@ -2445,7 +2503,9 @@ function historyWindowsResult(params: HistoryListWindowsParameters, ctx: Extensi
 			if (selected.parts.some((part) => part.kind === "tool_result") && historyExecutionStatus(entry) === "failed") summary.failedToolResults++;
 			if (selected.parts.some((part) => part.kind === "user_input")) {
 				summary.latestUserEntryId = entry.id;
-				summary.latestUserPreview = historyPartText(selected.parts, "text").slice(0, MAX_HISTORY_SEARCH_SNIPPET_LENGTH);
+				const text = historyPartText(selected.parts, "text");
+				summary.latestUserPreview = text.slice(0, MAX_HISTORY_SEARCH_SNIPPET_LENGTH);
+				summary.latestUserPreviewTruncated = text.length > summary.latestUserPreview.length;
 			}
 		}
 		if (entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY_TYPE) {
@@ -2455,6 +2515,8 @@ function historyWindowsResult(params: HistoryListWindowsParameters, ctx: Extensi
 				source.checkpointCount++;
 				source.latestCheckpointEntryId = entry.id;
 				source.checkpointPreview = data.ledger.slice(0, MAX_HISTORY_SEARCH_SNIPPET_LENGTH);
+				source.checkpointPreviewTruncated = data.ledger.length > source.checkpointPreview.length;
+				source.checkpointCoverage = coverageSummary(data.inputCoverage);
 			}
 		}
 	}
@@ -2467,13 +2529,16 @@ function historyWindowsResult(params: HistoryListWindowsParameters, ctx: Extensi
 	const tokenLimit = historyReadTokenLimit();
 	const windows: typeof ordered = [];
 	let nextCursor: string | null = null;
-	const render = () => JSON.stringify({ filter, order, windows, nextCursor, snapshotThrough: snapshot.through }, null, 2);
+	const pageEnd = () => windows.length >= remaining.length ? "complete" : windows.length >= limit ? "limit" : "output_budget";
+	const render = () => JSON.stringify({ filter, order, limit, returnedCount: windows.length, pageEnd: pageEnd(), windows, nextCursor, snapshotThrough: snapshot.through, continuation: historyContinuation(tool) }, null, 2);
 	for (const window of remaining.slice(0, limit)) {
 		const previousCursor = nextCursor;
 		windows.push(window);
 		nextCursor = windows.length < remaining.length ? encodeHistoryCursor(window.windowId, snapshot.through, filterKey) : null;
 		let candidateTokens = estimatedOutputTokens(render());
 		while (candidateTokens > tokenLimit && (window.checkpointPreview.length > 0 || window.latestUserPreview.length > 0)) {
+			window.checkpointPreviewTruncated ||= window.checkpointPreview.length > 0;
+			window.latestUserPreviewTruncated ||= window.latestUserPreview.length > 0;
 			window.checkpointPreview = window.checkpointPreview.slice(0, Math.floor(window.checkpointPreview.length / 2));
 			window.latestUserPreview = window.latestUserPreview.slice(0, Math.floor(window.latestUserPreview.length / 2));
 			candidateTokens = estimatedOutputTokens(render());
@@ -2488,7 +2553,7 @@ function historyWindowsResult(params: HistoryListWindowsParameters, ctx: Extensi
 	if (estimatedOutputTokens(output) > tokenLimit) throw historyCapacityError(tool, tokenLimit, estimatedOutputTokens(output));
 	return {
 		content: [{ type: "text" as const, text: output }],
-		details: { schemaVersion: LEDGER_SCHEMA_VERSION, filter, order, windows, nextCursor, snapshotThrough: snapshot.through, readTokenLimit: tokenLimit },
+		details: { schemaVersion: LEDGER_SCHEMA_VERSION, filter, order, limit, returnedCount: windows.length, pageEnd: pageEnd(), windows, nextCursor, snapshotThrough: snapshot.through, readTokenLimit: tokenLimit },
 	};
 }
 
@@ -2700,6 +2765,87 @@ function parseRequestPosition(value: unknown): RequestHistoryPosition | undefine
 	return { entryId: input.entryId as string | null, branchDepth: input.branchDepth as number };
 }
 
+function coverageRanges(entries: SessionEntry[], ids: Set<string>): CoverageRange[] {
+	const ranges: CoverageRange[] = [];
+	let previous = -2;
+	for (const [index, entry] of entries.entries()) {
+		if (!ids.has(entry.id)) continue;
+		if (index === previous + 1) {
+			ranges[ranges.length - 1].toEntryId = entry.id;
+			ranges[ranges.length - 1].entryCount++;
+		} else ranges.push({ fromEntryId: entry.id, toEntryId: entry.id, entryCount: 1 });
+		previous = index;
+	}
+	return ranges;
+}
+
+function buildInputCoverage(entries: SessionEntry[], position: RequestHistoryPosition, base: StoredCheckpoint | undefined, supplied?: Map<string, number>): InputCoverage {
+	const snapshot = entries.slice(0, positionStartIndex(entries, position));
+	const positions = new Map(snapshot.map((entry, index) => [entry.id, index]));
+	const gaps = new Map<string, InputCoverage["outstandingGaps"][number]["reason"]>();
+	for (const gap of base?.data.inputCoverage.outstandingGaps ?? []) {
+		const from = positions.get(gap.fromEntryId);
+		const to = positions.get(gap.toEntryId);
+		if (from === undefined || to === undefined || from > to || to - from + 1 !== gap.entryCount) throw validationError("checkpoint coverage range is outside the request branch snapshot");
+		for (let index = from; index <= to; index++) gaps.set(snapshot[index].id, gap.reason);
+	}
+	const scopeStart = base ? positionStartIndex(snapshot, base.data.requestHistoryPosition) : 0;
+	const omitted = new Set<string>();
+	for (const entry of snapshot.slice(scopeStart)) {
+		if (supplied?.has(entry.id)) continue;
+		gaps.set(entry.id, supplied ? "omitted" : "unknown");
+		if (supplied) omitted.add(entry.id);
+	}
+	const full = new Set<string>();
+	const partialEntries: InputCoverage["partialEntries"] = [];
+	for (const [entryId, providedChars] of supplied ?? []) {
+		const index = positions.get(entryId);
+		if (index === undefined) throw validationError("supplied coverage entry is outside the request snapshot");
+		const totalChars = renderEntry(snapshot[index]).length;
+		if (providedChars === totalChars) {
+			full.add(entryId);
+			gaps.delete(entryId);
+		} else {
+			partialEntries.push({ entryId, providedChars, totalChars });
+			if (index >= scopeStart || gaps.has(entryId)) gaps.set(entryId, "partial");
+		}
+	}
+	const outstandingGaps = (["omitted", "partial", "unknown"] as const).flatMap((reason) => coverageRanges(snapshot, new Set([...gaps].filter(([, value]) => value === reason).map(([id]) => id))).map((range) => ({ ...range, reason })));
+	outstandingGaps.sort((a, b) => positions.get(a.fromEntryId)! - positions.get(b.fromEntryId)!);
+	return {
+		source: supplied ? "ledger-refresh" : "agent-context",
+		representation: "rendered-text-with-image-references",
+		baseCheckpointEntryId: base?.entryId ?? null,
+		snapshotThrough: position.entryId,
+		fullRanges: coverageRanges(snapshot, full), partialEntries,
+		omittedRanges: coverageRanges(snapshot, omitted), outstandingGaps,
+	};
+}
+
+function coverageSummary(coverage?: InputCoverage) {
+	const count = (reason: InputCoverage["outstandingGaps"][number]["reason"]) => coverage?.outstandingGaps.filter((gap) => gap.reason === reason).reduce((sum, range) => sum + range.entryCount, 0) ?? null;
+	return {
+		representation: "rendered-text-with-image-references",
+		status: !coverage || coverage.source === "agent-context" || coverage.outstandingGaps.some((gap) => gap.reason === "unknown") ? "unknown" : coverage.outstandingGaps.length ? "partial" : "complete",
+		outstandingEntries: coverage?.outstandingGaps.reduce((sum, range) => sum + range.entryCount, 0) ?? null,
+		gapRanges: coverage?.outstandingGaps.length ?? null,
+		omittedEntries: count("omitted"), partialEntries: count("partial"), unknownEntries: count("unknown"),
+	};
+}
+
+function parseInputCoverage(value: unknown): InputCoverage | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const data = value as InputCoverage;
+	const id = (value: unknown) => typeof value === "string" && value.length > 0 && value.length <= MAX_HISTORY_IDENTIFIER_LENGTH;
+	const range = (value: CoverageRange) => value && id(value.fromEntryId) && id(value.toEntryId) && Number.isSafeInteger(value.entryCount) && value.entryCount > 0;
+	if ((data.source !== "ledger-refresh" && data.source !== "agent-context") || data.representation !== "rendered-text-with-image-references" ||
+		(data.baseCheckpointEntryId !== null && !id(data.baseCheckpointEntryId)) || (data.snapshotThrough !== null && !id(data.snapshotThrough)) ||
+		!Array.isArray(data.fullRanges) || !data.fullRanges.every(range) || !Array.isArray(data.omittedRanges) || !data.omittedRanges.every(range) ||
+		!Array.isArray(data.partialEntries) || !data.partialEntries.every((part) => part && id(part.entryId) && Number.isSafeInteger(part.providedChars) && Number.isSafeInteger(part.totalChars) && part.providedChars >= 0 && part.totalChars > part.providedChars) ||
+		!Array.isArray(data.outstandingGaps) || !data.outstandingGaps.every((gap) => range(gap) && ["omitted", "partial", "unknown"].includes(gap.reason))) return undefined;
+	return data;
+}
+
 function parseCheckpointData(value: unknown): CheckpointData | undefined {
 	if (!value || typeof value !== "object") return undefined;
 	const input = value as Record<string, unknown>;
@@ -2715,12 +2861,15 @@ function parseCheckpointData(value: unknown): CheckpointData | undefined {
 	if (typeof input.sourceWindowId !== "string" || input.sourceWindowId.length === 0) return undefined;
 	const requestHistoryPosition = parseRequestPosition(input.requestHistoryPosition);
 	if (!requestHistoryPosition) return undefined;
+	const inputCoverage = parseInputCoverage(input.inputCoverage);
+	if (!inputCoverage || inputCoverage.snapshotThrough !== requestHistoryPosition.entryId) return undefined;
 	return {
 		schemaVersion: LEDGER_SCHEMA_VERSION,
 		ledger: input.ledger,
 		activeRequestEntryIds: [...input.activeRequestEntryIds],
 		requestHistoryPosition,
 		sourceWindowId: input.sourceWindowId,
+		inputCoverage,
 	};
 }
 
@@ -3003,7 +3152,8 @@ function taskSectionText(active: string, latest: string, focus?: string): string
 	return sections.join("\n\n");
 }
 
-function renderTaskEntryReferences(entries: SessionEntry[], tokenLimit: number): string {
+function renderTaskEntryReferences(entries: SessionEntry[], tokenLimit: number, supplied?: Map<string, number>): string {
+	supplied?.clear();
 	if (entries.length === 0) return "(none recorded)";
 	const selected: string[] = [];
 	for (const entry of entries) {
@@ -3011,11 +3161,12 @@ function renderTaskEntryReferences(entries: SessionEntry[], tokenLimit: number):
 		const fullCandidate = [...selected, full].join("\n\n");
 		if (ledgerTokenEstimate(fullCandidate) <= tokenLimit) {
 			selected.push(full);
+			supplied?.set(entry.id, full.length);
 			continue;
 		}
 		const reference = renderTailReference(entry);
 		const referenceCandidate = [...selected, reference].join("\n\n");
-		if (ledgerTokenEstimate(referenceCandidate) <= tokenLimit) selected.push(reference);
+		if (ledgerTokenEstimate(referenceCandidate) <= tokenLimit) { selected.push(reference); supplied?.set(entry.id, 0); }
 	}
 	return selected.length > 0 ? selected.join("\n\n") : "(none recorded)";
 }
@@ -3025,8 +3176,9 @@ function fitTaskText(
 	entryId: string | undefined,
 	compose: (candidate: string) => string,
 	tokenLimit: number,
+	record?: (providedChars: number) => void,
 ): string {
-	if (ledgerTokenEstimate(compose(value)) <= tokenLimit) return value;
+	if (ledgerTokenEstimate(compose(value)) <= tokenLimit) { record?.(value.length); return value; }
 	const marker = entryId
 		? `[truncated; complete entry: ${historyEntryReference(entryId)}]`
 		: "[truncated; complete text remains in the session log]";
@@ -3037,16 +3189,19 @@ function fitTaskText(
 	let low = 0;
 	let high = value.length;
 	let best = markerCandidate;
+	let providedChars = 0;
 	while (low <= high) {
 		const middle = Math.floor((low + high) / 2);
 		const candidate = `${value.slice(0, middle)}${markerCandidate}`;
 		if (ledgerTokenEstimate(compose(candidate)) <= tokenLimit) {
 			best = candidate;
+			providedChars = middle;
 			low = middle + 1;
 		} else {
 			high = middle - 1;
 		}
 	}
+	record?.(providedChars);
 	return best;
 }
 
@@ -3076,6 +3231,7 @@ function renderTaskSection(
 	activeRequestEntryIds: string[],
 	customInstructions: string | undefined,
 	taskTokenLimit: number,
+	supplied?: Map<string, number>,
 ): string {
 	const taskBudget = Math.max(1, taskTokenLimit - 4);
 	const activeEntries = activeRequestEntryIds
@@ -3083,8 +3239,10 @@ function renderTaskSection(
 		.filter((entry): entry is SessionEntry => entry !== undefined);
 	const latest = latestUserEntry(entries);
 	const activeWithoutLatest = activeEntries.filter((entry) => entry.id !== latest?.id);
-	const fullActive = renderTaskEntryReferences(activeWithoutLatest, taskBudget);
+	const activeSupplied = new Map<string, number>();
+	const fullActive = renderTaskEntryReferences(activeWithoutLatest, taskBudget, activeSupplied);
 	const fullLatest = latest ? renderEntry(latest) : "(none recorded)";
+	let latestChars = fullLatest.length;
 	const fullFocus = customInstructions?.trim() ? customInstructions.trim() : "";
 	const compose = (active: string, latestText: string, focus?: string): string => taskSectionText(active, latestText, focus);
 	let active = fullActive;
@@ -3093,11 +3251,11 @@ function renderTaskSection(
 	let output = compose(active, latestText, focus);
 	if (ledgerTokenEstimate(output) > taskBudget) {
 		let activeBudget = Math.max(1, Math.floor(taskBudget / 2));
-		active = renderTaskEntryReferences(activeWithoutLatest, activeBudget);
+		active = renderTaskEntryReferences(activeWithoutLatest, activeBudget, activeSupplied);
 		output = compose(active, latestText, focus);
 		while (ledgerTokenEstimate(output) > taskBudget && activeBudget > 1) {
 			activeBudget = Math.max(1, Math.floor(activeBudget / 2));
-			active = renderTaskEntryReferences(activeWithoutLatest, activeBudget);
+			active = renderTaskEntryReferences(activeWithoutLatest, activeBudget, activeSupplied);
 			output = compose(active, latestText, focus);
 		}
 		if (ledgerTokenEstimate(output) > taskBudget) {
@@ -3111,7 +3269,7 @@ function renderTaskSection(
 						continue;
 					}
 					try {
-						latestText = fitTaskText(fullLatest, latest?.id, (candidate) => compose(active, candidate, focus), taskBudget);
+						latestText = fitTaskText(fullLatest, latest?.id, (candidate) => compose(active, candidate, focus), taskBudget, (count) => { latestChars = count; });
 						output = compose(active, latestText, focus);
 						if (ledgerTokenEstimate(output) <= taskBudget) break;
 					} catch {
@@ -3120,7 +3278,7 @@ function renderTaskSection(
 					focusBudget = Math.max(1, Math.floor(focusBudget / 2));
 				}
 			} else {
-				latestText = fitTaskText(fullLatest, latest?.id, (candidate) => compose(active, candidate), taskBudget);
+				latestText = fitTaskText(fullLatest, latest?.id, (candidate) => compose(active, candidate), taskBudget, (count) => { latestChars = count; });
 				output = compose(active, latestText);
 			}
 		}
@@ -3128,6 +3286,8 @@ function renderTaskSection(
 	if (ledgerTokenEstimate(output) > taskBudget) {
 		throw new Error("task recovery content exceeds the configured task budget");
 	}
+	for (const [id, count] of activeSupplied) supplied?.set(id, count);
+	if (latest) supplied?.set(latest.id, latestChars);
 	return output;
 }
 
@@ -3163,6 +3323,7 @@ function renderBootstrap(
 		`requestHistoryPosition: entry=${details.requestHistoryPosition?.entryId ?? "(empty)"} depth=${details.requestHistoryPosition?.branchDepth ?? 0}`,
 		`lastUserEntryId: ${lastUserEntryId ?? "(none)"} lastAssistantEntryId: ${lastAssistantEntryId ?? "(none)"}`,
 		`pendingHistoryRange: ${details.pendingHistoryRange.fromEntryId ?? "(none)"}..${details.pendingHistoryRange.toEntryId ?? "(none)"}`,
+		`inputCoverage: ${safeJson(coverageSummary(state.checkpoint?.data.inputCoverage))}; details: ${activeCheckpointEntryId ? historyEntryReference(activeCheckpointEntryId) : "unavailable"}`,
 		`sourceWindowId: ${details.sourceWindowId}`,
 		`sourceBranchTip: ${details.sourceBranchTip ?? "(empty)"}`,
 		`firstKeptEntryId: ${details.firstKeptEntryId}`,
@@ -3182,6 +3343,7 @@ function renderBootstrap(
 			? "Ledger refresh failed for this compaction. Restored the previous checkpoint, which may be stale. Verify subsequent work through pendingHistoryRange and history_read before continuing."
 			: "Ledger refresh failed for this compaction and no usable checkpoint is available. Recover the task and execution state from the retained entries and complete session history before acting."] : []),
 		"Verify execution facts and distinguish planned, executed, and verified work before repeating side effects.",
+		"Input coverage measures supplied rendered text, with image references only; understanding and verification require evidence. Saved checkpoints retain older coverage gaps. Read the checkpoint for its manifest and gap recovery calls when relevant to the next action.",
 		"Read known entry IDs with history_read first; use history_search only to find unknown IDs, then continue with nextOffset.",
 		"requestHistoryPosition marks the checkpoint model request start; pendingHistoryRange lists later events, not proof of understanding or verification.",
 		"</recovery-guidance>",
@@ -3329,6 +3491,7 @@ function validateCheckpoint(
 	params: CheckpointParameters,
 	state: SessionState,
 	entries: SessionEntry[],
+	inputCoverage?: InputCoverage,
 ): { data: CheckpointData; estimatedLedgerTokens: number; ledgerBytes: number; ledgerTokenLimit: number } {
 	if (!params || typeof params.ledger !== "string" || params.ledger.trim().length === 0) {
 		throw validationError("ledger must be a non-empty string");
@@ -3370,6 +3533,7 @@ function validateCheckpoint(
 			activeRequestEntryIds: ids,
 			requestHistoryPosition,
 			sourceWindowId: state.activeWindowId,
+			inputCoverage: inputCoverage ?? buildInputCoverage(entries, requestHistoryPosition, state.checkpoint),
 		},
 		estimatedLedgerTokens,
 		ledgerBytes,
@@ -3385,7 +3549,8 @@ function matchesCheckpointEntry(entry: SessionEntry, data: CheckpointData): bool
 		parsed.ledger === data.ledger &&
 		parsed.sourceWindowId === data.sourceWindowId &&
 		JSON.stringify(parsed.activeRequestEntryIds) === JSON.stringify(data.activeRequestEntryIds) &&
-		sameRequestPosition(parsed.requestHistoryPosition, data.requestHistoryPosition)
+		sameRequestPosition(parsed.requestHistoryPosition, data.requestHistoryPosition) &&
+		JSON.stringify(parsed.inputCoverage) === JSON.stringify(data.inputCoverage)
 	);
 }
 
@@ -3467,8 +3632,9 @@ async function generateCompactionCheckpoint(
 		].join("\n");
 		const inputBudget = model.contextWindow - maxTokens - ledgerTokenEstimate(systemPrompt) - modelMetadataTokens(ctx) - 64;
 		if (inputBudget < 1) return undefined;
-		const task = renderTaskSection(entries, state.inferredActiveRequestEntryIds, customInstructions, Math.min(budgets.taskTokens, Math.max(1, Math.floor(inputBudget / 4))));
-		const previousLedger = state.checkpoint ? `Previous ledger (may be stale):\n${state.checkpoint.data.ledger}` : "Previous ledger: none available.";
+		const supplied = new Map<string, number>();
+		const task = renderTaskSection(entries, state.inferredActiveRequestEntryIds, customInstructions, Math.min(budgets.taskTokens, Math.max(1, Math.floor(inputBudget / 4))), supplied);
+		const previousLedger = state.checkpoint ? `Previous ledger (may be stale; inherited input coverage: ${safeJson(coverageSummary(state.checkpoint.data.inputCoverage))}):\n${state.checkpoint.data.ledger}` : "Previous ledger: none available.";
 		const selected: string[] = [];
 		let used = ledgerTokenEstimate(task) + ledgerTokenEstimate(previousLedger) + 32;
 		const startIndex = state.checkpoint ? positionStartIndex(entries, state.checkpoint.data.requestHistoryPosition) : 0;
@@ -3476,13 +3642,16 @@ async function generateCompactionCheckpoint(
 			const remaining = inputBudget - used;
 			if (remaining < 64) break;
 			const entry = entries[index];
-			const text = clippedText(renderEntry(entry), Math.min(budgets.tailTokens, remaining - 16) * 3, entry.id);
+			let providedChars = 0;
+			const text = clippedText(renderEntry(entry), Math.min(budgets.tailTokens, remaining - 16) * 3, entry.id, (count) => { providedChars = count; });
 			const cost = ledgerTokenEstimate(text) + 2;
 			if (cost > remaining) break;
 			selected.unshift(text);
+			supplied.set(entry.id, Math.max(supplied.get(entry.id) ?? 0, providedChars));
 			used += cost;
 		}
 		const content = [task, previousLedger, "Bounded history since the checkpoint request (oldest to newest; omissions may exist):", ...selected].join("\n\n");
+		const inputCoverage = buildInputCoverage(entries, position, state.checkpoint, supplied);
 		if (ledgerTokenEstimate(content) > inputBudget) return undefined;
 		signal.throwIfAborted();
 		const aborted = new Promise<never>((_resolve, reject) => {
@@ -3515,7 +3684,7 @@ async function generateCompactionCheckpoint(
 				const ledger = result.content.filter((block) => block.type === "text").map((block) => block.text).join("\n").trim();
 				const capacityError = ledgerCapacityError(ledger, maxTokens);
 				if (capacityError) throw new Error(capacityError);
-				return validateCheckpoint({ ledger }, { ...state, requestHistoryPosition: position }, entries).data;
+				return validateCheckpoint({ ledger }, { ...state, requestHistoryPosition: position }, entries, inputCoverage).data;
 			} catch {
 				// Invalid output shares the same attempt budget as provider failures.
 			}
@@ -3765,7 +3934,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		description: "Save the complete active working ledger for recovery at the next native context compaction.",
 		promptSnippet: "save working state for context recovery",
 		promptGuidelines: [
-			"After important decisions or user corrections, save concise goal/status, constraints/decisions, completed and verified results/evidence, next step/wait, minimal artifact/recovery entry references, and suggested skills (or none); separate plans from facts, label pending checks, and redact secrets.",
+			"After important decisions or user corrections, save concise goal/status, constraints/decisions, verified results/evidence, next step/wait, artifact/recovery references, and suggested skills (or none). Separate plans from facts and redact secrets. Saving preserves prior input-coverage gaps; agent-context coverage is unknown. Inspect relevant gaps through history_read before relying on the ledger. A save continues this window; pi controls compaction.",
 		],
 		parameters: checkpointParameters,
 		executionMode: "sequential",
@@ -3803,7 +3972,8 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 							`scope: ${scopeText}`,
 							`history position: ${validated.data.requestHistoryPosition.entryId ?? "empty branch"}`,
 							`ledger: ${validated.estimatedLedgerTokens} estimated tokens / ${validated.ledgerBytes} UTF-8 bytes`,
-							"handoff: saved; waiting for pi's native compaction threshold.",
+						"handoff: saved; waiting for pi's native compaction threshold.",
+						`inputCoverage: ${safeJson(coverageSummary(validated.data.inputCoverage))}; details: ${historyEntryReference(saved.entryId)}`,
 						].join("\n"),
 					},
 				],
@@ -3815,10 +3985,10 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 	pi.registerTool({
 		name: "history_read",
 		label: "History Read",
-		description: "Read current-branch evidence: entry text, one image, a tool exchange, or neighboring log entries. contentIndex identifies an original block. Text uses offset/length; related views use cursors.",
+		description: "Read current-branch evidence. entry (default): offset/length text paging, follow nextRead. image: entryId/contentIndex only. exchange/neighbors: limit/cursor/order paging. contentIndex is an original block index. Output obeys the history token budget.",
 		promptSnippet: "read a bounded current-branch history entry",
 		promptGuidelines: [
-			"Use view=image with contentIndex to load pixels. Projection text keeps text from mixed image entries; images returns references; all returns both. Exchange follows actual call/result links; neighbors is chronological context, not proof of causation. Continue with nextOffset or nextCursor.",
+			"For entry text use length, not limit; offset/length count UTF-16 units. Copy nextRead to continue the same projection/block. Image view accepts only entryId/view/contentIndex. Exchange follows call/result links; neighbors uses before/after log-entry counts (default 2, max 20). Related views keep the same anchor/range/order with nextCursor; limit/projection may change. Projection images returns references; view=image loads pixels. pageEnd explains complete, requested length/limit, or output_budget.",
 		],
 		parameters: historyReadParameters,
 		executionMode: "sequential",
@@ -3840,7 +4010,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		description: "Search selected history parts by literal substring; ignores case by default. Shared filter supports kinds, exclusions, tools, statuses, window IDs, exclusive entry ranges, and image presence. Returns one item per source entry.",
 		promptSnippet: "search current-branch history with a literal query",
 		promptGuidelines: [
-			"Filter fields combine with AND, values within an array with OR; exclusions win. Maintenance tool traffic is excluded unless includeMaintenance=true. Projection controls returned content independently of matching; image content is searched only as metadata. Read single-block matches with contentIndex and offset; use entryId for spansBlocks or matches without a block index. Continue with nextCursor.",
+			"Filter fields combine with AND, arrays with OR; exclusions win. Maintenance tool traffic is excluded unless includeMaintenance=true. Projection controls output independently of matching; images are searched as metadata. Read single-block matches with contentIndex/offset/length; read entryId for spansBlocks. Continue with nextCursor and the same query/filter/order/caseSensitive; limit/maxChars/projection may change. limit and maxChars are ceilings; pageEnd reports complete, limit or output_budget.",
 		],
 		parameters: historySearchParameters,
 		executionMode: "sequential",
@@ -3861,7 +4031,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		label: "History List Items",
 		description: "Browse one item per source entry using the same filter and projection as history_search. Supports newest/oldest order, image-only entries, bounded previews, and snapshot cursors.",
 		promptSnippet: "browse history and checkpoint versions",
-		promptGuidelines: ["Use kinds=[checkpoint] to browse ledger versions, kinds=[user_input] for requests, toolNames for exact tools, and statuses for outcomes. hasImage selects entire entries; projection=text keeps their text while omitting image references. Checkpoint active is snapshot-relative; fitsCurrentLedgerBudget checks schema/ledger capacity, with full recovery checked at compaction."],
+		promptGuidelines: ["Use filter.kinds=[checkpoint] for ledger versions, [user_input] for requests; toolNames matches exact names. Filters use AND, arrays OR, exclusions win. Maintenance traffic defaults off. hasImage selects entire entries; projection=text keeps text. Continue with nextCursor and the same filter/order; limit/maxChars/projection may change. pageEnd reports complete, limit or output_budget. Checkpoint coverage counts outstanding input gaps; read the checkpoint for its manifest and gap recovery calls. active is snapshot-relative; fitsCurrentLedgerBudget checks schema/ledger capacity, with full recovery checked at compaction."],
 		parameters: historyListItemsParameters,
 		executionMode: "sequential",
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
@@ -3874,7 +4044,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		label: "History List Windows",
 		description: "Browse initial and committed windows, including empty ones. Returns attributed entry counts, filter-matched counts/kinds, failed results, images, latest user wording and checkpoint previews. Supports shared filters, order and snapshot cursors.",
 		promptSnippet: "browse context windows",
-		promptGuidelines: ["Use returned IDs in filter.windowIds to zoom into a window. matchedEntryCount uses the same filter as item listing; tool_call kindCounts counts invocations, other kinds count entries. Raw entry counts retain native attribution; checkpoints use sourceWindowId. Previews quote original user or ledger text."],
+		promptGuidelines: ["Use returned IDs in filter.windowIds to zoom in. Filter fields use AND, arrays OR, exclusions win; maintenance traffic defaults off. matchedEntryCount uses the item filter; tool_call counts invocations, other kinds count entries. Raw counts retain native attribution; checkpoints use sourceWindowId. Continue with nextCursor and the same filter/order; limit may change. pageEnd reports complete, limit or output_budget. Previews are bounded excerpts."],
 		parameters: historyListWindowsParameters,
 		executionMode: "sequential",
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
