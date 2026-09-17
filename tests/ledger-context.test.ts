@@ -32,7 +32,7 @@ const TEST_TIMEOUT_MS = 5_000;
 const extensionErrors: ExtensionError[] = [];
 const RED_2X2_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEUlEQVR4nGP4z8DwH4QZYAwAR8oH+WdZbrcAAAAASUVORK5CYII=";
 const BLUE_3X2_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAYAAACddGYaAAAAEElEQVR4nGNgYPj/H4GROACPigv118uacgAAAABJRU5ErkJggg==";
-const EMPTY_INPUT_COVERAGE = { source: "agent-context", representation: "rendered-text-with-image-references", baseCheckpointEntryId: null, snapshotThrough: null, fullRanges: [], partialEntries: [], omittedRanges: [], outstandingGaps: [] };
+const UNMEASURED_INPUT_RECORD = { measurement: "unmeasured", source: "agent-context", snapshotThrough: null };
 
 function use4kRecoveryBudgets(t: TestContext): void {
 	for (const name of ["LEDGER_CONTEXT_TASK_TOKENS", "LEDGER_CONTEXT_TAIL_TOKENS"]) {
@@ -766,7 +766,7 @@ test("checkpoint and manual compaction use the public SDK seam", { timeout: TEST
 		const compaction = branch.filter((entry) => entry.type === "compaction").at(-1);
 		assert.ok(compaction);
 		assert.ok(branch.some((entry) => entry.id === compaction.firstKeptEntryId));
-		assert.equal((compaction.details as { schemaVersion: number; kind: string }).schemaVersion, 2);
+		assert.equal((compaction.details as { schemaVersion: number; kind: string }).schemaVersion, 3);
 		assert.equal((compaction.details as { schemaVersion: number; kind: string }).kind, "ledger-context");
 		const provenance = compaction.details as {
 			checkpointEntryId: string | null;
@@ -1528,7 +1528,7 @@ test("malformed persisted reminder details do not suppress a valid level", { tim
 		await session.prompt("deliver the soft reminder");
 		const windowId = `window:${sessionManager.getSessionId()}:initial`;
 		sessionManager.appendCustomMessageEntry(REMINDER_MESSAGE_TYPE, "malformed reminder", false, {
-			schemaVersion: 2,
+			schemaVersion: 3,
 			reminderKey: `${windowId}:urgent`,
 			level: "urgent",
 			windowId,
@@ -2379,7 +2379,7 @@ test("steering queued during native compaction is delivered once in order", { ti
 			(entry): entry is Extract<SessionEntry, { type: "compaction" }> => entry.type === "compaction",
 		);
 		assert.ok(compactions.length >= 1);
-		assert.ok(compactions.every((entry) => entry.fromHook === true && (entry.details as { schemaVersion?: number; kind?: string }).schemaVersion === 2));
+		assert.ok(compactions.every((entry) => entry.fromHook === true && (entry.details as { schemaVersion?: number; kind?: string }).schemaVersion === 3));
 		assert.equal(new Set(compactions.map((entry) => (entry.details as { windowId: string }).windowId)).size, compactions.length);
 		assert.ok(reminderContext);
 		assert.ok(steeringContext);
@@ -4644,7 +4644,7 @@ test("global recovery pressure drops optional retained units before the latest r
 			retainedIds[0],
 			8_000,
 			{
-				schemaVersion: 2,
+				schemaVersion: 3,
 				kind: "ledger-context",
 				windowId,
 				sourceWindowId: `window:${sessionManager.getSessionId()}:initial`,
@@ -5056,7 +5056,7 @@ test("oversized retained units use a durable non-context tail marker", { timeout
 		if (marker.type !== "custom") throw new Error("missing tail marker");
 		assert.equal(preparations.length, 1);
 		assert.deepEqual(marker.data, {
-			schemaVersion: 2,
+			schemaVersion: 3,
 			sourceEntryId: preparations[0],
 			reason: "tail-budget",
 		});
@@ -5478,7 +5478,7 @@ test("history navigation discovers checkpoint versions independently of recovery
 	const fixture = await createFixture(false, [], 70, { compactionEnabled: false, extraToolNames: ["history_list_items"] });
 	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
 	const { sessionManager } = fixture;
-	const data = { schemaVersion: 2, activeRequestEntryIds: [], sourceWindowId: "metadata-only-key", requestHistoryPosition: { entryId: null, branchDepth: 0 }, inputCoverage: EMPTY_INPUT_COVERAGE };
+	const data = { schemaVersion: 3, activeRequestEntryIds: [], sourceWindowId: "metadata-only-key", requestHistoryPosition: { entryId: null, branchDepth: 0 }, inputCoverage: UNMEASURED_INPUT_RECORD };
 	const first = sessionManager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, { ...data, ledger: "historic constraint" });
 	const second = sessionManager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, { ...data, ledger: `historic oversized ${"x".repeat(2_000)}` });
 	const listed = await navigationCall(fixture, "history_list_items", { limit: 1, filter: { kinds: ["checkpoint"] } });
@@ -5544,7 +5544,7 @@ test("history navigation freezes windows and item pages across later compaction"
 	const { sessionManager } = fixture;
 	const initial = `window:${sessionManager.getSessionId()}:initial`;
 	const seed = sessionManager.appendMessage({ role: "user", content: "window seed", timestamp: Date.now() });
-	const details = (windowId: string, sourceWindowId: string) => ({ schemaVersion: 2, kind: "ledger-context", windowId, sourceWindowId, checkpointEntryId: null, sourceBranchTip: seed, firstKeptEntryId: seed, requestHistoryPosition: null, pendingHistoryRange: { fromEntryId: seed, toEntryId: seed } });
+	const details = (windowId: string, sourceWindowId: string) => ({ schemaVersion: 3, kind: "ledger-context", windowId, sourceWindowId, checkpointEntryId: null, sourceBranchTip: seed, firstKeptEntryId: seed, requestHistoryPosition: null, pendingHistoryRange: { fromEntryId: seed, toEntryId: seed } });
 	sessionManager.appendCompaction("first window", seed, 100, details("window:first", initial), true);
 	const before = await navigationCall(fixture, "history_list_windows", { limit: 1 });
 	const page = (before.message as { details: { windows: Array<Record<string, any>>; nextCursor: string } }).details;
@@ -5661,9 +5661,9 @@ test("history window listing shrinks optional previews before rejecting mandator
 	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
 	const initial = `window:${fixture.sessionManager.getSessionId()}:initial`;
 	const checkpointId = fixture.sessionManager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, {
-		schemaVersion: 2, activeRequestEntryIds: [], sourceWindowId: initial,
+		schemaVersion: 3, activeRequestEntryIds: [], sourceWindowId: initial,
 		requestHistoryPosition: { entryId: null, branchDepth: 0 }, ledger: "A".repeat(256),
-		inputCoverage: EMPTY_INPUT_COVERAGE,
+		inputCoverage: UNMEASURED_INPUT_RECORD,
 	});
 	const tool = fixture.session.getToolDefinition("history_list_windows");
 	assert.ok(tool);
@@ -5704,7 +5704,7 @@ test("history window active flags match restored state after non-ledger compacti
 	const initial = `window:${sessionManager.getSessionId()}:initial`;
 	const seed = sessionManager.appendMessage({ role: "user", content: "window source", timestamp: Date.now() });
 	sessionManager.appendCompaction("ledger summary", seed, 100, {
-		schemaVersion: 2, kind: "ledger-context", windowId: "window:tracked", sourceWindowId: initial,
+		schemaVersion: 3, kind: "ledger-context", windowId: "window:tracked", sourceWindowId: initial,
 		checkpointEntryId: null, sourceBranchTip: seed, firstKeptEntryId: seed,
 		requestHistoryPosition: null, pendingHistoryRange: { fromEntryId: seed, toEntryId: seed },
 	}, true);
@@ -5914,7 +5914,7 @@ test("history read explains view conflicts and supplies exact bounded continuati
 	assert.match(JSON.stringify(first.content), /nextRead/);
 });
 
-test("checkpoint coverage preserves omitted corrections across refresh, manual save, reload and branches", async (t) => {
+test("checkpoint input records remain immutable per request across refresh, manual save, reload and branches", async (t) => {
 	const previousTail = process.env.LEDGER_CONTEXT_TAIL_TOKENS;
 	const previousTask = process.env.LEDGER_CONTEXT_TASK_TOKENS;
 	process.env.LEDGER_CONTEXT_TAIL_TOKENS = "512";
@@ -5926,39 +5926,48 @@ test("checkpoint coverage preserves omitted corrections across refresh, manual s
 	faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Initial task. Skills: none." })), fauxAssistantMessage("saved")]);
 	await session.prompt("Original task anchor");
 	const base = checkpointEntries(manager.getBranch()).at(-1)!;
+	assert.deepEqual((base.data as any).inputCoverage, { measurement: "unmeasured", source: "agent-context", snapshotThrough: (base.data as any).requestHistoryPosition.entryId });
 	const correction = manager.appendMessage({ role: "user", content: "Important correction must remain discoverable " + "c".repeat(500), timestamp: Date.now() });
 	for (let i = 0; i < 100; i++) manager.appendMessage(fauxAssistantMessage(`large-${i}:` + "x".repeat(8000)));
 	const latest = manager.appendMessage({ role: "user", content: "Latest task anchor", timestamp: Date.now() });
 	ledgerFaux.setResponses([(context) => {
 		assert.doesNotMatch(JSON.stringify(context.messages), /Important correction/);
 		assert.match(JSON.stringify(context.messages), /Original task anchor/);
-		return fauxAssistantMessage("Bounded ledger. Follow coverage gaps for older evidence. Skills: none.");
+		return fauxAssistantMessage("Bounded ledger. Source references are available. Skills: none.");
 	}]);
 	await session.compact();
 	const first = checkpointEntries(manager.getBranch()).at(-1)!;
 	const coverage = (first.data as any).inputCoverage;
 	assert.equal(coverage.source, "ledger-refresh");
+	assert.equal(coverage.measurement, "measured");
 	assert.equal(coverage.baseCheckpointEntryId, base.id);
 	assert.equal(coverage.snapshotThrough, latest);
+	assert.deepEqual(coverage.historyScope, { afterEntryId: (base.data as any).requestHistoryPosition.entryId, throughEntryId: latest });
+	assert.equal(coverage.projections.find((item: any) => item.entryId === base.id).kind, "checkpoint_summary");
 	const contains = (entries: SessionEntry[], ranges: any[], id: string) => ranges.some(range => entries.findIndex(e => e.id === range.fromEntryId) <= entries.findIndex(e => e.id === id) && entries.findIndex(e => e.id === range.toEntryId) >= entries.findIndex(e => e.id === id));
 	assert.ok(contains(manager.getBranch(), coverage.omittedRanges, correction));
 	assert.ok(coverage.partialEntries.length > 0);
 	assert.ok(contains(manager.getBranch(), coverage.fullRanges, latest));
-	assert.match(latestCompaction(manager.getBranch()).summary, /inputCoverage:.*omittedEntries/);
+	assert.match(latestCompaction(manager.getBranch()).summary, /inputRecord:.*measured/);
+	assert.doesNotMatch(latestCompaction(manager.getBranch()).summary, /outstandingEntries|unknownEntries|gapRanges/);
+	const firstRecord = JSON.stringify(first.data);
 	manager.appendMessage({ role: "user", content: "Continue the next window", timestamp: Date.now() });
-	ledgerFaux.setResponses([fauxAssistantMessage("Second ledger retains coverage gaps. Skills: none.")]);
+	ledgerFaux.setResponses([fauxAssistantMessage("Second ledger uses its own input record. Skills: none.")]);
 	await session.compact();
 	const second = checkpointEntries(manager.getBranch()).at(-1)!;
-	assert.ok(contains(manager.getBranch(), (second.data as any).inputCoverage.outstandingGaps, correction));
+	assert.equal((second.data as any).inputCoverage.baseCheckpointEntryId, first.id);
+	assert.equal(contains(manager.getBranch(), (second.data as any).inputCoverage.omittedRanges, correction), false);
+	assert.equal(JSON.stringify(first.data), firstRecord);
 	await session.reload();
 	faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Agent saved ledger. Skills: none." })), fauxAssistantMessage("saved again")]);
 	await session.prompt("Save current progress");
 	const manual = checkpointEntries(manager.getBranch()).at(-1)!;
-	assert.equal((manual.data as any).inputCoverage.source, "agent-context");
-	assert.ok(contains(manager.getBranch(), (manual.data as any).inputCoverage.outstandingGaps, correction));
-	assert.ok((manual.data as any).inputCoverage.outstandingGaps.some((gap: any) => gap.reason === "unknown"));
-	const read = await inspectHistory(fixture, "history_read", { entryId: manual.id, length: 65536 });
-	assert.ok((read.details as any).coverage.outstandingEntries > 0);
+	assert.deepEqual((manual.data as any).inputCoverage, { measurement: "unmeasured", source: "agent-context", snapshotThrough: (manual.data as any).requestHistoryPosition.entryId });
+	const listed = await inspectHistory(fixture, "history_list_items", { filter: { kinds: ["checkpoint"] }, limit: 1 });
+	assert.equal((listed.details as any).items[0].previousCheckpointEntryId, second.id);
+	assert.deepEqual((listed.details as any).items[0].inputRecord, { measurement: "unmeasured", source: "agent-context" });
+	const read = await inspectHistory(fixture, "history_read", { entryId: first.id, length: 65536 });
+	assert.equal((read.details as any).inputRecord.measurement, "measured");
 	let page = read;
 	let manifestText = "";
 	for (let pageCount = 0; ; pageCount++) {
@@ -5967,8 +5976,8 @@ test("checkpoint coverage preserves omitted corrections across refresh, manual s
 		if (!(page.details as any).nextRead) break;
 		page = await inspectHistory(fixture, "history_read", (page.details as any).nextRead);
 	}
-	const recoveryCalls = JSON.parse(manifestText.split("Coverage recovery calls (inclusive stored ranges, exclusive query bounds):\n")[1]);
-	const recovery = recoveryCalls.find((gap: any) => contains(manager.getBranch(), [gap], correction));
+	const recoveryCalls = JSON.parse(manifestText.split("Input record browse calls (inclusive recorded ranges, exclusive query bounds):\n")[1]);
+	const recovery = recoveryCalls.find((item: any) => item.inputForm === "omitted" && contains(manager.getBranch(), [item], correction));
 	const recoveredIds: string[] = [];
 	let cursor: string | undefined;
 	do {
@@ -5986,15 +5995,16 @@ test("checkpoint coverage preserves omitted corrections across refresh, manual s
 	}]);
 	await session.compact();
 	const repaired = (checkpointEntries(manager.getBranch()).at(-1)!.data as any).inputCoverage;
-	assert.equal(contains(manager.getBranch(), repaired.outstandingGaps, correction), false);
 	assert.ok(contains(manager.getBranch(), repaired.fullRanges, correction));
+	assert.equal("outstandingGaps" in repaired, false);
+	assert.equal(JSON.stringify(first.data), firstRecord, "later input and browsing must not rewrite prior omission records");
 	process.env.LEDGER_CONTEXT_TASK_TOKENS = "128";
 	manager.appendMessage({ role: "user", content: "Continue briefly", timestamp: Date.now() });
 	ledgerFaux.setResponses([fauxAssistantMessage("Carry previously supplied correction. Skills: none.")]);
 	await session.compact();
 	const carried = (checkpointEntries(manager.getBranch()).at(-1)!.data as any).inputCoverage;
-	assert.equal(carried.partialEntries.find((part: any) => part.entryId === correction).providedChars, 0);
-	assert.equal(contains(manager.getBranch(), carried.outstandingGaps, correction), false, "a partial repeat must not reopen an already supplied text entry");
+	assert.equal(carried.projections.find((part: any) => part.entryId === correction).kind, "reference");
+	assert.equal("outstandingGaps" in carried, false);
 	const savedCoverage = JSON.stringify(carried);
 	manager.appendMessage({ role: "user", content: "Refresh will fail", timestamp: Date.now() });
 	ledgerFaux.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "invalid api key" })]);
@@ -6033,7 +6043,10 @@ test("coverage records task references, exact text prefixes and image representa
 	await session.compact();
 	const coverage = (checkpointEntries(manager.getBranch()).at(-1)!.data as any).inputCoverage;
 	assert.equal(coverage.representation, "rendered-text-with-image-references");
-	assert.equal(coverage.partialEntries.find((part: any) => part.entryId === anchor).providedChars, 0);
+	const reference = coverage.projections.find((part: any) => part.entryId === anchor);
+	assert.equal(reference.kind, "reference");
+	assert.equal(reference.providedChars, reference.totalChars);
+	assert.ok(reference.providedChars > 0);
 	const part = coverage.partialEntries.find((part: any) => part.entryId === long);
 	const rendered = `[entry ${long}] user\n${longText}`;
 	assert.equal(part.totalChars, rendered.length);
@@ -6064,7 +6077,7 @@ test("ledger refresh projects checkpoint bodies while explicit reads retain comp
 	const original = JSON.stringify(first.data);
 	assert.ok((first.data as any).inputCoverage.partialEntries.length >= 100);
 	assert.ok(original.length > 8000);
-	const invalid = manager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, { schemaVersion: 2, inputCoverage: { payload: "invalid-manifest-sentinel".repeat(500) } });
+	const invalid = manager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, { schemaVersion: 3, inputCoverage: { payload: "invalid-manifest-sentinel".repeat(500) } });
 	process.env.LEDGER_CONTEXT_TAIL_TOKENS = "4096";
 	manager.appendMessage({ role: "user", content: "Keep fresh-work-sentinel in the next ledger", timestamp: Date.now() });
 	manager.appendMessage(fauxAssistantMessage("Additional recent evidence. ".repeat(30)));
@@ -6075,10 +6088,15 @@ test("ledger refresh projects checkpoint bodies while explicit reads retain comp
 	assert.match(input, /fresh-work-sentinel/);
 	assert.ok(input.includes(`pi://entry/${first.id}`));
 	assert.ok(input.includes(`pi://entry/${invalid}`));
-	assert.doesNotMatch(input, /"fullRanges":\[|"partialEntries":\[|"outstandingGaps":\[|invalid-manifest-sentinel/);
+	assert.doesNotMatch(input, /"fullRanges":\[|"partialEntries":\[|"projections":\[|invalid-manifest-sentinel/);
 	assert.ok(input.length < original.length, "the refresh must not pay for the full manifest");
 	const coverage = (checkpointEntries(manager.getBranch()).at(-1)!.data as any).inputCoverage;
-	for (const id of [first.id, invalid]) assert.equal(coverage.partialEntries.find((part: any) => part.entryId === id).providedChars, 0);
+	for (const id of [first.id, invalid]) {
+		const projection = coverage.projections.find((part: any) => part.entryId === id);
+		assert.equal(projection.kind, "checkpoint_summary");
+		assert.ok(projection.providedChars > 0 && projection.providedChars <= projection.totalChars);
+		assert.equal(coverage.partialEntries.some((part: any) => part.entryId === id), false);
+	}
 	assert.equal(JSON.stringify(first.data), original);
 	let params: Record<string, unknown> | null = { entryId: first.id, length: 65536 };
 	let recovered = "";
@@ -6089,4 +6107,24 @@ test("ledger refresh projects checkpoint bodies while explicit reads retain comp
 		params = (result.details as any).nextRead;
 	}
 	assert.ok(recovered.includes(original));
+});
+
+test("unmeasured input records expose no invented coverage and reject mixed formats", async (t) => {
+	const fixture = await createFixture(false, [], 64, { compactionEnabled: false });
+	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+	const data = { schemaVersion: 3, ledger: "Saved by the agent.", activeRequestEntryIds: [], sourceWindowId: "initial", requestHistoryPosition: { entryId: null, branchDepth: 0 }, inputCoverage: UNMEASURED_INPUT_RECORD };
+	for (const invalid of [
+		{ ...data, inputCoverage: { ...UNMEASURED_INPUT_RECORD, omittedRanges: [] } },
+		{ ...data, inputCoverage: { ...UNMEASURED_INPUT_RECORD, baseCheckpointEntryId: "invented-basis" } },
+		{ ...data, schemaVersion: 2 },
+	]) {
+		const entryId = fixture.sessionManager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, invalid);
+		const read = await inspectHistory(fixture, "history_read", { entryId, projection: "references" });
+		assert.equal((read.details as any).fitsCurrentLedgerBudget, false);
+		assert.deepEqual((read.details as any).inputRecord, { measurement: "unavailable" });
+	}
+	const entryId = fixture.sessionManager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, data);
+	const read = await inspectHistory(fixture, "history_read", { entryId });
+	assert.deepEqual((read.details as any).inputRecord, { measurement: "unmeasured", source: "agent-context" });
+	assert.doesNotMatch((read.details as any).text, /omittedRanges|Input record browse calls/);
 });

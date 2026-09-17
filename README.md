@@ -32,22 +32,24 @@ Call `checkpoint` with the complete active ledger and optional current-branch us
 
 Keep the ledger brief: goal and status, constraints and decisions, verified results and evidence, next step or wait condition, recovery references, and useful available skills or “none.” Use paths and entry IDs for detail, distinguish plans from completed work, and redact secrets.
 
-Checkpoint metadata uses schema version 2. Its `inputCoverage` records the input snapshot and inherited coverage gaps separately from the ledger:
+Checkpoint metadata uses schema version 3. Its `inputCoverage` is an immutable record of session-history material supplied to that checkpoint request. Automatic ledger refresh records `measurement: "measured"`. Agent-authored saves record `measurement: "unmeasured"`, `source: "agent-context"`, and `snapshotThrough`; the input of this path is outside precise measurement.
 
 | Field | Meaning |
 | --- | --- |
-| `source`, `baseCheckpointEntryId`, `snapshotThrough` | Generation path, preceding checkpoint used as the coverage basis, and request snapshot tip. |
-| `representation` | `rendered-text-with-image-references`: coverage describes rendered text; image pixels require a separate image read. |
+| `measurement`, `source`, `snapshotThrough` | Measurement availability, generation path, and request snapshot tip. All input records contain these fields. |
+| `baseCheckpointEntryId` | Measured requests: the checkpoint whose ledger was actually supplied as a base, or null. `previousCheckpointEntryId` in history results separately identifies the preceding parsed version. |
+| `historyScope` | Measured requests: the historical selection interval, after `afterEntryId` exclusively through `throughEntryId` inclusively. A null lower bound starts at the branch beginning. |
+| `representation` | `rendered-text-with-image-references`: supplied text includes image references; pixels require a separate image read. |
 | `fullRanges` | Inclusive ranges whose complete rendered entry text was supplied to this ledger request. |
-| `partialEntries` | Supplied prefixes with `providedChars` and `totalChars` in UTF-16 units; zero supplied characters indicates a reference or summary projection of the source entry. |
-| `omittedRanges` | Inclusive ranges omitted from the new history since the preceding checkpoint request. |
-| `outstandingGaps` | Inherited and current gaps, with reason `omitted`, `partial`, or `unknown`; each inclusive range includes its entry count. |
+| `partialEntries` | Original rendered text prefixes: source entry ID, positive `providedChars`, and larger `totalChars`, in UTF-16 units. |
+| `projections` | `reference` or `checkpoint_summary`, with the source entry ID and supplied/total UTF-16 lengths of the projection text. |
+| `omittedRanges` | Inclusive ranges within `historyScope` for which this request supplied neither original nor projected content. Each range includes its entry count. |
 
-Automatic refresh measures the final task anchors and selected history together. A complete text entry supplied through either path resolves its text-coverage gap. Saving another ledger carries remaining gaps forward. Agent-authored `checkpoint` calls mark the new request interval as `unknown` and preserve preceding gaps. Coverage records supplied input; understanding, retained meaning, and execution verification are separate judgments supported by evidence.
+Measured records include the representation, base ledger, selection scope, and content fields in the table. Task anchors may supply entries preceding that scope. The final task anchors, history selection, and base ledger are measured together. Later reading and checkpoint generation leave earlier records unchanged; each generated checkpoint describes its own request. Input records describe supplied material. Task relevance, understanding, and execution verification remain judgments supported by evidence during ordinary agent work.
 
-Within automatic refresh input, checkpoint history entries are projected to their ledger text, compact coverage counts, and original-entry reference. Coverage records these projections with zero source-prefix characters. Complete manifests remain available through explicit `history_read` calls.
+Within automatic refresh input, checkpoint history entries use ledger text, compact input-record provenance, and source references. The base ledger is supplied explicitly and recorded as a checkpoint summary projection; its checkpoint entry is skipped in the incremental history selection. Other historical records retain their own text, including quotations of earlier ledgers. Complete input records remain available through explicit `history_read` calls.
 
-Checkpoint receipts, listings, window summaries, and recovery bootstraps show compact coverage counts. Read a checkpoint with `history_read` and follow `nextRead` for its complete manifest and gap recovery calls. Those calls convert inclusive coverage ranges to the history filter's exclusive bounds. Inspect gaps relevant to the next decision; the full session log remains available for evidence recovery.
+Checkpoint receipts, listings, and recovery bootstraps show compact `inputRecord` provenance; windows expose `checkpointInputRecord` for the latest checkpoint from that source window. Read a checkpoint with `history_read` and follow `nextRead` for its complete input record and optional source browsing calls. These calls locate omitted ranges, original text beyond the supplied prefixes, and projected sources using the appropriate history filters and offsets. Choose evidence according to the current task.
 
 The bootstrap identifies the previous checkpoint, latest user request, and latest completed assistant answer. `requestHistoryPosition` records the log position at the start of the model request that produced the checkpoint; `pendingHistoryRange` identifies subsequent events. Use these positions to locate evidence, then use retained text or `history_read` to establish what the ledger reflects and verify execution facts before continuing actions with side effects.
 
@@ -100,7 +102,7 @@ Item lists and searches return `items`, `totalMatches`, `returnedCount`, `snapsh
 
 Checkpoint items include the prior parsed checkpoint ID, source window, request history position, and snapshot-relative `active` flag. `fitsCurrentLedgerBudget` checks the checkpoint schema and current ledger budget; full bootstrap capacity is checked at compaction. Older checkpoints remain discoverable when the ledger budget shrinks.
 
-`history_list_windows` accepts the shared filter, ordering, limit, and cursor. It includes initial and committed windows even when empty. `entryCount` and first/last entry IDs describe native window attribution; `matchedEntryCount`, `kindCounts`, `failedToolResults`, and `imageCount` use the same filter as item listing. Tool-call counts count invocations; other kinds count entries. Latest user previews quote matching inputs. Checkpoint counts, excerpts, and latest coverage describe snapshots grouped by original source window independently of the filter. Preview truncation flags distinguish complete wording from excerpts. Continue with the same filter/order and an adjustable `limit`; `returnedCount` and `pageEnd` describe the page. Successful history results obey `LEDGER_CONTEXT_READ_TOKENS`.
+`history_list_windows` accepts the shared filter, ordering, limit, and cursor. It includes initial and committed windows even when empty. `entryCount` and first/last entry IDs describe native window attribution; `matchedEntryCount`, `kindCounts`, `failedToolResults`, and `imageCount` use the same filter as item listing. Tool-call counts count invocations; other kinds count entries. Latest user previews quote matching inputs. Checkpoint counts, excerpts, and latest input-record provenance describe snapshots grouped by original source window independently of the filter. Preview truncation flags distinguish complete wording from excerpts. Continue with the same filter/order and an adjustable `limit`; `returnedCount` and `pageEnd` describe the page. Successful history results obey `LEDGER_CONTEXT_READ_TOKENS`.
 
 ```ts
 history_search({ query: "timeout", filter: { kinds: ["tool_result"], toolNames: ["bash"], statuses: ["failed"] }, projection: "text" });

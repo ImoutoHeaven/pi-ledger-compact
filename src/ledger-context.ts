@@ -16,7 +16,7 @@ import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-wor
 export const CHECKPOINT_ENTRY_TYPE = "ledger-context/checkpoint";
 export const RAW_TAIL_MARKER_ENTRY_TYPE = "ledger-context/tail-marker";
 export const COMPACTION_DETAILS_KIND = "ledger-context";
-export const LEDGER_SCHEMA_VERSION = 2 as const;
+export const LEDGER_SCHEMA_VERSION = 3 as const;
 export const MAX_ACTIVE_REQUEST_IDS = 8;
 export const LEDGER_BYTE_LIMIT = 65_536;
 export const DEFAULT_LEDGER_TOKEN_LIMIT = 4_096;
@@ -245,16 +245,29 @@ interface CoverageRange {
 	entryCount: number;
 }
 
-interface InputCoverage {
-	source: "ledger-refresh" | "agent-context";
+interface InputProjection {
+	entryId: string;
+	kind: "reference" | "checkpoint_summary";
+	providedChars: number;
+	totalChars: number;
+}
+
+type InputCoverage = {
+	measurement: "unmeasured";
+	source: "agent-context";
+	snapshotThrough: string | null;
+} | {
+	measurement: "measured";
+	source: "ledger-refresh";
 	representation: "rendered-text-with-image-references";
 	baseCheckpointEntryId: string | null;
 	snapshotThrough: string | null;
+	historyScope: { afterEntryId: string | null; throughEntryId: string | null };
 	fullRanges: CoverageRange[];
 	partialEntries: Array<{ entryId: string; providedChars: number; totalChars: number }>;
+	projections: InputProjection[];
 	omittedRanges: CoverageRange[];
-	outstandingGaps: Array<CoverageRange & { reason: "omitted" | "partial" | "unknown" }>;
-}
+};
 
 export interface CheckpointReceiptDetails extends CheckpointData {
 	checkpointEntryId: string;
@@ -1628,15 +1641,20 @@ function historyViewAt(entries: SessionEntry[], ctx: ExtensionContext, index: nu
 	const windowIds = branchWindowIds(entries, ctx);
 	let text = projectedHistoryEntry(entry, projection, contentIndex);
 	const checkpoint = entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY_TYPE ? parseCheckpointData(entry.data) : undefined;
-	if (checkpoint && contentIndex === undefined && (projection === "all" || projection === "text")) {
+	if (checkpoint?.inputCoverage.measurement === "measured" && contentIndex === undefined && (projection === "all" || projection === "text")) {
 		const positions = new Map(entries.map((entry, index) => [entry.id, index]));
-		const recovery = checkpoint.inputCoverage.outstandingGaps.map((gap) => {
-			const from = positions.get(gap.fromEntryId);
-			const to = positions.get(gap.toEntryId);
-			if (from === undefined || to === undefined || !entries[to + 1]) return { ...gap, error: "range unavailable on this branch" };
-			return { ...gap, tool: "history_list_items", arguments: { filter: { includeMaintenance: true, ...(from > 0 ? { afterEntryId: entries[from - 1].id } : {}), beforeEntryId: entries[to + 1].id }, order: "oldest", projection: "references" } };
-		});
-		text += `\nCoverage recovery calls (inclusive stored ranges, exclusive query bounds):\n${safeJson(recovery)}`;
+		const coverage = checkpoint.inputCoverage;
+		const browsing = [
+			...coverage.omittedRanges.map((range) => {
+				const from = positions.get(range.fromEntryId);
+				const to = positions.get(range.toEntryId);
+				if (from === undefined || to === undefined || !entries[to + 1]) return { ...range, inputForm: "omitted", error: "range unavailable on this branch" };
+				return { ...range, inputForm: "omitted", tool: "history_list_items", arguments: { filter: { includeMaintenance: true, ...(from > 0 ? { afterEntryId: entries[from - 1].id } : {}), beforeEntryId: entries[to + 1].id }, order: "oldest", projection: "references" } };
+			}),
+			...coverage.partialEntries.map((part) => ({ entryId: part.entryId, inputForm: "text_prefix", tool: "history_read", arguments: { entryId: part.entryId, offset: part.providedChars } })),
+			...coverage.projections.map((part) => ({ entryId: part.entryId, inputForm: part.kind, tool: "history_read", arguments: { entryId: part.entryId } })),
+		];
+		text += `\nInput record browse calls (inclusive recorded ranges, exclusive query bounds):\n${safeJson(browsing)}`;
 	}
 	return {
 		entry,
@@ -2199,7 +2217,7 @@ interface CheckpointHistoryDetails {
 	requestHistoryPosition: RequestHistoryPosition | null;
 	fitsCurrentLedgerBudget: boolean;
 	recoveryIssue: string | null;
-	coverage: ReturnType<typeof coverageSummary>;
+	inputRecord: ReturnType<typeof inputRecordSummary>;
 }
 
 function checkpointHistoryDetails(entries: SessionEntry[]): Map<string, CheckpointHistoryDetails> {
@@ -2219,7 +2237,7 @@ function checkpointHistoryDetails(entries: SessionEntry[]): Map<string, Checkpoi
 			requestHistoryPosition: data?.requestHistoryPosition ?? null,
 			fitsCurrentLedgerBudget: issue === null,
 			recoveryIssue: issue,
-			coverage: coverageSummary(data?.inputCoverage),
+			inputRecord: inputRecordSummary(data?.inputCoverage),
 		});
 		if (data) {
 			previous = entry.id;
@@ -2485,7 +2503,7 @@ function historyWindowsResult(params: HistoryListWindowsParameters, ctx: Extensi
 		latestCheckpointEntryId: null as string | null,
 		checkpointPreview: "",
 		checkpointPreviewTruncated: false,
-		checkpointCoverage: null as ReturnType<typeof coverageSummary> | null,
+		checkpointInputRecord: null as ReturnType<typeof inputRecordSummary> | null,
 	}]));
 	const windowIds = branchWindowIds(entries, ctx);
 	for (const [index, entry] of entries.entries()) {
@@ -2516,7 +2534,7 @@ function historyWindowsResult(params: HistoryListWindowsParameters, ctx: Extensi
 				source.latestCheckpointEntryId = entry.id;
 				source.checkpointPreview = data.ledger.slice(0, MAX_HISTORY_SEARCH_SNIPPET_LENGTH);
 				source.checkpointPreviewTruncated = data.ledger.length > source.checkpointPreview.length;
-				source.checkpointCoverage = coverageSummary(data.inputCoverage);
+				source.checkpointInputRecord = inputRecordSummary(data.inputCoverage);
 			}
 		}
 	}
@@ -2779,70 +2797,56 @@ function coverageRanges(entries: SessionEntry[], ids: Set<string>): CoverageRang
 	return ranges;
 }
 
-function buildInputCoverage(entries: SessionEntry[], position: RequestHistoryPosition, base: StoredCheckpoint | undefined, supplied?: Map<string, number>): InputCoverage {
+function buildInputCoverage(entries: SessionEntry[], position: RequestHistoryPosition, base: StoredCheckpoint | undefined, supplied: Map<string, number>, projections: Map<string, InputProjection>): InputCoverage {
 	const snapshot = entries.slice(0, positionStartIndex(entries, position));
 	const positions = new Map(snapshot.map((entry, index) => [entry.id, index]));
-	const gaps = new Map<string, InputCoverage["outstandingGaps"][number]["reason"]>();
-	for (const gap of base?.data.inputCoverage.outstandingGaps ?? []) {
-		const from = positions.get(gap.fromEntryId);
-		const to = positions.get(gap.toEntryId);
-		if (from === undefined || to === undefined || from > to || to - from + 1 !== gap.entryCount) throw validationError("checkpoint coverage range is outside the request branch snapshot");
-		for (let index = from; index <= to; index++) gaps.set(snapshot[index].id, gap.reason);
-	}
 	const scopeStart = base ? positionStartIndex(snapshot, base.data.requestHistoryPosition) : 0;
-	const omitted = new Set<string>();
-	for (const entry of snapshot.slice(scopeStart)) {
-		if (supplied?.has(entry.id)) continue;
-		gaps.set(entry.id, supplied ? "omitted" : "unknown");
-		if (supplied) omitted.add(entry.id);
-	}
+	const omitted = new Set(snapshot.slice(scopeStart).filter((entry) => !supplied.has(entry.id) && !projections.has(entry.id)).map((entry) => entry.id));
 	const full = new Set<string>();
-	const partialEntries: InputCoverage["partialEntries"] = [];
-	for (const [entryId, providedChars] of supplied ?? []) {
+	const partialEntries: Extract<InputCoverage, { measurement: "measured" }>["partialEntries"] = [];
+	for (const [entryId, providedChars] of supplied) {
 		const index = positions.get(entryId);
 		if (index === undefined) throw validationError("supplied coverage entry is outside the request snapshot");
 		const totalChars = renderEntry(snapshot[index]).length;
-		if (providedChars === totalChars) {
-			full.add(entryId);
-			gaps.delete(entryId);
-		} else {
-			partialEntries.push({ entryId, providedChars, totalChars });
-			if (index >= scopeStart || gaps.has(entryId)) gaps.set(entryId, "partial");
-		}
+		if (providedChars === totalChars) full.add(entryId);
+		else partialEntries.push({ entryId, providedChars, totalChars });
 	}
-	const outstandingGaps = (["omitted", "partial", "unknown"] as const).flatMap((reason) => coverageRanges(snapshot, new Set([...gaps].filter(([, value]) => value === reason).map(([id]) => id))).map((range) => ({ ...range, reason })));
-	outstandingGaps.sort((a, b) => positions.get(a.fromEntryId)! - positions.get(b.fromEntryId)!);
+	for (const id of projections.keys()) if (!positions.has(id)) throw validationError("projected coverage entry is outside the request snapshot");
 	return {
-		source: supplied ? "ledger-refresh" : "agent-context",
+		measurement: "measured", source: "ledger-refresh",
 		representation: "rendered-text-with-image-references",
 		baseCheckpointEntryId: base?.entryId ?? null,
 		snapshotThrough: position.entryId,
+		historyScope: { afterEntryId: base?.data.requestHistoryPosition.entryId ?? null, throughEntryId: position.entryId },
 		fullRanges: coverageRanges(snapshot, full), partialEntries,
-		omittedRanges: coverageRanges(snapshot, omitted), outstandingGaps,
+		projections: [...projections.values()], omittedRanges: coverageRanges(snapshot, omitted),
 	};
 }
 
-function coverageSummary(coverage?: InputCoverage) {
-	const count = (reason: InputCoverage["outstandingGaps"][number]["reason"]) => coverage?.outstandingGaps.filter((gap) => gap.reason === reason).reduce((sum, range) => sum + range.entryCount, 0) ?? null;
-	return {
-		representation: "rendered-text-with-image-references",
-		status: !coverage || coverage.source === "agent-context" || coverage.outstandingGaps.some((gap) => gap.reason === "unknown") ? "unknown" : coverage.outstandingGaps.length ? "partial" : "complete",
-		outstandingEntries: coverage?.outstandingGaps.reduce((sum, range) => sum + range.entryCount, 0) ?? null,
-		gapRanges: coverage?.outstandingGaps.length ?? null,
-		omittedEntries: count("omitted"), partialEntries: count("partial"), unknownEntries: count("unknown"),
-	};
+function inputRecordSummary(coverage?: InputCoverage) {
+	if (!coverage) return { measurement: "unavailable" };
+	return { measurement: coverage.measurement, source: coverage.source, ...(coverage.measurement === "measured" ? { baseCheckpointEntryId: coverage.baseCheckpointEntryId } : {}) };
 }
 
 function parseInputCoverage(value: unknown): InputCoverage | undefined {
-	if (!value || typeof value !== "object") return undefined;
-	const data = value as InputCoverage;
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const input = value as Record<string, unknown>;
 	const id = (value: unknown) => typeof value === "string" && value.length > 0 && value.length <= MAX_HISTORY_IDENTIFIER_LENGTH;
+	const nullableId = (value: unknown) => value === null || id(value);
+	if (!nullableId(input.snapshotThrough)) return undefined;
+	if (input.measurement === "unmeasured") {
+		if (input.source !== "agent-context" || Object.keys(input).some((key) => !["measurement", "source", "snapshotThrough"].includes(key))) return undefined;
+		return input as Extract<InputCoverage, { measurement: "unmeasured" }>;
+	}
+	if (input.measurement !== "measured" || Object.keys(input).some((key) => !["measurement", "source", "snapshotThrough", "representation", "baseCheckpointEntryId", "historyScope", "fullRanges", "partialEntries", "projections", "omittedRanges"].includes(key))) return undefined;
+	const data = input as Extract<InputCoverage, { measurement: "measured" }>;
 	const range = (value: CoverageRange) => value && id(value.fromEntryId) && id(value.toEntryId) && Number.isSafeInteger(value.entryCount) && value.entryCount > 0;
-	if ((data.source !== "ledger-refresh" && data.source !== "agent-context") || data.representation !== "rendered-text-with-image-references" ||
-		(data.baseCheckpointEntryId !== null && !id(data.baseCheckpointEntryId)) || (data.snapshotThrough !== null && !id(data.snapshotThrough)) ||
+	const lengths = (part: { providedChars: number; totalChars: number }) => Number.isSafeInteger(part.providedChars) && Number.isSafeInteger(part.totalChars) && part.providedChars > 0 && part.providedChars <= part.totalChars;
+	if (data.source !== "ledger-refresh" || data.representation !== "rendered-text-with-image-references" || !nullableId(data.baseCheckpointEntryId) ||
+		!data.historyScope || !nullableId(data.historyScope.afterEntryId) || data.historyScope.throughEntryId !== data.snapshotThrough ||
 		!Array.isArray(data.fullRanges) || !data.fullRanges.every(range) || !Array.isArray(data.omittedRanges) || !data.omittedRanges.every(range) ||
-		!Array.isArray(data.partialEntries) || !data.partialEntries.every((part) => part && id(part.entryId) && Number.isSafeInteger(part.providedChars) && Number.isSafeInteger(part.totalChars) && part.providedChars >= 0 && part.totalChars > part.providedChars) ||
-		!Array.isArray(data.outstandingGaps) || !data.outstandingGaps.every((gap) => range(gap) && ["omitted", "partial", "unknown"].includes(gap.reason))) return undefined;
+		!Array.isArray(data.partialEntries) || !data.partialEntries.every((part) => part && id(part.entryId) && lengths(part) && part.providedChars < part.totalChars) ||
+		!Array.isArray(data.projections) || !data.projections.every((part) => part && id(part.entryId) && lengths(part) && ["reference", "checkpoint_summary"].includes(part.kind))) return undefined;
 	return data;
 }
 
@@ -3152,8 +3156,9 @@ function taskSectionText(active: string, latest: string, focus?: string): string
 	return sections.join("\n\n");
 }
 
-function renderTaskEntryReferences(entries: SessionEntry[], tokenLimit: number, supplied?: Map<string, number>): string {
+function renderTaskEntryReferences(entries: SessionEntry[], tokenLimit: number, supplied?: Map<string, number>, projections?: Map<string, InputProjection>): string {
 	supplied?.clear();
+	projections?.clear();
 	if (entries.length === 0) return "(none recorded)";
 	const selected: string[] = [];
 	for (const entry of entries) {
@@ -3166,7 +3171,10 @@ function renderTaskEntryReferences(entries: SessionEntry[], tokenLimit: number, 
 		}
 		const reference = renderTailReference(entry);
 		const referenceCandidate = [...selected, reference].join("\n\n");
-		if (ledgerTokenEstimate(referenceCandidate) <= tokenLimit) { selected.push(reference); supplied?.set(entry.id, 0); }
+		if (ledgerTokenEstimate(referenceCandidate) <= tokenLimit) {
+			selected.push(reference);
+			projections?.set(entry.id, { entryId: entry.id, kind: "reference", providedChars: reference.length, totalChars: reference.length });
+		}
 	}
 	return selected.length > 0 ? selected.join("\n\n") : "(none recorded)";
 }
@@ -3232,6 +3240,7 @@ function renderTaskSection(
 	customInstructions: string | undefined,
 	taskTokenLimit: number,
 	supplied?: Map<string, number>,
+	projections?: Map<string, InputProjection>,
 ): string {
 	const taskBudget = Math.max(1, taskTokenLimit - 4);
 	const activeEntries = activeRequestEntryIds
@@ -3240,7 +3249,8 @@ function renderTaskSection(
 	const latest = latestUserEntry(entries);
 	const activeWithoutLatest = activeEntries.filter((entry) => entry.id !== latest?.id);
 	const activeSupplied = new Map<string, number>();
-	const fullActive = renderTaskEntryReferences(activeWithoutLatest, taskBudget, activeSupplied);
+	const activeProjections = new Map<string, InputProjection>();
+	const fullActive = renderTaskEntryReferences(activeWithoutLatest, taskBudget, activeSupplied, activeProjections);
 	const fullLatest = latest ? renderEntry(latest) : "(none recorded)";
 	let latestChars = fullLatest.length;
 	const fullFocus = customInstructions?.trim() ? customInstructions.trim() : "";
@@ -3251,11 +3261,11 @@ function renderTaskSection(
 	let output = compose(active, latestText, focus);
 	if (ledgerTokenEstimate(output) > taskBudget) {
 		let activeBudget = Math.max(1, Math.floor(taskBudget / 2));
-		active = renderTaskEntryReferences(activeWithoutLatest, activeBudget, activeSupplied);
+		active = renderTaskEntryReferences(activeWithoutLatest, activeBudget, activeSupplied, activeProjections);
 		output = compose(active, latestText, focus);
 		while (ledgerTokenEstimate(output) > taskBudget && activeBudget > 1) {
 			activeBudget = Math.max(1, Math.floor(activeBudget / 2));
-			active = renderTaskEntryReferences(activeWithoutLatest, activeBudget, activeSupplied);
+			active = renderTaskEntryReferences(activeWithoutLatest, activeBudget, activeSupplied, activeProjections);
 			output = compose(active, latestText, focus);
 		}
 		if (ledgerTokenEstimate(output) > taskBudget) {
@@ -3287,7 +3297,11 @@ function renderTaskSection(
 		throw new Error("task recovery content exceeds the configured task budget");
 	}
 	for (const [id, count] of activeSupplied) supplied?.set(id, count);
-	if (latest) supplied?.set(latest.id, latestChars);
+	for (const [id, projection] of activeProjections) projections?.set(id, projection);
+	if (latest) {
+		if (latestChars > 0) supplied?.set(latest.id, latestChars);
+		else projections?.set(latest.id, { entryId: latest.id, kind: "reference", providedChars: latestText.length, totalChars: latestText.length });
+	}
 	return output;
 }
 
@@ -3323,7 +3337,7 @@ function renderBootstrap(
 		`requestHistoryPosition: entry=${details.requestHistoryPosition?.entryId ?? "(empty)"} depth=${details.requestHistoryPosition?.branchDepth ?? 0}`,
 		`lastUserEntryId: ${lastUserEntryId ?? "(none)"} lastAssistantEntryId: ${lastAssistantEntryId ?? "(none)"}`,
 		`pendingHistoryRange: ${details.pendingHistoryRange.fromEntryId ?? "(none)"}..${details.pendingHistoryRange.toEntryId ?? "(none)"}`,
-		`inputCoverage: ${safeJson(coverageSummary(state.checkpoint?.data.inputCoverage))}; details: ${activeCheckpointEntryId ? historyEntryReference(activeCheckpointEntryId) : "unavailable"}`,
+		`inputRecord: ${safeJson(inputRecordSummary(state.checkpoint?.data.inputCoverage))}; details: ${activeCheckpointEntryId ? historyEntryReference(activeCheckpointEntryId) : "unavailable"}`,
 		`sourceWindowId: ${details.sourceWindowId}`,
 		`sourceBranchTip: ${details.sourceBranchTip ?? "(empty)"}`,
 		`firstKeptEntryId: ${details.firstKeptEntryId}`,
@@ -3343,7 +3357,7 @@ function renderBootstrap(
 			? "Ledger refresh failed for this compaction. Restored the previous checkpoint, which may be stale. Verify subsequent work through pendingHistoryRange and history_read before continuing."
 			: "Ledger refresh failed for this compaction and no usable checkpoint is available. Recover the task and execution state from the retained entries and complete session history before acting."] : []),
 		"Verify execution facts and distinguish planned, executed, and verified work before repeating side effects.",
-		"Input coverage measures supplied rendered text, with image references only; understanding and verification require evidence. Saved checkpoints retain older coverage gaps. Read the checkpoint for its manifest and gap recovery calls when relevant to the next action.",
+		"Input records describe material supplied for each checkpoint request, with image references only. Use source references as needed for the current task; understanding and verification require evidence.",
 		"Read known entry IDs with history_read first; use history_search only to find unknown IDs, then continue with nextOffset.",
 		"requestHistoryPosition marks the checkpoint model request start; pendingHistoryRange lists later events, not proof of understanding or verification.",
 		"</recovery-guidance>",
@@ -3533,7 +3547,7 @@ function validateCheckpoint(
 			activeRequestEntryIds: ids,
 			requestHistoryPosition,
 			sourceWindowId: state.activeWindowId,
-			inputCoverage: inputCoverage ?? buildInputCoverage(entries, requestHistoryPosition, state.checkpoint),
+			inputCoverage: inputCoverage ?? { measurement: "unmeasured", source: "agent-context", snapshotThrough: requestHistoryPosition.entryId },
 		},
 		estimatedLedgerTokens,
 		ledgerBytes,
@@ -3633,8 +3647,10 @@ async function generateCompactionCheckpoint(
 		const inputBudget = model.contextWindow - maxTokens - ledgerTokenEstimate(systemPrompt) - modelMetadataTokens(ctx) - 64;
 		if (inputBudget < 1) return undefined;
 		const supplied = new Map<string, number>();
-		const task = renderTaskSection(entries, state.inferredActiveRequestEntryIds, customInstructions, Math.min(budgets.taskTokens, Math.max(1, Math.floor(inputBudget / 4))), supplied);
-		const previousLedger = state.checkpoint ? `Previous ledger (may be stale; inherited input coverage: ${safeJson(coverageSummary(state.checkpoint.data.inputCoverage))}):\n${state.checkpoint.data.ledger}` : "Previous ledger: none available.";
+		const projections = new Map<string, InputProjection>();
+		const task = renderTaskSection(entries, state.inferredActiveRequestEntryIds, customInstructions, Math.min(budgets.taskTokens, Math.max(1, Math.floor(inputBudget / 4))), supplied, projections);
+		const previousLedger = state.checkpoint ? `Previous ledger (may be stale; source: ${historyEntryReference(state.checkpoint.entryId)}):\n${state.checkpoint.data.ledger}` : "Previous ledger: none available.";
+		if (state.checkpoint) projections.set(state.checkpoint.entryId, { entryId: state.checkpoint.entryId, kind: "checkpoint_summary", providedChars: previousLedger.length, totalChars: previousLedger.length });
 		const selected: string[] = [];
 		let used = ledgerTokenEstimate(task) + ledgerTokenEstimate(previousLedger) + 32;
 		const startIndex = state.checkpoint ? positionStartIndex(entries, state.checkpoint.data.requestHistoryPosition) : 0;
@@ -3642,24 +3658,25 @@ async function generateCompactionCheckpoint(
 			const remaining = inputBudget - used;
 			if (remaining < 64) break;
 			const entry = entries[index];
+			if (entry.id === state.checkpoint?.entryId) continue;
 			const isCheckpoint = entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY_TYPE;
 			const checkpoint = isCheckpoint ? parseCheckpointData(entry.data) : undefined;
 			const rendered = isCheckpoint ? [
 				`[entry ${entry.id}] checkpoint summary projection; complete entry: ${historyEntryReference(entry.id)}`,
-				`inputCoverage: ${safeJson(coverageSummary(checkpoint?.inputCoverage))}`,
+				`inputRecord: ${safeJson(inputRecordSummary(checkpoint?.inputCoverage))}`,
 				checkpoint ? `ledger:\n${checkpoint.ledger}` : "Checkpoint format is invalid; inspect the original entry for evidence.",
 			].join("\n") : renderEntry(entry);
 			let providedChars = 0;
-			// A checkpoint summary is a projection, not a prefix of the persisted entry.
-			const text = clippedText(rendered, Math.min(budgets.tailTokens, remaining - 16) * 3, entry.id, (count) => { if (!isCheckpoint) providedChars = count; });
+			const text = clippedText(rendered, Math.min(budgets.tailTokens, remaining - 16) * 3, entry.id, (count) => { providedChars = count; });
 			const cost = ledgerTokenEstimate(text) + 2;
 			if (cost > remaining) break;
 			selected.unshift(text);
-			supplied.set(entry.id, Math.max(supplied.get(entry.id) ?? 0, providedChars));
+			if (isCheckpoint) projections.set(entry.id, { entryId: entry.id, kind: "checkpoint_summary", providedChars, totalChars: rendered.length });
+			else supplied.set(entry.id, Math.max(supplied.get(entry.id) ?? 0, providedChars));
 			used += cost;
 		}
 		const content = [task, previousLedger, "Bounded history since the checkpoint request (oldest to newest; omissions may exist):", ...selected].join("\n\n");
-		const inputCoverage = buildInputCoverage(entries, position, state.checkpoint, supplied);
+		const inputCoverage = buildInputCoverage(entries, position, state.checkpoint, supplied, projections);
 		if (ledgerTokenEstimate(content) > inputBudget) return undefined;
 		signal.throwIfAborted();
 		const aborted = new Promise<never>((_resolve, reject) => {
@@ -3942,7 +3959,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		description: "Save the complete active working ledger for recovery at the next native context compaction.",
 		promptSnippet: "save working state for context recovery",
 		promptGuidelines: [
-			"After important decisions or user corrections, save concise goal/status, constraints/decisions, verified results/evidence, next step/wait, artifact/recovery references, and suggested skills (or none). Separate plans from facts and redact secrets. Saving preserves prior input-coverage gaps; agent-context coverage is unknown. Inspect relevant gaps through history_read before relying on the ledger. A save continues this window; pi controls compaction.",
+			"After important decisions or user corrections, save concise goal/status, constraints/decisions, verified results/evidence, next step/wait, artifact/recovery references, and suggested skills (or none). Separate plans from facts and redact secrets. Input measurement for agent-authored checkpoints is unmeasured. Use history references as needed for the current task. A save continues this window; pi controls compaction.",
 		],
 		parameters: checkpointParameters,
 		executionMode: "sequential",
@@ -3981,7 +3998,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 							`history position: ${validated.data.requestHistoryPosition.entryId ?? "empty branch"}`,
 							`ledger: ${validated.estimatedLedgerTokens} estimated tokens / ${validated.ledgerBytes} UTF-8 bytes`,
 						"handoff: saved; waiting for pi's native compaction threshold.",
-						`inputCoverage: ${safeJson(coverageSummary(validated.data.inputCoverage))}; details: ${historyEntryReference(saved.entryId)}`,
+						`inputRecord: ${safeJson(inputRecordSummary(validated.data.inputCoverage))}; details: ${historyEntryReference(saved.entryId)}`,
 						].join("\n"),
 					},
 				],
@@ -4039,7 +4056,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		label: "History List Items",
 		description: "Browse one item per source entry using the same filter and projection as history_search. Supports newest/oldest order, image-only entries, bounded previews, and snapshot cursors.",
 		promptSnippet: "browse history and checkpoint versions",
-		promptGuidelines: ["Use filter.kinds=[checkpoint] for ledger versions, [user_input] for requests; toolNames matches exact names. Filters use AND, arrays OR, exclusions win. Maintenance traffic defaults off. hasImage selects entire entries; projection=text keeps text. Continue with nextCursor and the same filter/order; limit/maxChars/projection may change. pageEnd reports complete, limit or output_budget. Checkpoint coverage counts outstanding input gaps; read the checkpoint for its manifest and gap recovery calls. active is snapshot-relative; fitsCurrentLedgerBudget checks schema/ledger capacity, with full recovery checked at compaction."],
+		promptGuidelines: ["Use filter.kinds=[checkpoint] for ledger versions, [user_input] for requests; toolNames matches exact names. Filters use AND, arrays OR, exclusions win. Maintenance traffic defaults off. hasImage selects entire entries; projection=text keeps text. Continue with nextCursor and the same filter/order; limit/maxChars/projection may change. pageEnd reports complete, limit or output_budget. Checkpoint inputRecord reports measurement and the actual base ledger when known; read the checkpoint for its per-request input record and source browsing calls. active is snapshot-relative; fitsCurrentLedgerBudget checks schema/ledger capacity, with full recovery checked at compaction."],
 		parameters: historyListItemsParameters,
 		executionMode: "sequential",
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {

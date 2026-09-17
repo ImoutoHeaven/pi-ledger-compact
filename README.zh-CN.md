@@ -32,22 +32,24 @@ pi install -l .
 
 账本保持简短，记录目标和状态、约束和决策、已验证的结果及证据、下一步或等待条件、恢复引用，以及适用的可用技能或“无”。细节通过路径和条目 ID 引用，计划与已完成工作分别标明，敏感信息使用脱敏表示。
 
-Checkpoint 元数据使用 schema version 2。`inputCoverage` 独立于账本正文，记录输入快照和继承的覆盖缺口：
+Checkpoint 元数据使用 schema version 3。`inputCoverage` 是该次 checkpoint 请求实际提供的会话历史材料的不可变记录。自动刷新账本记录 `measurement: "measured"`；主 agent 保存账本记录 `measurement: "unmeasured"`、`source: "agent-context"` 和 `snapshotThrough`，表示这条路径的输入未经精确测量。
 
 | 字段 | 含义 |
 | --- | --- |
-| `source`、`baseCheckpointEntryId`、`snapshotThrough` | 生成路径、作为覆盖继承依据的上一份 checkpoint，以及请求快照末端。 |
-| `representation` | `rendered-text-with-image-references`：覆盖范围描述渲染文字；图片像素通过独立图像读取获取。 |
+| `measurement`、`source`、`snapshotThrough` | 测量可用性、生成路径和请求快照末端，所有输入记录均包含这些字段。 |
+| `baseCheckpointEntryId` | 已测量请求实际作为基础输入提供的 checkpoint 账本 ID，或 null。历史结果中的 `previousCheckpointEntryId` 独立表示前一个可解析版本。 |
+| `historyScope` | 已测量请求的历史选择区间：从 `afterEntryId` 之后，到包含 `throughEntryId` 为止；下界为 null 表示从分支起点开始。 |
+| `representation` | `rendered-text-with-image-references`：提供的文字包含图片引用；像素通过独立图像读取获取。 |
 | `fullRanges` | 本次账本请求完整提供了渲染正文的条目范围，包含首尾条目。 |
-| `partialEntries` | 已提供前缀的 `providedChars` 和完整正文的 `totalChars`，单位为 UTF-16；提供字符数为零表示提供了原始条目的引用或摘要投影。 |
-| `omittedRanges` | 从上一份 checkpoint 请求位置之后的新增历史中省略的范围，包含首尾条目。 |
-| `outstandingGaps` | 继承和本次产生的覆盖缺口，原因为 `omitted`、`partial` 或 `unknown`；范围包含首尾条目，并记录条目数。 |
+| `partialEntries` | 原始渲染正文的前缀：来源条目 ID、正数 `providedChars` 和更大的 `totalChars`，单位为 UTF-16。 |
+| `projections` | `reference` 或 `checkpoint_summary`，记录来源条目 ID，以及投影文字已提供的长度与总长度，单位为 UTF-16。 |
+| `omittedRanges` | `historyScope` 内本次既未提供原文、也未提供投影的范围，包含首尾条目，并记录条目数。 |
 
-自动刷新统一统计最终任务锚点和选中的历史正文。任一路径完整提供某条目的渲染文字后，其文字覆盖缺口得到补齐；再次保存账本会继承其余缺口。主 agent 调用 `checkpoint` 时，将新增请求区间标为 `unknown`，并保留既有缺口。Coverage 记录实际提供的输入；理解、含义保留和执行核验分别由证据支持。
+已测量记录包含表中的表示方式、基础账本、选择区间及内容字段。任务锚点可以提供该区间之前的条目；最终任务锚点、历史选择和基础账本一起接受测量。后续阅读和保存保留之前的记录原样，每份生成的 checkpoint 独立描述自己的请求。输入记录描述实际提供的材料，任务相关性、理解和执行核验由 agent 在正常工作中结合证据判断。
 
-自动刷新输入中的 checkpoint 历史条目投影为账本正文、简短的覆盖统计和原始条目引用。Coverage 将这类投影记录为零个原文前缀字符。完整 manifest 通过显式 `history_read` 调用读取。
+自动刷新输入中的 checkpoint 历史条目使用账本正文、简短的输入记录来源信息和原始条目引用。基础账本显式提供并记录为 checkpoint 摘要投影，其 checkpoint 条目从增量历史选择中跳过。其他历史记录保留各自的文字，包括其中对早期账本的引用。完整输入记录通过显式 `history_read` 调用读取。
 
-Checkpoint 回执、条目列表、窗口摘要和恢复引导展示简短的覆盖统计。通过 `history_read` 读取 checkpoint，并跟随 `nextRead` 获取完整 manifest 和缺口查询调用。这些调用将包含首尾的覆盖范围转换为历史过滤器的排他边界。按下一步决策的需要补查相关缺口；完整会话日志持续作为证据来源。
+Checkpoint 回执、条目列表和恢复引导展示简短的 `inputRecord` 来源信息；窗口通过 `checkpointInputRecord` 展示来自该窗口的最新 checkpoint 输入来源。通过 `history_read` 读取 checkpoint，并跟随 `nextRead` 获取完整输入记录和可选的来源浏览调用。这些调用使用适当的历史过滤器与偏移，定位未选入范围、原文未提供的后缀以及投影来源。Agent 根据当前任务选择所需证据。
 
 恢复引导标出上一个检查点、最新用户请求和最新已完成的助手回答。`requestHistoryPosition` 记录生成检查点的模型请求开始时的日志位置，`pendingHistoryRange` 标出此后的事件。使用这些位置定位证据，再结合保留的正文或 `history_read` 核对账本反映的内容，并在继续执行有副作用的操作前验证执行事实。
 
@@ -100,7 +102,7 @@ const ledgerExtension = createLedgerContext({
 
 Checkpoint 结果包含前一个可解析版本的 ID、来源窗口、请求历史位置和快照内的 `active` 标记。`fitsCurrentLedgerBudget` 检查格式与当前 ledger 预算，完整 bootstrap 容量在压缩时检查。预算缩小后，旧 checkpoint 仍可被发现。
 
-`history_list_windows` 接受共用过滤条件、顺序、条数和游标，包含初始窗口及条目数为零的已提交窗口。`entryCount` 和首尾条目 ID 描述原生窗口归属；`matchedEntryCount`、`kindCounts`、`failedToolResults`、`imageCount` 使用与条目列表相同的过滤条件。工具调用按调用数统计，其他种类按条目数统计。最新用户预览引用匹配的输入原文；checkpoint 数量、摘录和最新覆盖统计独立于过滤条件，按原始来源窗口组织。预览截断标记区分完整措辞与摘录。续页保持 filter/order，可调整 `limit`；`returnedCount` 和 `pageEnd` 描述本页状态。成功返回的历史结果遵守 `LEDGER_CONTEXT_READ_TOKENS` 预算。
+`history_list_windows` 接受共用过滤条件、顺序、条数和游标，包含初始窗口及条目数为零的已提交窗口。`entryCount` 和首尾条目 ID 描述原生窗口归属；`matchedEntryCount`、`kindCounts`、`failedToolResults`、`imageCount` 使用与条目列表相同的过滤条件。工具调用按调用数统计，其他种类按条目数统计。最新用户预览引用匹配的输入原文；checkpoint 数量、摘录和最新输入记录的来源信息独立于过滤条件，按原始来源窗口组织。预览截断标记区分完整措辞与摘录。续页保持 filter/order，可调整 `limit`；`returnedCount` 和 `pageEnd` 描述本页状态。成功返回的历史结果遵守 `LEDGER_CONTEXT_READ_TOKENS` 预算。
 
 ```ts
 history_search({ query: "timeout", filter: { kinds: ["tool_result"], toolNames: ["bash"], statuses: ["failed"] }, projection: "text" });
