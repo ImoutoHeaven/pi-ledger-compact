@@ -1,6 +1,6 @@
 # pi Ledger Context Extension
 
-Ledger Context keeps a bounded working ledger in the pi session log and carries it into a deterministic recovery bootstrap at native context compaction. The extension uses pi's public `ExtensionAPI` and SDK.
+Ledger Context preserves the main agent's working checkpoint and a separate cumulative compaction delta in the pi session log. Each model request uses the current recovery baseline through pi's public `ExtensionAPI` and SDK.
 
 ## Requirements
 
@@ -28,40 +28,45 @@ The package registers these model tools:
 
 ## Checkpoints and recovery
 
-Call `checkpoint` with the complete active ledger and optional current-branch user request entry IDs. A successful receipt contains the checkpoint entry ID, source window ID, request history position, estimated ledger size, persistence scope, and `awaiting-native-compaction-threshold` handoff state.
+Call `checkpoint` with the complete current working state and optional current-branch user request entry IDs. Integrate still-needed facts from the current checkpoint, subsequent delta and recent work. A successful save replaces the active baseline, retains earlier versions in history, and reports its entry ID, source window, request position, size and persistence scope. Pi controls compaction timing.
 
 Keep the ledger brief: goal and status, constraints and decisions, verified results and evidence, next step or wait condition, recovery references, and useful available skills or “none.” Use paths and entry IDs for detail, distinguish plans from completed work, and redact secrets.
 
-Checkpoint metadata uses schema version 3. Its `inputCoverage` is an immutable record of session-history material supplied to that checkpoint request. Automatic ledger refresh records `measurement: "measured"`. Agent-authored saves record `measurement: "unmeasured"`, `source: "agent-context"`, and `snapshotThrough`; the input of this path is outside precise measurement.
+Only the main agent's `checkpoint` tool writes checkpoints. Its prompt asks for the current working state. The compaction prompt asks for subsequent changes: user corrections, decisions, execution outcomes, verification and changed next steps. It receives the checkpoint as read-only background, the previous matching delta as a summary, and bounded new evidence. Repeated compactions update the cumulative delta while preserving the checkpoint text. With no checkpoint, the origin is the branch beginning.
+
+Recovery records use schema version 4. Start a new session when switching from an earlier recovery schema. Original logs remain intact; incompatible or corrupt recovery records stop resume with an explicit error.
+
+Each `inputCoverage` is an immutable input record. Agent checkpoints use `measurement: "unmeasured"`, `source: "agent-context"`, `snapshotThrough`, and `recoveryBasis`: the checkpoint/delta IDs projected for the generating main-agent request, or null when no recovery view was supplied. Delta requests use `measurement: "measured"` and `source: "compaction-delta"` with these fields:
 
 | Field | Meaning |
 | --- | --- |
 | `measurement`, `source`, `snapshotThrough` | Measurement availability, generation path, and request snapshot tip. All input records contain these fields. |
-| `baseCheckpointEntryId` | Measured requests: the checkpoint whose ledger was actually supplied as a base, or null. `previousCheckpointEntryId` in history results separately identifies the preceding parsed version. |
+| `baseCheckpointEntryId`, `baseDeltaCompactionEntryId` | Checkpoint and earlier generated delta actually supplied as bases, or null. |
 | `historyScope` | Measured requests: the historical selection interval, after `afterEntryId` exclusively through `throughEntryId` inclusively. A null lower bound starts at the branch beginning. |
 | `representation` | `rendered-text-with-image-references`: supplied text includes image references; pixels require a separate image read. |
-| `fullRanges` | Inclusive ranges whose complete rendered entry text was supplied to this ledger request. |
+| `fullRanges` | Inclusive ranges whose complete rendered entry text was supplied to this delta request. |
 | `partialEntries` | Original rendered text prefixes: source entry ID, positive `providedChars`, and larger `totalChars`, in UTF-16 units. |
-| `projections` | `reference` or `checkpoint_summary`, with the source entry ID and supplied/total UTF-16 lengths of the projection text. |
-| `omittedRanges` | Inclusive ranges within `historyScope` for which this request supplied neither original nor projected content. Each range includes its entry count. |
+| `projections` | `reference`, `checkpoint-ledger`, `delta-ledger`, or `filtered-entry`, with source IDs and supplied/total UTF-16 lengths of projection text. |
+| `omittedRanges` | Inclusive ranges within `historyScope` left out of the bounded input, with entry counts. |
+| `excludedRanges` | Inclusive ranges excluded by the fixed `maintenance` or `structural-metadata` policy. Substantive history-tool results remain eligible evidence. |
 
-Measured records include the representation, base ledger, selection scope, and content fields in the table. Task anchors may supply entries preceding that scope. The final task anchors, history selection, and base ledger are measured together. Later reading and checkpoint generation leave earlier records unchanged; each generated checkpoint describes its own request. Input records describe supplied material. Task relevance, understanding, and execution verification remain judgments supported by evidence during ordinary agent work.
+The delta's `scope` spans its cumulative target interval. Its input record's `historyScope` spans the new history considered for that request. Task anchors may precede this interval. Earlier delta text counts as a summary projection; its original sources retain their earlier input records. Relevance, understanding and verification remain judgments supported by evidence during ordinary agent work.
 
-Within automatic refresh input, checkpoint history entries use ledger text, compact input-record provenance, and source references. The base ledger is supplied explicitly and recorded as a checkpoint summary projection; its checkpoint entry is skipped in the incremental history selection. Other historical records retain their own text, including quotations of earlier ledgers. Complete input records remain available through explicit `history_read` calls.
+Generation receives the base checkpoint and previous delta explicitly. Compaction packets and complete manifests stay in the log, keeping repeated generation input bounded. Mixed assistant entries with maintenance calls use filtered projections; ordinary evidence retains its rendering, including any quotations.
 
-Checkpoint receipts, listings, and recovery bootstraps show compact `inputRecord` provenance; windows expose `checkpointInputRecord` for the latest checkpoint from that source window. Read a checkpoint with `history_read` and follow `nextRead` for its complete input record and optional source browsing calls. These calls locate omitted ranges, original text beyond the supplied prefixes, and projected sources using the appropriate history filters and offsets. Choose evidence according to the current task.
+Receipts, listings and recovery views show compact `inputRecord` provenance. Read the checkpoint or delta's owning compaction entry with `history_read`, following `nextRead` for full details. Generated delta records include optional browse calls for omitted ranges, partial text and projected sources. Choose evidence according to the current task.
 
-The bootstrap identifies the previous checkpoint, latest user request, and latest completed assistant answer. `requestHistoryPosition` records the log position at the start of the model request that produced the checkpoint; `pendingHistoryRange` identifies subsequent events. Use these positions to locate evidence, then use retained text or `history_read` to establish what the ledger reflects and verify execution facts before continuing actions with side effects.
+After compaction, each main-agent request projects the latest checkpoint and its matching delta into the extension's recovery summary. A new checkpoint immediately becomes the baseline; earlier checkpoint/delta versions remain readable in history. The persisted compaction packet and its bounded task/tail material remain unchanged. Recovery ownership is checked against the current branch before projection.
 
-Saving a checkpoint lets the current run continue. Pi controls compaction timing. Every automatic compaction and manual `/compact [instructions]` attempts to refresh the ledger using the current model, host authentication, previous usable ledger, latest task, and bounded subsequent history. Transient network or service errors, rate limits, and empty, truncated, oversized, or invalid output share a maximum of three total generation attempts with cancellable backoff. Authentication, invalid-request, and account-limit errors go directly to recovery. Each attempt waits for the response or an error, subject to user cancellation. Valid output is saved once as a checkpoint and included in recovery. Failed generation restores the previous usable checkpoint with an explicit stale-ledger warning and recovery references. When that checkpoint is unavailable or exceeds the current ledger budget, the bootstrap explicitly directs recovery from session history. User cancellation cancels compaction; a checkpoint write failure stops recovery until the persisted session is reopened.
+Delta generation uses the current model and host authentication. Transient failures and invalid outputs share at most three attempts with cancellable backoff; authentication, invalid-request and account-limit failures go directly to recovery. Each attempt waits for a response or error, subject to cancellation. With no new eligible material or custom instructions, compaction reuses the matching delta or records an empty delta. New deltas become active with the committed pi compaction entry.
 
-The bootstrap carries the latest ledger, current task and latest user wording, window metadata, bounded recent interaction, execution state, and direct history references. Assistant tool calls stay paired with every matching result. Persistent sessions keep complete entries in the pi session log as the durable evidence source; in-memory sessions keep them for the current process.
+The recovery view distinguishes saved state from later changes. Later user corrections and original execution evidence can supersede saved facts; omission from a delta leaves checkpoint items intact. `requestHistoryPosition` and `compactionSnapshot` mark request boundaries. `eventsAfterDeltaInput` locates later events for optional investigation. These fields describe provenance; the agent decides what requires verification. Tool calls retain matching results, and complete source entries remain in the session log.
 
 Read known entry IDs with `history_read`. Locate evidence by browsing windows and entries or by searching a known phrase, then read the returned IDs. Retrieve the evidence needed for the next action.
 
 ## Reminders and native boundaries
 
-Ledger Context measures new work from the active checkpoint request position, or from the current window start when no checkpoint exists. The volume counter covers ordinary user messages, assistant work, and ordinary tool interactions. Request capacity also includes checkpoint, history-tool, context-budget, and reminder maintenance. The volume reminder interval is 10% of the current model's context window, rounded down to at least one token. Each new interval queues one notice; a large result crossing several intervals produces one notice for the highest crossed mark. Delivered marks survive reload, and a model change recalculates the interval while preserving already-notified progress. A successful checkpoint resets the volume origin. `LEDGER_CONTEXT_TAIL_TOKENS` controls retained history independently.
+Ledger Context measures new work from the latest agent checkpoint request position, or from the branch beginning when no checkpoint exists. The volume counter covers ordinary user messages, assistant work, and ordinary tool interactions. Request capacity also includes checkpoint, history-tool, context-budget, and reminder maintenance. The volume reminder interval is 10% of the current model's context window, rounded down to at least one token. Each new interval queues one notice; a large result crossing several intervals produces one notice for the highest crossed mark. Delivered marks survive reload and compaction, and a model change recalculates the interval while preserving already-notified progress. An agent checkpoint resets the volume origin; delta updates preserve it. `LEDGER_CONTEXT_TAIL_TOKENS` controls retained history independently.
 
 Reminders are triggered by accumulated work volume or budget pressure. After a tool batch, they use pi's native steering; when a run has already ended, pending reminders wait for the next normal user request. Pending reasons are combined into one notice and deduplicated separately. Ordinary work continues while reminders are delivered.
 
@@ -88,7 +93,7 @@ The history query tools share a structured `filter`. Fields combine with AND, ar
 
 | Filter | Meaning |
 | --- | --- |
-| `kinds`, `excludeKinds` | Select or exclude `user_input`, `assistant_text`, `tool_call`, `tool_result`, `checkpoint`, and `metadata` parts. Omission includes all kinds. |
+| `kinds`, `excludeKinds` | Select or exclude `user_input`, `assistant_text`, `tool_call`, `tool_result`, `checkpoint`, `compaction_delta`, and `metadata` parts. Omission includes all kinds. |
 | `toolNames` | Exact tool names; selects matching invocations and results. |
 | `statuses` | Logged entry status: `received`, `requested`, `completed`, `failed`, `saved`, `committed`, or `metadata`. |
 | `windowIds` | Committed window IDs or the initial window ID. |
@@ -100,13 +105,16 @@ The history query tools share a structured `filter`. Fields combine with AND, ar
 
 Item lists and searches return `items`, `totalMatches`, `returnedCount`, `snapshotThrough`, and `nextCursor`. `order` is `newest` by default and also accepts `oldest`. Version 4 cursors bind the branch snapshot, tool, filters, ordering, and match options. Continue with the same selection arguments; `limit`, `maxChars`, and `projection` may change between pages. Later activity leaves that snapshot stable. `limit` and `maxChars` are ceilings within the output budget. `pageEnd` reports `complete`, `limit`, or `output_budget`; a preview's truncation marker directs a full entry read. Invalid cursors explain continuation and restarting with the current query.
 
-Checkpoint items include the prior parsed checkpoint ID, source window, request history position, and snapshot-relative `active` flag. `fitsCurrentLedgerBudget` checks the checkpoint schema and current ledger budget; full bootstrap capacity is checked at compaction. Older checkpoints remain discoverable when the ledger budget shrinks.
+Checkpoint items include the prior parsed checkpoint ID, source window, request history position, and snapshot-relative `active` flag. The latest checkpoint retains its identity when its budget shrinks; `fitsCurrentLedgerBudget` reports whether it fits. Full recovery capacity is checked at compaction and each request. `compaction_delta` items identify compaction entries that generated a delta, with their base checkpoint, scope, input record and active flag. Reused or stale deltas refer to that original owner.
 
 `history_list_windows` accepts the shared filter, ordering, limit, and cursor. It includes initial and committed windows even when empty. `entryCount` and first/last entry IDs describe native window attribution; `matchedEntryCount`, `kindCounts`, `failedToolResults`, and `imageCount` use the same filter as item listing. Tool-call counts count invocations; other kinds count entries. Latest user previews quote matching inputs. Checkpoint counts, excerpts, and latest input-record provenance describe snapshots grouped by original source window independently of the filter. Preview truncation flags distinguish complete wording from excerpts. Continue with the same filter/order and an adjustable `limit`; `returnedCount` and `pageEnd` describe the page. Successful history results obey `LEDGER_CONTEXT_READ_TOKENS`.
+
+Windows separately expose `deltaStatus`, `deltaActive`, the owning compaction ID, base checkpoint, preview and `deltaInputRecord`. Checkpoint counts include agent-authored checkpoints. A window's committed delta status remains historical when a newer checkpoint becomes active.
 
 ```ts
 history_search({ query: "timeout", filter: { kinds: ["tool_result"], toolNames: ["bash"], statuses: ["failed"] }, projection: "text" });
 history_list_items({ filter: { kinds: ["checkpoint"] }, limit: 5 });
+history_list_items({ filter: { kinds: ["compaction_delta"] }, limit: 5 });
 history_read({ entryId: "result-id", view: "exchange" });
 ```
 
@@ -132,13 +140,14 @@ For `openai-responses`, outgoing tool images are attached as user content after 
 
 ## Configuration and budgets
 
-All seven extension settings use the `LEDGER_CONTEXT_` namespace. Every configured value is a positive integer. `LEDGER_CONTEXT_URGENT_TOKENS` is smaller than `LEDGER_CONTEXT_REMINDER_TOKENS`.
+All extension settings use the `LEDGER_CONTEXT_` namespace. Every configured value is a positive integer. `LEDGER_CONTEXT_URGENT_TOKENS` is smaller than `LEDGER_CONTEXT_REMINDER_TOKENS`.
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `LEDGER_CONTEXT_REMINDER_TOKENS` | `max(2, floor(min(window × 0.20, 32768)))` | Soft reminder lead time before the effective boundary; the used-token trigger is `B - lead time` |
 | `LEDGER_CONTEXT_URGENT_TOKENS` | `max(1, min(default soft lead time − 1, floor(min(window × 0.10, 16384))))` | Urgent reminder lead time before the effective boundary; the used-token trigger is `B - lead time` |
-| `LEDGER_CONTEXT_LEDGER_TOKENS` | `4096` | Estimated token limit for a saved ledger |
+| `LEDGER_CONTEXT_LEDGER_TOKENS` | `4096` | Estimated token limit for an agent checkpoint |
+| `LEDGER_CONTEXT_DELTA_TOKENS` | `2048` | Estimated token limit for a cumulative compaction delta |
 | `LEDGER_CONTEXT_TASK_TOKENS` | `max(1, floor(window × 0.05))` | Estimated token limit for task and request recovery text |
 | `LEDGER_CONTEXT_TAIL_TOKENS` | `max(1, floor(window × 0.05))` | Estimated token limit for recent interaction display |
 | `LEDGER_CONTEXT_READ_TOKENS` | `2048` | Total estimated output for one history query or read; image reads include source metadata, the note, and the image estimate |
@@ -146,13 +155,14 @@ All seven extension settings use the `LEDGER_CONTEXT_` namespace. Every configur
 
 Each request budget includes the system prompt, active tool schemas and prompt guidelines, model metadata, selected messages and recovery content, and output reserve. Mandatory active tool protocol and fresh images may exceed the recent-tail limit when the full request fits; optional history stays within its allocation. Image reads also obey the total `LEDGER_CONTEXT_READ_TOKENS` limit.
 
-Ledger input has a `65,536` UTF-8 byte limit and accepts at most `8` active request references. History search text allows up to `8,192` UTF-8 bytes, identifiers up to `1,024` UTF-16 code units, and history pages up to `100` results. Text reads accept a maximum length of `65,536` UTF-16 code units. These input limits apply alongside the output budgets.
+Checkpoint and delta text each have a `65,536` UTF-8 byte limit; checkpoints accept at most `8` active request references. History search text allows up to `8,192` UTF-8 bytes, identifiers up to `1,024` UTF-16 code units, and history pages up to `100` results. Text reads accept a maximum length of `65,536` UTF-16 code units. These input limits apply alongside the output budgets.
 
 Pi context usage combines the provider's reported usage with estimates for subsequent messages. When provider usage is unknown, Ledger Context estimates the bounded messages, system prompt, active tools, and model metadata sent in the request. Full request capacity adds output reserve separately. Text and image estimates guide capacity decisions; their accuracy depends on the model's token accounting.
 
 ## Recovery states
 
-- Every compaction attempts a ledger refresh; failed refreshes explicitly identify either the restored checkpoint or history-based recovery.
+- Delta state is `generated`, `reused`, `empty`, `stale`, or `unavailable`. Generation failure preserves the checkpoint and earlier matching delta; retained messages and source references support subsequent work.
+- Saved checkpoint and delta text must fit in full. Capacity errors preserve their identity and stop the request or compaction. Restore a sufficient model/budget before asking the main agent to save a smaller checkpoint.
 - Normal compaction cancellation and invalid checkpoint input preserve the previous valid window and checkpoint.
 - A persistent session log failure stops the current run and future saves or compactions. Reopen the persisted file with a fresh public `SessionManager` to resume durable recovery.
 - Fork, tree, resume, reload, new session, and model changes rebuild state from the selected branch. Each branch keeps its own ledger, window records, and pending reminder provenance.

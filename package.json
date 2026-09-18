@@ -1,6 +1,6 @@
 {
   "name": "pi-better-compact",
-  "version": "1.0.1",
+  "version": "2.0.0",
   "type": "module",
   "description": "A pi extension that preserves working state across native context compaction",
   "main": "src/ledger-context.ts",

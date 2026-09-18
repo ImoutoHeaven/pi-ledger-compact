@@ -1,6 +1,6 @@
 # pi Ledger Context 扩展
 
-Ledger Context 将有界的工作账本保存到 pi 会话日志，并在原生上下文压缩时带入确定性的恢复引导（bootstrap）。扩展使用 pi 的公开 `ExtensionAPI` 和 SDK。
+Ledger Context 在 pi 会话日志中保存主 agent 的工作 checkpoint 和独立的累计 compaction delta，通过 pi 的公开 `ExtensionAPI` 和 SDK 为每次模型请求提供当前恢复基线。
 
 ## 运行前提
 
@@ -28,40 +28,45 @@ pi install -l .
 
 ## 检查点与恢复
 
-使用 `checkpoint` 提交完整工作账本，以及可选的当前分支用户请求条目 ID。成功回执包含检查点条目 ID、来源窗口 ID、请求历史位置、账本大小估计、持久化范围和 `awaiting-native-compaction-threshold` 交接状态。
+使用 `checkpoint` 提交当前完整工作状态，以及可选的当前分支用户请求条目 ID。将当前 checkpoint、后续 delta 和近期工作中仍需保留的事实整理进去。成功保存后替换活动基线，旧版本保留在历史中；回执标明条目 ID、来源窗口、请求位置、大小和持久化范围。Pi 控制压缩时机。
 
 账本保持简短，记录目标和状态、约束和决策、已验证的结果及证据、下一步或等待条件、恢复引用，以及适用的可用技能或“无”。细节通过路径和条目 ID 引用，计划与已完成工作分别标明，敏感信息使用脱敏表示。
 
-Checkpoint 元数据使用 schema version 3。`inputCoverage` 是该次 checkpoint 请求实际提供的会话历史材料的不可变记录。自动刷新账本记录 `measurement: "measured"`；主 agent 保存账本记录 `measurement: "unmeasured"`、`source: "agent-context"` 和 `snapshotThrough`，表示这条路径的输入未经精确测量。
+Checkpoint 由主 agent 的 `checkpoint` 工具写入，其提示要求整理当前工作状态。压缩提示要求描述此后的变化：用户更正、决策、执行结果、验证和下一步的变化。生成器接收只读 checkpoint、作为摘要的上一份匹配 delta，以及有界的新证据。连续压缩更新累计 delta，保留 checkpoint 原文。尚无 checkpoint 时，delta 从分支起点开始。
+
+恢复记录使用 schema version 4。从较早的恢复协议切换时，请新建会话。原始日志保持完整；协议不匹配或恢复记录损坏时，恢复过程会明确报错并停止。
+
+`inputCoverage` 是不可变的输入记录。Agent checkpoint 使用 `measurement: "unmeasured"`、`source: "agent-context"`、`snapshotThrough` 和 `recoveryBasis`；后者记录生成它的主请求中投影的 checkpoint/delta ID，没有恢复视图时为 null。Delta 请求使用 `measurement: "measured"` 和 `source: "compaction-delta"`，包含以下字段：
 
 | 字段 | 含义 |
 | --- | --- |
 | `measurement`、`source`、`snapshotThrough` | 测量可用性、生成路径和请求快照末端，所有输入记录均包含这些字段。 |
-| `baseCheckpointEntryId` | 已测量请求实际作为基础输入提供的 checkpoint 账本 ID，或 null。历史结果中的 `previousCheckpointEntryId` 独立表示前一个可解析版本。 |
+| `baseCheckpointEntryId`、`baseDeltaCompactionEntryId` | 实际作为基础输入提供的 checkpoint 和早期生成 delta 的来源 ID，或 null。 |
 | `historyScope` | 已测量请求的历史选择区间：从 `afterEntryId` 之后，到包含 `throughEntryId` 为止；下界为 null 表示从分支起点开始。 |
 | `representation` | `rendered-text-with-image-references`：提供的文字包含图片引用；像素通过独立图像读取获取。 |
-| `fullRanges` | 本次账本请求完整提供了渲染正文的条目范围，包含首尾条目。 |
+| `fullRanges` | 本次 delta 请求完整提供了渲染正文的条目范围，包含首尾条目。 |
 | `partialEntries` | 原始渲染正文的前缀：来源条目 ID、正数 `providedChars` 和更大的 `totalChars`，单位为 UTF-16。 |
-| `projections` | `reference` 或 `checkpoint_summary`，记录来源条目 ID，以及投影文字已提供的长度与总长度，单位为 UTF-16。 |
-| `omittedRanges` | `historyScope` 内本次既未提供原文、也未提供投影的范围，包含首尾条目，并记录条目数。 |
+| `projections` | `reference`、`checkpoint-ledger`、`delta-ledger` 或 `filtered-entry`，记录来源 ID 和投影文字已提供/总 UTF-16 长度。 |
+| `omittedRanges` | `historyScope` 内未选入有界输入的范围，包含首尾条目和条目数。 |
+| `excludedRanges` | 按固定规则排除的 `maintenance` 或 `structural-metadata` 范围；包含实质证据的历史工具结果仍参与选择。 |
 
-已测量记录包含表中的表示方式、基础账本、选择区间及内容字段。任务锚点可以提供该区间之前的条目；最终任务锚点、历史选择和基础账本一起接受测量。后续阅读和保存保留之前的记录原样，每份生成的 checkpoint 独立描述自己的请求。输入记录描述实际提供的材料，任务相关性、理解和执行核验由 agent 在正常工作中结合证据判断。
+Delta 的 `scope` 表示累计目标区间，输入记录的 `historyScope` 表示本次考虑的新历史区间。任务锚点可以位于该区间之前。旧 delta 正文记录为摘要投影，其原始来源继续保留各自早期的输入记录。任务相关性、理解和核验由 agent 在正常工作中结合证据判断。
 
-自动刷新输入中的 checkpoint 历史条目使用账本正文、简短的输入记录来源信息和原始条目引用。基础账本显式提供并记录为 checkpoint 摘要投影，其 checkpoint 条目从增量历史选择中跳过。其他历史记录保留各自的文字，包括其中对早期账本的引用。完整输入记录通过显式 `history_read` 调用读取。
+生成输入显式提供基础 checkpoint 和上一份 delta。完整 compaction 包和输入清单保留在日志中，使连续生成的输入保持有界。混有维护工具调用的 assistant 消息使用过滤投影；普通证据保留自身的渲染内容，包括其中的引文。
 
-Checkpoint 回执、条目列表和恢复引导展示简短的 `inputRecord` 来源信息；窗口通过 `checkpointInputRecord` 展示来自该窗口的最新 checkpoint 输入来源。通过 `history_read` 读取 checkpoint，并跟随 `nextRead` 获取完整输入记录和可选的来源浏览调用。这些调用使用适当的历史过滤器与偏移，定位未选入范围、原文未提供的后缀以及投影来源。Agent 根据当前任务选择所需证据。
+回执、列表和恢复视图展示简短的 `inputRecord` 来源信息。通过 `history_read` 读取 checkpoint 或承载 delta 的 compaction 条目，并跟随 `nextRead` 获取完整细节。生成的 delta 记录提供可选的来源浏览调用，定位未选入范围、部分原文和投影来源。Agent 根据当前任务选择证据。
 
-恢复引导标出上一个检查点、最新用户请求和最新已完成的助手回答。`requestHistoryPosition` 记录生成检查点的模型请求开始时的日志位置，`pendingHistoryRange` 标出此后的事件。使用这些位置定位证据，再结合保留的正文或 `history_read` 核对账本反映的内容，并在继续执行有副作用的操作前验证执行事实。
+压缩后，每次主 agent 请求将最新 checkpoint 及其匹配 delta 投影到本扩展的恢复摘要中。新 checkpoint 立即成为基线，早期 checkpoint/delta 版本继续保留在历史中。持久化 compaction 包及其有界 task/tail 材料保持原样；投影前根据当前分支核对恢复记录归属。
 
-保存检查点后，当前运行继续执行。pi 控制压缩时机。每次自动压缩和手动 `/compact [instructions]` 都尝试使用当前模型、宿主认证、上一个可用账本、最新任务及后续有界历史更新账本。暂时性网络或服务错误、限流，以及空输出、截断、超预算或校验失败，共享最多三次生成尝试，并使用可取消的退避等待。认证、请求格式和账户额度错误直接进入恢复流程。每次尝试持续等待响应或错误，期间可由用户取消。有效结果保存一次为检查点并用于恢复。生成失败时，恢复上一个可用检查点，同时明确提醒账本可能过期，并提供恢复引用。该检查点不可用或超过当前账本预算时，恢复引导明确要求从会话历史恢复状态。用户取消会取消压缩；检查点写入失败时停止恢复，需重新打开持久会话。
+Delta 使用当前模型和宿主认证生成。暂时性错误和无效输出共享最多三次尝试，并使用可取消的退避等待；认证、请求格式和账户额度错误直接进入恢复流程。每次尝试等待响应或错误，期间可由用户取消。没有新增合格材料或 custom instructions 时，压缩复用匹配 delta 或记录 empty 状态。新 delta 随 pi compaction 条目提交后生效。
 
-恢复引导携带最新账本、当前任务和最新用户措辞、窗口元数据、有界近期交互、执行状态及直接历史引用。助手工具调用与每一个匹配的工具结果保持配对。持久会话将完整条目保存在 pi 会话日志中作为证据来源，内存会话在当前进程中保留这些条目。
+恢复视图区分保存的状态与后续变化。后续用户更正和原始执行证据可以修正旧事实；delta 没提及某项时，checkpoint 中的该项仍然保留。`requestHistoryPosition` 和 `compactionSnapshot` 标明请求边界，`eventsAfterDeltaInput` 为按需调查定位后续事件。这些字段描述来源，agent 决定需要核验什么。工具调用保留匹配结果，完整来源条目保留在会话日志中。
 
 已知条目 ID 时使用 `history_read`。需要定位证据时，浏览窗口和条目，或按已知关键词搜索，再读取返回的 ID。检索范围以支持下一步操作所需的证据为准。
 
 ## 提醒与原生边界
 
-Ledger Context 从活动检查点的请求位置统计新增工作量；窗口没有检查点时从当前窗口起点统计。工作量统计覆盖普通用户消息、助手工作和普通工具交互。请求容量同时包含检查点、历史工具、容量查询和提醒等维护活动。体积提醒的间隔为当前模型上下文窗口的 10%，向下取整且至少为一个 token。每跨过一个新区间排队一条提醒；大型结果跨过多个区间时，只按最高到达位置提醒一次。已提醒的位置在重载后保留；模型变化时重新计算间隔，并保留已提醒进度。检查点成功后重置计量起点。`LEDGER_CONTEXT_TAIL_TOKENS` 独立控制历史保留量。
+Ledger Context 从最新 agent checkpoint 的请求位置统计新增工作量；没有 checkpoint 时从分支起点统计。工作量统计覆盖普通用户消息、助手工作和普通工具交互。请求容量同时包含 checkpoint、历史工具、容量查询和提醒等维护活动。体积提醒的间隔为当前模型窗口的 10%，向下取整且至少一个 token。每跨过一个新区间排队一条提醒；大型结果跨过多个区间时按最高位置提醒一次。已提醒的位置跨重载和压缩保留；模型变化时重新计算间隔并保留已提醒进度。主 agent 保存 checkpoint 会重置计量起点，delta 更新保留原起点。`LEDGER_CONTEXT_TAIL_TOKENS` 独立控制历史保留量。
 
 提醒由累计工作量或预算压力触发。工具批次结束后，通过 pi 原生消息插入机制投递；当前运行已经结束时，待处理提醒留到下一次正常用户请求。多个原因合并为一条提醒，各原因分别去重。提醒投递期间，普通工作继续执行。
 
@@ -88,7 +93,7 @@ const ledgerExtension = createLedgerContext({
 
 | 过滤条件 | 含义 |
 | --- | --- |
-| `kinds`、`excludeKinds` | 选择或排除 `user_input`、`assistant_text`、`tool_call`、`tool_result`、`checkpoint`、`metadata` 内容。省略时包含全部种类。 |
+| `kinds`、`excludeKinds` | 选择或排除 `user_input`、`assistant_text`、`tool_call`、`tool_result`、`checkpoint`、`compaction_delta`、`metadata` 内容。省略时包含全部种类。 |
 | `toolNames` | 精确工具名，选择对应调用和结果。 |
 | `statuses` | 日志执行状态：`received`、`requested`、`completed`、`failed`、`saved`、`committed`、`metadata`。 |
 | `windowIds` | 已提交窗口或初始窗口的 ID。 |
@@ -100,13 +105,16 @@ const ledgerExtension = createLedgerContext({
 
 条目列表和搜索结果包含 `items`、`totalMatches`、`returnedCount`、`snapshotThrough` 和 `nextCursor`。`order` 默认 `newest`，也支持 `oldest`。Version 4 游标绑定分支快照、工具、过滤条件、顺序和匹配选项。续页保持相同的选择参数，允许调整 `limit`、`maxChars` 和 `projection`；后续活动保持该快照稳定。`limit` 和 `maxChars` 是输出预算内的上限。`pageEnd` 表示 `complete`、`limit` 或 `output_budget`；预览的截断标记提供完整条目的读取方向。无效游标会说明如何续页，以及如何从当前查询重新开始。
 
-Checkpoint 结果包含前一个可解析版本的 ID、来源窗口、请求历史位置和快照内的 `active` 标记。`fitsCurrentLedgerBudget` 检查格式与当前 ledger 预算，完整 bootstrap 容量在压缩时检查。预算缩小后，旧 checkpoint 仍可被发现。
+Checkpoint 结果包含前一个可解析版本的 ID、来源窗口、请求位置和快照内的 `active` 标记。预算缩小后，最新 checkpoint 保留身份，由 `fitsCurrentLedgerBudget` 报告能否容纳。压缩和每次请求均检查完整恢复容量。`compaction_delta` 结果标明生成 delta 的 compaction 条目、基础 checkpoint、范围、输入记录和活动标记；复用或过期 delta 引用其原始条目。
 
 `history_list_windows` 接受共用过滤条件、顺序、条数和游标，包含初始窗口及条目数为零的已提交窗口。`entryCount` 和首尾条目 ID 描述原生窗口归属；`matchedEntryCount`、`kindCounts`、`failedToolResults`、`imageCount` 使用与条目列表相同的过滤条件。工具调用按调用数统计，其他种类按条目数统计。最新用户预览引用匹配的输入原文；checkpoint 数量、摘录和最新输入记录的来源信息独立于过滤条件，按原始来源窗口组织。预览截断标记区分完整措辞与摘录。续页保持 filter/order，可调整 `limit`；`returnedCount` 和 `pageEnd` 描述本页状态。成功返回的历史结果遵守 `LEDGER_CONTEXT_READ_TOKENS` 预算。
+
+窗口独立展示 `deltaStatus`、`deltaActive`、承载 delta 的 compaction ID、基础 checkpoint、预览和 `deltaInputRecord`。Checkpoint 数量统计主 agent 保存的版本；新 checkpoint 生效后，窗口已提交的 delta 状态继续作为历史信息保留。
 
 ```ts
 history_search({ query: "timeout", filter: { kinds: ["tool_result"], toolNames: ["bash"], statuses: ["failed"] }, projection: "text" });
 history_list_items({ filter: { kinds: ["checkpoint"] }, limit: 5 });
+history_list_items({ filter: { kinds: ["compaction_delta"] }, limit: 5 });
 history_read({ entryId: "result-id", view: "exchange" });
 ```
 
@@ -132,13 +140,14 @@ history_read({ entryId: "result-id", view: "exchange" });
 
 ## 配置与预算
 
-七项扩展配置均使用 `LEDGER_CONTEXT_` 命名空间。所有覆盖值都必须是正整数，且 `LEDGER_CONTEXT_URGENT_TOKENS` 小于 `LEDGER_CONTEXT_REMINDER_TOKENS`。
+扩展配置均使用 `LEDGER_CONTEXT_` 命名空间。所有覆盖值都必须是正整数，且 `LEDGER_CONTEXT_URGENT_TOKENS` 小于 `LEDGER_CONTEXT_REMINDER_TOKENS`。
 
 | 配置项 | 默认值 | 作用 |
 | --- | --- | --- |
 | `LEDGER_CONTEXT_REMINDER_TOKENS` | `max(2, floor(min(window × 0.20, 32768)))` | 柔性提醒在有效边界前的提前量；已用 token 触发值为 `B - 提前量` |
 | `LEDGER_CONTEXT_URGENT_TOKENS` | `max(1, min(默认柔性提醒提前量 − 1, floor(min(window × 0.10, 16384))))` | 紧急提醒在有效边界前的提前量；已用 token 触发值为 `B - 提前量` |
-| `LEDGER_CONTEXT_LEDGER_TOKENS` | `4096` | 已保存账本的估计 token 上限 |
+| `LEDGER_CONTEXT_LEDGER_TOKENS` | `4096` | Agent checkpoint 的估计 token 上限 |
+| `LEDGER_CONTEXT_DELTA_TOKENS` | `2048` | 累计 compaction delta 的估计 token 上限 |
 | `LEDGER_CONTEXT_TASK_TOKENS` | `max(1, floor(window × 0.05))` | 任务和请求恢复文本的估计 token 上限 |
 | `LEDGER_CONTEXT_TAIL_TOKENS` | `max(1, floor(window × 0.05))` | 近期交互显示的估计 token 上限 |
 | `LEDGER_CONTEXT_READ_TOKENS` | `2048` | 单次历史查询或读取的总估计输出上限；图像读取还包含来源元数据、说明文字和图像估计 |
@@ -146,13 +155,14 @@ history_read({ entryId: "result-id", view: "exchange" });
 
 每次请求预算都包含系统提示、活动工具定义及提示指南、模型元数据、选中的消息和恢复内容，以及输出预留。完整请求能够容纳时，当前必需的工具调用与结果、刚读出的图像可以超过近期交互上限；可选历史内容仍受分配额度约束。图像读取同时遵守 `LEDGER_CONTEXT_READ_TOKENS` 总量限制。
 
-账本最多包含 `65,536` 个 UTF-8 字节和 `8` 个活动请求引用。历史搜索文本最多包含 `8,192` 个 UTF-8 字节，标识符最多包含 `1,024` 个 UTF-16 代码单元，每页历史查询最多返回 `100` 项。正文读取接受的最大长度为 `65,536` 个 UTF-16 代码单元。这些输入限制与输出预算共同生效。
+Checkpoint 和 delta 正文各自最多包含 `65,536` 个 UTF-8 字节；checkpoint 最多接受 `8` 个活动请求引用。历史搜索文本最多包含 `8,192` 个 UTF-8 字节，标识符最多包含 `1,024` 个 UTF-16 代码单元，每页历史查询最多返回 `100` 项。正文读取接受的最大长度为 `65,536` 个 UTF-16 代码单元。这些输入限制与输出预算共同生效。
 
 pi 的上下文用量由提供方报告的用量与后续消息的估算量组成。提供方用量未知时，Ledger Context 根据请求中的有界消息、系统提示、活动工具定义和模型元数据估算用量；完整请求容量另计输出预留。文本和图像估算用于容量决策，其精度取决于模型的 token 计量方式。
 
 ## 恢复状态
 
-- 每次压缩都尝试更新账本；更新失败时，明确标识恢复的检查点或从历史恢复的状态。
+- Delta 状态为 `generated`、`reused`、`empty`、`stale` 或 `unavailable`。生成失败时保留 checkpoint 和早期匹配 delta，后续工作通过保留消息和来源引用恢复。
+- 已保存的 checkpoint 和 delta 正文须完整容纳。容量不足时保留其身份并停止请求或压缩；恢复足够的模型窗口或预算后，可让主 agent 保存更小的 checkpoint。
 - 压缩正常取消和无效检查点输入保留上一有效窗口和检查点。
 - 持久会话日志写入失败时，当前运行及后续保存和切窗停止。使用新的公开 `SessionManager` 重新打开持久文件以继续持久恢复。
 - `fork`、`tree`、`resume`、`reload`、新会话和模型切换都沿选中分支重建状态，每条分支保留自己的账本、窗口记录和待处理提醒来源。

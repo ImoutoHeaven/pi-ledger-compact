@@ -26,13 +26,66 @@ import {
 	createAgentSession,
 } from "@earendil-works/pi-coding-agent";
 import { Type, fauxAssistantMessage, fauxProvider, fauxThinking, fauxToolCall, type Context } from "@earendil-works/pi-ai";
-import { CHECKPOINT_ENTRY_TYPE, MAX_HISTORY_IMAGE_BASE64_BYTES, REMINDER_MESSAGE_TYPE, createLedgerContext, type LedgerContextSettingsReader } from "../src/ledger-context.ts";
+import { CHECKPOINT_ENTRY_TYPE, MAX_HISTORY_IMAGE_BASE64_BYTES, REMINDER_MESSAGE_TYPE, createLedgerContext, type LedgerContextSettingsReader, type LedgerCompactionDetails } from "../src/ledger-context.ts";
 
 const TEST_TIMEOUT_MS = 5_000;
 const extensionErrors: ExtensionError[] = [];
 const RED_2X2_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEUlEQVR4nGP4z8DwH4QZYAwAR8oH+WdZbrcAAAAASUVORK5CYII=";
 const BLUE_3X2_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAYAAACddGYaAAAAEElEQVR4nGNgYPj/H4GROACPigv118uacgAAAABJRU5ErkJggg==";
-const UNMEASURED_INPUT_RECORD = { measurement: "unmeasured", source: "agent-context", snapshotThrough: null };
+const UNMEASURED_INPUT_RECORD = { measurement: "unmeasured", source: "agent-context", snapshotThrough: null, recoveryBasis: null };
+
+function generatedDelta(entry: Extract<SessionEntry, { type: "compaction" }>) {
+	const details = entry.details as LedgerCompactionDetails;
+	assert.equal(details.schemaVersion, 4);
+	assert.equal(details.delta.status, "generated");
+	assert.ok(details.delta.status === "generated");
+	return details.delta.record;
+}
+
+test("agent checkpoint ownership survives cumulative deltas and updates the next request", { timeout: TEST_TIMEOUT_MS }, async () => {
+	const { root, faux, ledgerFaux, session, sessionManager } = await createFixture(true, [], 64, { compactionEnabled: false });
+	try {
+		const ledger = "Only staging. Preserve checkpoint-sentinel. Next: verify migration.";
+		faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger })), fauxAssistantMessage("Saved the working state.")]);
+		await session.prompt("Preserve the staging constraint and track the migration.");
+		const checkpoint = checkpointEntries(sessionManager.getBranch()).at(-1)!;
+		const original = structuredClone(checkpoint.data);
+		ledgerFaux.setResponses([fauxAssistantMessage("Migration completed; delta-one-sentinel.")]);
+		await session.compact();
+		const first = latestCompaction(sessionManager.getBranch());
+		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 1);
+		assert.deepEqual(checkpoint.data, original);
+		assert.match(first.summary, /checkpoint-sentinel/);
+		assert.match(first.summary, /delta-one-sentinel/);
+		faux.setResponses([fauxAssistantMessage("Verification finished.")]);
+		await session.prompt("Verify the completed migration.");
+		ledgerFaux.setResponses([(context) => {
+			assert.match(JSON.stringify(context.messages), /delta-one-sentinel/);
+			assert.match(JSON.stringify(context.messages), /checkpoint-sentinel/);
+			return fauxAssistantMessage("Migration and verification completed; delta-two-sentinel.");
+		}]);
+		await session.compact();
+		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 1);
+		const persistedSummary = latestCompaction(sessionManager.getBranch()).summary;
+		faux.setResponses([
+			fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Only staging. Completed and verified; checkpoint-two-sentinel." })),
+			(context) => {
+				const recovery = context.messages.flatMap((message) => message.role === "user" && Array.isArray(message.content) ? message.content.filter((block) => block.type === "text").map((block) => block.text) : []).find((text) => text.includes("# Ledger Context Recovery"))!;
+				assert.ok(recovery);
+				assert.match(recovery, /checkpoint-two-sentinel/);
+				assert.doesNotMatch(recovery, /delta-two-sentinel/);
+				assert.doesNotMatch(recovery, /checkpoint-sentinel/);
+				return fauxAssistantMessage("Using the new working state.");
+			},
+		]);
+		await session.prompt("Save the complete current working state.");
+		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 2);
+		assert.equal(latestCompaction(sessionManager.getBranch()).summary, persistedSummary);
+	} finally {
+		session.dispose();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
 
 function use4kRecoveryBudgets(t: TestContext): void {
 	for (const name of ["LEDGER_CONTEXT_TASK_TOKENS", "LEDGER_CONTEXT_TAIL_TOKENS"]) {
@@ -144,7 +197,7 @@ function conservativeContextTokens(context: Context, session: AgentSession, outp
 function registerFixtureProvider(modelRuntime: ModelRuntime, faux: ReturnType<typeof fauxProvider>) {
 	// Separate scripts for maintenance generation keep ordinary run assertions meaningful.
 	const ledgerFaux = fauxProvider({ provider: faux.provider.id, models: faux.models, tokenSize: { min: 1_024, max: 1_024 } });
-	const providerFor = (context: Context) => context.systemPrompt?.startsWith("Write a recovery ledger for this session.")
+	const providerFor = (context: Context) => context.systemPrompt?.startsWith("Write the cumulative changes since the main agent's checkpoint.")
 		? ledgerFaux.provider : faux.provider;
 	modelRuntime.registerNativeProvider({
 		...faux.provider,
@@ -365,7 +418,7 @@ test("packed package installs and loads through the public pi package manager", 
 		const checkpointTool = session.getAllTools().find((tool) => tool.name === "checkpoint");
 		assert.ok(checkpointTool);
 		const checkpointGuidance = JSON.stringify(checkpointTool.promptGuidelines);
-		for (const phrase of ["important decisions", "goal/status", "constraints/decisions", "verified results", "next step/wait", "artifact/recovery", "suggested skills (or none)", "plans from facts", "redact secrets"]) {
+		for (const phrase of ["important decisions", "current working state", "goal/status", "constraints and decisions", "verification evidence", "next step/wait", "recovery references", "skills (or none)", "complete baseline", "subsequent delta", "plans from facts", "redact secrets"]) {
 			assert.ok(checkpointGuidance.includes(phrase), `checkpoint guidance must include ${phrase}`);
 		}
 		let historySearchResult: Extract<SessionEntry, { type: "message" }> | undefined;
@@ -752,7 +805,7 @@ test("checkpoint and manual compaction use the public SDK seam", { timeout: TEST
 		assert.ok(toolReceipt);
 		const toolReceiptMessage = toolReceipt.message as { content: unknown; details?: unknown };
 		assert.match(JSON.stringify(toolReceiptMessage.content), /persistent session log/);
-		assert.match(JSON.stringify(toolReceiptMessage.content), /native compaction threshold/);
+		assert.match(JSON.stringify(toolReceiptMessage.content), /active recovery baseline; pi controls compaction/);
 		assert.equal((toolReceiptMessage.details as { checkpointEntryId: string }).checkpointEntryId, checkpoint.id);
 		assert.equal((toolReceiptMessage.details as { windowId: string }).windowId, checkpointData.sourceWindowId);
 		assert.equal(faux.state.callCount, 2);
@@ -766,12 +819,12 @@ test("checkpoint and manual compaction use the public SDK seam", { timeout: TEST
 		const compaction = branch.filter((entry) => entry.type === "compaction").at(-1);
 		assert.ok(compaction);
 		assert.ok(branch.some((entry) => entry.id === compaction.firstKeptEntryId));
-		assert.equal((compaction.details as { schemaVersion: number; kind: string }).schemaVersion, 3);
+		assert.equal((compaction.details as { schemaVersion: number; kind: string }).schemaVersion, 4);
 		assert.equal((compaction.details as { schemaVersion: number; kind: string }).kind, "ledger-context");
 		const provenance = compaction.details as {
 			checkpointEntryId: string | null;
 			previousCheckpointEntryId: string | null;
-			requestHistoryPosition: { entryId: string | null; branchDepth: number } | null;
+			snapshotPosition: { entryId: string | null; branchDepth: number };
 			lastUserEntryId: string | null;
 			lastAssistantEntryId: string | null;
 		};
@@ -779,17 +832,17 @@ test("checkpoint and manual compaction use the public SDK seam", { timeout: TEST
 		assert.ok(lastAssistant);
 		assert.equal(provenance.checkpointEntryId, checkpoint.id);
 		assert.equal(provenance.previousCheckpointEntryId, null);
-		assert.equal(provenance.requestHistoryPosition?.entryId, userEntryId);
+		assert.equal(provenance.snapshotPosition.entryId, lastAssistant.id);
 		assert.equal(provenance.lastUserEntryId, userEntryId);
 		assert.equal(provenance.lastAssistantEntryId, lastAssistant.id);
 		assert.match(compaction.summary, /preserve the task across compaction/);
 		assert.match(compaction.summary, /previousCheckpointEntryId: \(none\)/);
-		assert.match(compaction.summary, new RegExp(`requestHistoryPosition: entry=${userEntryId}`));
+		assert.match(compaction.summary, new RegExp(`"requestHistoryPosition":\\{"entryId":"${userEntryId}"`));
 		assert.match(compaction.summary, /Continue the ledger integration task/);
-		const pending = (compaction.details as { pendingHistoryRange: { fromEntryId: string; toEntryId: string } }).pendingHistoryRange;
+		const pending = JSON.parse(compaction.summary.match(/^eventsAfterDeltaInput: (.+)$/m)![1]);
 		assert.equal(pending.fromEntryId, messageEntries(branch).find((entry) => entry.message.role === "assistant" && entry.message.content.some((block) => block.type === "toolCall"))!.id);
 		assert.equal(pending.toEntryId, lastAssistant.id);
-		assert.equal(faux.state.callCount, 2, "manual compaction must not call the model");
+		assert.equal(faux.state.callCount, 2, "manual compaction must not call the working agent");
 		assert.match(readFileSync(sessionManager.getSessionFile()!, "utf8"), /ledger-context\/checkpoint/);
 		const assistantEntry = messageEntries(sessionManager.getBranch()).find((entry) => entry.message.role === "assistant" && entry.message.content.some((block) => block.type === "toolCall"));
 		assert.ok(assistantEntry);
@@ -876,7 +929,6 @@ test("recovery provenance preserves prior checkpoint and direct recovery IDs", {
 			sessionManager.appendMessage(fauxAssistantMessage(`provenance partial ${stopReason}`, { stopReason }));
 		}
 		sessionManager.appendMessage(fauxAssistantMessage(fauxToolCall("ordinary_tool", { value: "provenance tool request" }), { stopReason: "toolUse" }));
-		sessionManager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, { malformed: true });
 
 		await session.compact();
 		const compaction = sessionManager.getBranch().filter((entry) => entry.type === "compaction").at(-1);
@@ -884,13 +936,13 @@ test("recovery provenance preserves prior checkpoint and direct recovery IDs", {
 		const details = compaction.details as {
 			checkpointEntryId: string | null;
 			previousCheckpointEntryId: string | null;
-			requestHistoryPosition: { entryId: string | null; branchDepth: number } | null;
+			snapshotPosition: { entryId: string | null; branchDepth: number };
 			lastUserEntryId: string | null;
 			lastAssistantEntryId: string | null;
 		};
 		assert.equal(details.checkpointEntryId, secondCheckpoint.id);
 		assert.equal(details.previousCheckpointEntryId, firstCheckpoint.id);
-		assert.equal(details.requestHistoryPosition?.entryId, secondUser.id);
+		assert.ok(details.snapshotPosition.branchDepth > (secondCheckpoint.data as { requestHistoryPosition: { branchDepth: number } }).requestHistoryPosition.branchDepth);
 		assert.equal(details.lastUserEntryId, secondUser.id);
 		assert.equal(details.lastAssistantEntryId, secondAnswer.id);
 		assert.match(compaction.summary, new RegExp(`previousCheckpointEntryId: ${firstCheckpoint.id}`));
@@ -977,7 +1029,7 @@ test("native threshold compacts before the next request in the same run", { time
 		ledgerFaux.setResponses([
 			fauxAssistantMessage("native-generated-ledger: Large operations returned; verify evidence before repeating. Skills: none."),
 			(context) => {
-				assert.match(JSON.stringify(context.messages), /Previous ledger.*native-generated-ledger/);
+				assert.match(JSON.stringify(context.messages), /Previous cumulative delta.*native-generated-ledger/);
 				return fauxAssistantMessage("native-refreshed-ledger: Same-run work completed. Skills: none.");
 			},
 		]);
@@ -1029,7 +1081,7 @@ test("native threshold compacts before the next request in the same run", { time
 		assert.match(JSON.stringify(messages), /# Ledger Context Recovery/);
 		assert.match(JSON.stringify(messages), /native-generated-ledger/);
 		assert.equal(ledgerFaux.state.callCount, sessionManager.getBranch().filter((entry) => entry.type === "compaction").length);
-		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 2);
+		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 0);
 		assert.match(latestCompaction(sessionManager.getBranch()).summary, /native-refreshed-ledger/);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
@@ -1061,9 +1113,9 @@ test("long native run recovers twenty windows and reads its earliest operation",
 		},
 	};
 	const fixture = await createFixture(true, [], 1_750, {
-		contextWindow: 4_000,
+		contextWindow: 6_000,
 		maxTokens: 128,
-		reserveTokens: 500,
+		reserveTokens: 2_500,
 		compactionEnabled: true,
 		extraToolNames: ["long_operation"],
 		customTools: [operationTool],
@@ -1528,7 +1580,7 @@ test("malformed persisted reminder details do not suppress a valid level", { tim
 		await session.prompt("deliver the soft reminder");
 		const windowId = `window:${sessionManager.getSessionId()}:initial`;
 		sessionManager.appendCustomMessageEntry(REMINDER_MESSAGE_TYPE, "malformed reminder", false, {
-			schemaVersion: 3,
+			schemaVersion: 4,
 			reminderKey: `${windowId}:urgent`,
 			level: "urgent",
 			windowId,
@@ -2379,7 +2431,7 @@ test("steering queued during native compaction is delivered once in order", { ti
 			(entry): entry is Extract<SessionEntry, { type: "compaction" }> => entry.type === "compaction",
 		);
 		assert.ok(compactions.length >= 1);
-		assert.ok(compactions.every((entry) => entry.fromHook === true && (entry.details as { schemaVersion?: number; kind?: string }).schemaVersion === 3));
+		assert.ok(compactions.every((entry) => entry.fromHook === true && (entry.details as { schemaVersion?: number; kind?: string }).schemaVersion === 4));
 		assert.equal(new Set(compactions.map((entry) => (entry.details as { windowId: string }).windowId)).size, compactions.length);
 		assert.ok(reminderContext);
 		assert.ok(steeringContext);
@@ -2503,10 +2555,10 @@ test("uses pi token estimates and renders every saved ledger within its configur
 		process.env.LEDGER_CONTEXT_LEDGER_TOKENS = "4096";
 		faux.setResponses([fauxAssistantMessage("work after the large checkpoint")]);
 		await session.prompt("Add work after the large checkpoint");
-		await session.compact();
-		const missing = latestCompaction(sessionManager.getBranch());
-		assert.match(missing.summary, /Ledger refresh failed.*no usable checkpoint/);
-		assert.equal((missing.details as { checkpointEntryId: string | null }).checkpointEntryId, null);
+		await assert.rejects(session.compact(), /Compaction cancelled/);
+		assert.equal(latestCompaction(sessionManager.getBranch()).id, compaction.id);
+		assert.equal((checkpointEntries(sessionManager.getBranch()).at(-1)!.data as { ledger: string }).ledger, asciiLedger);
+		process.env.LEDGER_CONTEXT_LEDGER_TOKENS = "8192";
 
 		const cjkLedger = `${"界".repeat(6_000)}CJK-LEDGER-END`;
 		faux.setResponses([
@@ -4192,7 +4244,7 @@ test("history_read nextOffset reconstructs the complete rendered entry", { timeo
 	}
 });
 
-test("every manual compaction refreshes the ledger and failures explicitly restore its checkpoint", { timeout: TEST_TIMEOUT_MS }, async () => {
+test("compaction without an agent checkpoint accumulates deltas and preserves the last delta on failure", { timeout: TEST_TIMEOUT_MS }, async () => {
 	const { root, faux, ledgerFaux, session, sessionManager } = await createFixture(true, [], 64, { contextWindow: 16_000, maxTokens: 512, reserveTokens: 0 });
 	try {
 		faux.setResponses([fauxAssistantMessage("Verified result: operation completed once."), fauxAssistantMessage("Next: inspect the result.")]);
@@ -4212,41 +4264,41 @@ test("every manual compaction refreshes the ledger and failures explicitly resto
 		}]);
 		await session.compact();
 		assert.equal(ledgerFaux.state.callCount, 1);
-		const checkpoint = checkpointEntries(sessionManager.getBranch()).at(-1);
-		assert.ok(checkpoint);
-		assert.equal((checkpoint.data as { ledger: string }).ledger, ledger);
-		assert.equal((latestCompaction(sessionManager.getBranch()).details as { checkpointEntryId: string }).checkpointEntryId, checkpoint.id);
+		const checkpoint = latestCompaction(sessionManager.getBranch());
+		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 0);
+		assert.equal(generatedDelta(checkpoint).ledger, ledger);
+		assert.equal((checkpoint.details as LedgerCompactionDetails).checkpointEntryId, null);
 		assert.match(latestCompaction(sessionManager.getBranch()).summary, /operation completed once/);
 		const reopened = SessionManager.open(sessionManager.getSessionFile()!);
-		assert.equal(checkpointEntries(reopened.getBranch()).at(-1)?.id, checkpoint.id);
-		const position = (checkpoint.data as { requestHistoryPosition: { entryId: string; branchDepth: number } }).requestHistoryPosition;
+		assert.equal(latestCompaction(reopened.getBranch()).id, checkpoint.id);
+		const position = (checkpoint.details as LedgerCompactionDetails).snapshotPosition;
 		const branch = sessionManager.getBranch();
 		assert.equal(branch[position.branchDepth - 1].id, position.entryId);
 		assert.equal(branch.findIndex((entry) => entry.id === checkpoint.id), position.branchDepth);
 		faux.setResponses([fauxAssistantMessage("Verified: final result is now complete.")]);
 		await session.prompt("Continue after the generated checkpoint.");
 		ledgerFaux.setResponses([(context) => {
-			assert.match(JSON.stringify(context.messages), /Previous ledger.*operation completed once/);
+			assert.match(JSON.stringify(context.messages), /Previous cumulative delta.*operation completed once/);
 			assert.match(JSON.stringify(context.messages), /final result is now complete/);
 			assert.match(JSON.stringify(context.messages), /Preserve the final result/);
 			return fauxAssistantMessage("Verified: final result complete. Preserve the original constraints.");
 		}]);
 		await session.compact("Preserve the final result");
 		assert.equal(ledgerFaux.state.callCount, 2);
-		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 2);
+		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 0);
 		assert.match(latestCompaction(sessionManager.getBranch()).summary, /final result complete/);
-		const refreshed = checkpointEntries(sessionManager.getBranch()).at(-1)!;
-		const refreshedPosition = (refreshed.data as { requestHistoryPosition: unknown }).requestHistoryPosition;
+		const refreshed = latestCompaction(sessionManager.getBranch());
+		const refreshedRecord = JSON.stringify(generatedDelta(refreshed));
 		faux.setResponses([fauxAssistantMessage("Later work after the refreshed checkpoint.")]);
 		await session.prompt("Continue again.");
 		ledgerFaux.setResponses(Array.from({ length: 3 }, () => fauxAssistantMessage("", { stopReason: "error", errorMessage: "OpenAI API error (503): service unavailable" })));
 		await session.compact();
 		assert.equal(ledgerFaux.state.callCount, 5);
-		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 2);
+		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 0);
 		const fallback = latestCompaction(sessionManager.getBranch());
-		assert.match(fallback.summary, /Ledger refresh failed.*previous checkpoint.*may be stale/);
-		assert.equal((fallback.details as { checkpointEntryId: string }).checkpointEntryId, refreshed.id);
-		assert.deepEqual((fallback.details as { requestHistoryPosition: unknown }).requestHistoryPosition, refreshedPosition);
+		assert.match(fallback.summary, /Delta update failed/);
+		assert.deepEqual((fallback.details as LedgerCompactionDetails).delta, { status: "stale", sourceCompactionEntryId: refreshed.id });
+		assert.equal(JSON.stringify(generatedDelta(refreshed)), refreshedRecord);
 	} finally {
 		session.dispose();
 		rmSync(root, { recursive: true, force: true });
@@ -4322,8 +4374,8 @@ test("ledger refresh exhausts invalid outputs and transient errors, but stops on
 			await session.compact();
 			assert.equal(ledgerFaux.state.callCount, attempts);
 			assert.equal(checkpointEntries(sessionManager.getBranch()).length, 0);
-			assert.match(latestCompaction(sessionManager.getBranch()).summary, /checkpoint missing/);
-			assert.match(latestCompaction(sessionManager.getBranch()).summary, /Ledger refresh failed.*no usable checkpoint/);
+			assert.match(latestCompaction(sessionManager.getBranch()).summary, /No agent checkpoint/);
+			assert.match(latestCompaction(sessionManager.getBranch()).summary, /Delta update failed/);
 		} finally {
 			session.dispose();
 			rmSync(root, { recursive: true, force: true });
@@ -4352,10 +4404,10 @@ test("ledger refresh shares three attempts across transport and validation failu
 		await session.compact();
 		assert.equal(requests, 3);
 		assert.equal(ledgerFaux.state.callCount, 2);
-		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 1);
+		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 0);
 		assert.match(latestCompaction(sessionManager.getBranch()).summary, /Valid ledger on attempt three/);
-		assert.doesNotMatch(latestCompaction(sessionManager.getBranch()).summary, /Ledger refresh failed/);
-		assert.equal(checkpointEntries(SessionManager.open(sessionManager.getSessionFile()!).getBranch()).length, 1);
+		assert.equal(generatedDelta(latestCompaction(sessionManager.getBranch())).ledger, "Valid ledger on attempt three.");
+		assert.equal(checkpointEntries(SessionManager.open(sessionManager.getSessionFile()!).getBranch()).length, 0);
 	} finally {
 		session.dispose();
 		rmSync(root, { recursive: true, force: true });
@@ -4386,16 +4438,17 @@ test("missing checkpoint generation cancellation and persistence failures cancel
 				}
 				return fauxAssistantMessage("Goal: restore state. Next: verify original evidence. Skills: none.");
 			}]);
-			await assert.rejects(session.compact(), /Compaction cancelled/);
+			await assert.rejects(session.compact(), mode === "write-failure" ? /EISDIR/ : /Compaction cancelled/);
 			assert.equal(ledgerFaux.state.callCount, 1);
-			assert.equal(sessionManager.getBranch().filter((entry) => entry.type === "compaction").length, 0);
 			if (mode !== "write-failure") {
+				assert.equal(sessionManager.getBranch().filter((entry) => entry.type === "compaction").length, 0);
 				assert.equal(checkpointEntries(sessionManager.getBranch()).length, 0);
 				assert.equal(readFileSync(sessionManager.getSessionFile()!, "utf8"), beforeGeneration);
 			} else {
-				await assert.rejects(session.compact(), /Compaction cancelled/);
+				await assert.rejects(session.compact(), /Already compacted|Compaction cancelled/);
 				assert.equal(ledgerFaux.state.callCount, 1);
 				assert.equal(checkpointEntries(SessionManager.open(`${sessionManager.getSessionFile()!}.saved`).getBranch()).length, 0);
+				assert.equal(SessionManager.open(`${sessionManager.getSessionFile()!}.saved`).getBranch().filter((entry) => entry.type === "compaction").length, 0);
 			}
 		} finally {
 			session.dispose();
@@ -4454,7 +4507,7 @@ test("task and tail defaults scale with the model window and allow independent o
 	}
 });
 
-test("compaction details expose missing and stale checkpoint ranges", { timeout: TEST_TIMEOUT_MS }, async () => {
+test("failed delta updates expose chronological ranges without changing the checkpoint", { timeout: TEST_TIMEOUT_MS }, async () => {
 	const missing = await createFixture(true, [], 64, { contextWindow: 32_000, maxTokens: 512, reserveTokens: 0 });
 	try {
 		missing.faux.setResponses([fauxAssistantMessage("missing checkpoint first completion")]);
@@ -4467,16 +4520,16 @@ test("compaction details expose missing and stale checkpoint ranges", { timeout:
 		assert.ok(compaction);
 		const details = compaction.details as {
 			checkpointEntryId: string | null;
-			requestHistoryPosition: unknown;
-			pendingHistoryRange: { fromEntryId: string | null; toEntryId: string | null };
+			snapshotPosition: { entryId: string | null };
 			sourceBranchTip: string | null;
 		};
 		assert.equal(details.checkpointEntryId, null);
-		assert.equal(details.requestHistoryPosition, null);
-		assert.equal(details.pendingHistoryRange.fromEntryId, branchBeforeCompaction[0].id);
-		assert.equal(details.pendingHistoryRange.toEntryId, branchBeforeCompaction.at(-1)!.id);
+		assert.equal(details.snapshotPosition.entryId, branchBeforeCompaction.at(-1)!.id);
+		const range = JSON.parse(compaction.summary.match(/^eventsAfterDeltaInput: (.+)$/m)![1]);
+		assert.equal(range.fromEntryId, branchBeforeCompaction[0].id);
+		assert.equal(range.toEntryId, branchBeforeCompaction.at(-1)!.id);
 		assert.equal(details.sourceBranchTip, branchBeforeCompaction.at(-1)!.id);
-		assert.match(compaction.summary, /checkpoint missing/);
+		assert.match(compaction.summary, /No agent checkpoint/);
 	} finally {
 		rmSync(missing.root, { recursive: true, force: true });
 	}
@@ -4505,11 +4558,11 @@ test("compaction details expose missing and stale checkpoint ranges", { timeout:
 		assert.ok(compaction);
 		const details = compaction.details as {
 			checkpointEntryId: string | null;
-			pendingHistoryRange: { fromEntryId: string | null; toEntryId: string | null };
 		};
 		assert.equal(details.checkpointEntryId, checkpoint.id);
-		assert.equal(details.pendingHistoryRange.fromEntryId, expectedFrom);
-		assert.equal(details.pendingHistoryRange.toEntryId, expectedTo);
+		const range = JSON.parse(compaction.summary.match(/^eventsAfterDeltaInput: (.+)$/m)![1]);
+		assert.equal(range.fromEntryId, expectedFrom);
+		assert.equal(range.toEntryId, expectedTo);
 	} finally {
 		rmSync(stale.root, { recursive: true, force: true });
 	}
@@ -4622,7 +4675,7 @@ test("global recovery pressure drops optional retained units before the latest r
 	const previousReserve = process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS;
 	process.env.LEDGER_CONTEXT_TAIL_TOKENS = "2048";
 	const { root, faux, session, sessionManager } = await createFixture(true, [], 1_000, {
-		contextWindow: 4_096,
+		contextWindow: 8_192,
 		maxTokens: 512,
 		reserveTokens: 0,
 		compactionEnabled: false,
@@ -4644,22 +4697,29 @@ test("global recovery pressure drops optional retained units before the latest r
 			retainedIds[0],
 			8_000,
 			{
-				schemaVersion: 3,
+				schemaVersion: 4,
 				kind: "ledger-context",
 				windowId,
 				sourceWindowId: `window:${sessionManager.getSessionId()}:initial`,
 				checkpointEntryId: null,
-				sourceBranchTip: prefixId,
+					sourceBranchTip: retainedIds.at(-1),
 				firstKeptEntryId: retainedIds[0],
-				requestHistoryPosition: null,
-				pendingHistoryRange: { fromEntryId: prefixId, toEntryId: prefixId },
+					snapshotPosition: { entryId: retainedIds.at(-1), branchDepth: sessionManager.getBranch().length },
+					delta: { status: "empty" },
+					recoveryContext: { task: "global-pressure", tail: "" },
 			},
 			true,
 		);
 		const compaction = sessionManager.getEntry(compactionId);
 		assert.ok(compaction && compaction.type === "compaction");
+		await session.reload();
+		session.agent.state.messages = sessionManager.buildSessionContext().messages;
+		let measuredContext: Context | undefined;
+		faux.setResponses([(context) => { measuredContext = context; return fauxAssistantMessage("measured"); }]);
+		await session.prompt("measure recovery projection");
+		assert.ok(measuredContext);
 		const summaryCost = conservativeContextTokens(
-			{ messages: convertToLlm(sessionEntryToContextMessages(compaction)), systemPrompt: session.systemPrompt } as Context,
+			{ messages: measuredContext.messages.filter((message) => message.role === "user" && JSON.stringify(message.content).includes("# Ledger Context Recovery")), systemPrompt: session.systemPrompt } as Context,
 			session,
 			0,
 		);
@@ -5056,7 +5116,7 @@ test("oversized retained units use a durable non-context tail marker", { timeout
 		if (marker.type !== "custom") throw new Error("missing tail marker");
 		assert.equal(preparations.length, 1);
 		assert.deepEqual(marker.data, {
-			schemaVersion: 3,
+			schemaVersion: 4,
 			sourceEntryId: preparations[0],
 			reason: "tail-budget",
 		});
@@ -5456,6 +5516,8 @@ test("context capacity failure aborts the active provider request", { timeout: T
 });
 
 async function navigationCall(fixture: Awaited<ReturnType<typeof createFixture>>, name: string, args: Record<string, unknown>) {
+	await fixture.session.reload();
+	fixture.session.agent.state.messages = fixture.sessionManager.buildSessionContext().messages;
 	fixture.faux.setResponses([
 		fauxAssistantMessage(fauxToolCall(name, args)),
 		fauxAssistantMessage("navigation complete"),
@@ -5478,7 +5540,7 @@ test("history navigation discovers checkpoint versions independently of recovery
 	const fixture = await createFixture(false, [], 70, { compactionEnabled: false, extraToolNames: ["history_list_items"] });
 	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
 	const { sessionManager } = fixture;
-	const data = { schemaVersion: 3, activeRequestEntryIds: [], sourceWindowId: "metadata-only-key", requestHistoryPosition: { entryId: null, branchDepth: 0 }, inputCoverage: UNMEASURED_INPUT_RECORD };
+	const data = { schemaVersion: 4, kind: "agent-checkpoint", activeRequestEntryIds: [], sourceWindowId: "metadata-only-key", requestHistoryPosition: { entryId: null, branchDepth: 0 }, inputCoverage: UNMEASURED_INPUT_RECORD };
 	const first = sessionManager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, { ...data, ledger: "historic constraint" });
 	const second = sessionManager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, { ...data, ledger: `historic oversized ${"x".repeat(2_000)}` });
 	const listed = await navigationCall(fixture, "history_list_items", { limit: 1, filter: { kinds: ["checkpoint"] } });
@@ -5489,7 +5551,7 @@ test("history navigation discovers checkpoint versions independently of recovery
 	assert.equal(firstPage.items[0].sourceWindowId, "metadata-only-key");
 	assert.equal(firstPage.items[0].fitsCurrentLedgerBudget, false);
 	assert.match(firstPage.items[0].recoveryIssue, /estimated tokens/);
-	assert.equal(firstPage.items[0].active, false);
+	assert.equal(firstPage.items[0].active, true, "the latest checkpoint retains its identity even when its budget shrinks");
 	assert.ok(firstPage.nextCursor);
 	sessionManager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, { ...data, ledger: "historic newer" });
 	const continued = await navigationCall(fixture, "history_list_items", { limit: 1, cursor: firstPage.nextCursor, filter: { kinds: ["checkpoint"] } });
@@ -5544,7 +5606,7 @@ test("history navigation freezes windows and item pages across later compaction"
 	const { sessionManager } = fixture;
 	const initial = `window:${sessionManager.getSessionId()}:initial`;
 	const seed = sessionManager.appendMessage({ role: "user", content: "window seed", timestamp: Date.now() });
-	const details = (windowId: string, sourceWindowId: string) => ({ schemaVersion: 3, kind: "ledger-context", windowId, sourceWindowId, checkpointEntryId: null, sourceBranchTip: seed, firstKeptEntryId: seed, requestHistoryPosition: null, pendingHistoryRange: { fromEntryId: seed, toEntryId: seed } });
+	const details = (windowId: string, sourceWindowId: string) => ({ schemaVersion: 4, kind: "ledger-context", windowId, sourceWindowId, checkpointEntryId: null, sourceBranchTip: sessionManager.getLeafId(), firstKeptEntryId: seed, snapshotPosition: { entryId: seed, branchDepth: sessionManager.getBranch().findIndex((entry) => entry.id === seed) + 1 }, delta: { status: "empty" }, recoveryContext: { task: "window seed", tail: "" } });
 	sessionManager.appendCompaction("first window", seed, 100, details("window:first", initial), true);
 	const before = await navigationCall(fixture, "history_list_windows", { limit: 1 });
 	const page = (before.message as { details: { windows: Array<Record<string, any>>; nextCursor: string } }).details;
@@ -5661,7 +5723,7 @@ test("history window listing shrinks optional previews before rejecting mandator
 	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
 	const initial = `window:${fixture.sessionManager.getSessionId()}:initial`;
 	const checkpointId = fixture.sessionManager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, {
-		schemaVersion: 3, activeRequestEntryIds: [], sourceWindowId: initial,
+		schemaVersion: 4, kind: "agent-checkpoint", activeRequestEntryIds: [], sourceWindowId: initial,
 		requestHistoryPosition: { entryId: null, branchDepth: 0 }, ledger: "A".repeat(256),
 		inputCoverage: UNMEASURED_INPUT_RECORD,
 	});
@@ -5704,9 +5766,9 @@ test("history window active flags match restored state after non-ledger compacti
 	const initial = `window:${sessionManager.getSessionId()}:initial`;
 	const seed = sessionManager.appendMessage({ role: "user", content: "window source", timestamp: Date.now() });
 	sessionManager.appendCompaction("ledger summary", seed, 100, {
-		schemaVersion: 3, kind: "ledger-context", windowId: "window:tracked", sourceWindowId: initial,
+		schemaVersion: 4, kind: "ledger-context", windowId: "window:tracked", sourceWindowId: initial,
 		checkpointEntryId: null, sourceBranchTip: seed, firstKeptEntryId: seed,
-		requestHistoryPosition: null, pendingHistoryRange: { fromEntryId: seed, toEntryId: seed },
+		snapshotPosition: { entryId: seed, branchDepth: sessionManager.getBranch().findIndex((entry) => entry.id === seed) + 1 }, delta: { status: "empty" }, recoveryContext: { task: "window source", tail: "" },
 	}, true);
 	sessionManager.appendCompaction("native summary", seed, 100);
 	await fixture.session.reload();
@@ -5887,10 +5949,6 @@ test("history search block coordinates round-trip through exact UTF-16 reads", a
 	assert.equal((spanning.details as { items: Array<{ match: { spansBlocks: boolean } }> }).items[0].match.spansBlocks, true);
 });
 
-test("extension handlers report no unexpected errors", () => {
-	assert.deepEqual(extensionErrors, []);
-});
-
 test("history read explains view conflicts and supplies exact bounded continuation", async (t) => {
 	const fixture = await createFixture(false, [], 70, { compactionEnabled: false, extraToolNames: ["history_list_items"] });
 	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
@@ -5914,7 +5972,7 @@ test("history read explains view conflicts and supplies exact bounded continuati
 	assert.match(JSON.stringify(first.content), /nextRead/);
 });
 
-test("checkpoint input records remain immutable per request across refresh, manual save, reload and branches", async (t) => {
+test("delta input records remain immutable across cumulative updates, agent saves, reload and branches", async (t) => {
 	const previousTail = process.env.LEDGER_CONTEXT_TAIL_TOKENS;
 	const previousTask = process.env.LEDGER_CONTEXT_TASK_TOKENS;
 	process.env.LEDGER_CONTEXT_TAIL_TOKENS = "512";
@@ -5926,7 +5984,7 @@ test("checkpoint input records remain immutable per request across refresh, manu
 	faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Initial task. Skills: none." })), fauxAssistantMessage("saved")]);
 	await session.prompt("Original task anchor");
 	const base = checkpointEntries(manager.getBranch()).at(-1)!;
-	assert.deepEqual((base.data as any).inputCoverage, { measurement: "unmeasured", source: "agent-context", snapshotThrough: (base.data as any).requestHistoryPosition.entryId });
+	assert.deepEqual((base.data as any).inputCoverage, { ...UNMEASURED_INPUT_RECORD, snapshotThrough: (base.data as any).requestHistoryPosition.entryId });
 	const correction = manager.appendMessage({ role: "user", content: "Important correction must remain discoverable " + "c".repeat(500), timestamp: Date.now() });
 	for (let i = 0; i < 100; i++) manager.appendMessage(fauxAssistantMessage(`large-${i}:` + "x".repeat(8000)));
 	const latest = manager.appendMessage({ role: "user", content: "Latest task anchor", timestamp: Date.now() });
@@ -5936,36 +5994,41 @@ test("checkpoint input records remain immutable per request across refresh, manu
 		return fauxAssistantMessage("Bounded ledger. Source references are available. Skills: none.");
 	}]);
 	await session.compact();
-	const first = checkpointEntries(manager.getBranch()).at(-1)!;
-	const coverage = (first.data as any).inputCoverage;
-	assert.equal(coverage.source, "ledger-refresh");
+	const first = latestCompaction(manager.getBranch());
+	const coverage = generatedDelta(first).inputCoverage;
+	assert.equal(coverage.source, "compaction-delta");
 	assert.equal(coverage.measurement, "measured");
 	assert.equal(coverage.baseCheckpointEntryId, base.id);
 	assert.equal(coverage.snapshotThrough, latest);
 	assert.deepEqual(coverage.historyScope, { afterEntryId: (base.data as any).requestHistoryPosition.entryId, throughEntryId: latest });
-	assert.equal(coverage.projections.find((item: any) => item.entryId === base.id).kind, "checkpoint_summary");
+	assert.equal(coverage.projections.find((item) => item.entryId === base.id)?.kind, "checkpoint-ledger");
 	const contains = (entries: SessionEntry[], ranges: any[], id: string) => ranges.some(range => entries.findIndex(e => e.id === range.fromEntryId) <= entries.findIndex(e => e.id === id) && entries.findIndex(e => e.id === range.toEntryId) >= entries.findIndex(e => e.id === id));
 	assert.ok(contains(manager.getBranch(), coverage.omittedRanges, correction));
 	assert.ok(coverage.partialEntries.length > 0);
 	assert.ok(contains(manager.getBranch(), coverage.fullRanges, latest));
-	assert.match(latestCompaction(manager.getBranch()).summary, /inputRecord:.*measured/);
+	assert.match(latestCompaction(manager.getBranch()).summary, /"inputRecord":.*measured/);
 	assert.doesNotMatch(latestCompaction(manager.getBranch()).summary, /outstandingEntries|unknownEntries|gapRanges/);
-	const firstRecord = JSON.stringify(first.data);
+	const firstRecord = JSON.stringify(first.details);
 	manager.appendMessage({ role: "user", content: "Continue the next window", timestamp: Date.now() });
 	ledgerFaux.setResponses([fauxAssistantMessage("Second ledger uses its own input record. Skills: none.")]);
 	await session.compact();
-	const second = checkpointEntries(manager.getBranch()).at(-1)!;
-	assert.equal((second.data as any).inputCoverage.baseCheckpointEntryId, first.id);
-	assert.equal(contains(manager.getBranch(), (second.data as any).inputCoverage.omittedRanges, correction), false);
-	assert.equal(JSON.stringify(first.data), firstRecord);
+	const second = latestCompaction(manager.getBranch());
+	const secondCoverage = generatedDelta(second).inputCoverage;
+	assert.equal(secondCoverage.baseCheckpointEntryId, base.id);
+	assert.equal(secondCoverage.baseDeltaCompactionEntryId, first.id);
+	assert.equal(secondCoverage.historyScope.afterEntryId, coverage.snapshotThrough);
+	assert.equal(generatedDelta(second).scope.afterEntryId, (base.data as any).requestHistoryPosition.entryId);
+	assert.equal(contains(manager.getBranch(), secondCoverage.omittedRanges, correction), false);
+	assert.equal(JSON.stringify(first.details), firstRecord);
 	await session.reload();
 	faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Agent saved ledger. Skills: none." })), fauxAssistantMessage("saved again")]);
 	await session.prompt("Save current progress");
 	const manual = checkpointEntries(manager.getBranch()).at(-1)!;
-	assert.deepEqual((manual.data as any).inputCoverage, { measurement: "unmeasured", source: "agent-context", snapshotThrough: (manual.data as any).requestHistoryPosition.entryId });
+	const recoveryBasis = { checkpointEntryId: base.id, deltaCompactionEntryId: second.id };
+	assert.deepEqual((manual.data as any).inputCoverage, { ...UNMEASURED_INPUT_RECORD, snapshotThrough: (manual.data as any).requestHistoryPosition.entryId, recoveryBasis });
 	const listed = await inspectHistory(fixture, "history_list_items", { filter: { kinds: ["checkpoint"] }, limit: 1 });
-	assert.equal((listed.details as any).items[0].previousCheckpointEntryId, second.id);
-	assert.deepEqual((listed.details as any).items[0].inputRecord, { measurement: "unmeasured", source: "agent-context" });
+	assert.equal((listed.details as any).items[0].previousCheckpointEntryId, base.id);
+	assert.deepEqual((listed.details as any).items[0].inputRecord, { measurement: "unmeasured", source: "agent-context", recoveryBasis });
 	const read = await inspectHistory(fixture, "history_read", { entryId: first.id, length: 65536 });
 	assert.equal((read.details as any).inputRecord.measurement, "measured");
 	let page = read;
@@ -5994,29 +6057,32 @@ test("checkpoint input records remain immutable per request across refresh, manu
 		return fauxAssistantMessage("Ledger now received correction text. Skills: none.");
 	}]);
 	await session.compact();
-	const repaired = (checkpointEntries(manager.getBranch()).at(-1)!.data as any).inputCoverage;
+	const repaired = generatedDelta(latestCompaction(manager.getBranch())).inputCoverage;
+	assert.equal(repaired.baseDeltaCompactionEntryId, null, "a new checkpoint retires the old delta basis");
 	assert.ok(contains(manager.getBranch(), repaired.fullRanges, correction));
 	assert.equal("outstandingGaps" in repaired, false);
-	assert.equal(JSON.stringify(first.data), firstRecord, "later input and browsing must not rewrite prior omission records");
+	assert.equal(JSON.stringify(first.details), firstRecord, "later input and browsing must not rewrite prior omission records");
 	process.env.LEDGER_CONTEXT_TASK_TOKENS = "128";
 	manager.appendMessage({ role: "user", content: "Continue briefly", timestamp: Date.now() });
 	ledgerFaux.setResponses([fauxAssistantMessage("Carry previously supplied correction. Skills: none.")]);
 	await session.compact();
-	const carried = (checkpointEntries(manager.getBranch()).at(-1)!.data as any).inputCoverage;
-	assert.equal(carried.projections.find((part: any) => part.entryId === correction).kind, "reference");
+	const carriedOwner = latestCompaction(manager.getBranch());
+	const carried = generatedDelta(carriedOwner).inputCoverage;
+	assert.equal(carried.projections.find((part) => part.entryId === correction)?.kind, "reference");
 	assert.equal("outstandingGaps" in carried, false);
 	const savedCoverage = JSON.stringify(carried);
 	manager.appendMessage({ role: "user", content: "Refresh will fail", timestamp: Date.now() });
 	ledgerFaux.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "invalid api key" })]);
 	await session.compact();
-	assert.equal(JSON.stringify((checkpointEntries(manager.getBranch()).at(-1)!.data as any).inputCoverage), savedCoverage);
+	assert.equal(JSON.stringify(generatedDelta(carriedOwner).inputCoverage), savedCoverage);
+	assert.deepEqual((latestCompaction(manager.getBranch()).details as LedgerCompactionDetails).delta, { status: "stale", sourceCompactionEntryId: carriedOwner.id });
 	manager.branch(base.id);
 	await session.reload();
 	manager.appendMessage({ role: "user", content: "Independent branch request", timestamp: Date.now() });
 	manager.appendMessage(fauxAssistantMessage("Independent branch evidence. ".repeat(100)));
 	ledgerFaux.setResponses([fauxAssistantMessage("Independent branch ledger. Skills: none.")]);
 	await session.compact();
-	assert.equal(JSON.stringify((checkpointEntries(manager.getBranch()).at(-1)!.data as any).inputCoverage).includes(correction), false);
+	assert.equal(JSON.stringify(generatedDelta(latestCompaction(manager.getBranch())).inputCoverage).includes(correction), false);
 });
 
 test("coverage records task references, exact text prefixes and image representation", async (t) => {
@@ -6041,13 +6107,13 @@ test("coverage records task references, exact text prefixes and image representa
 	let actualInput = "";
 	ledgerFaux.setResponses([(context) => { actualInput = String(context.messages[0].content); return fauxAssistantMessage("Image references and partial text supplied. Skills: none."); }]);
 	await session.compact();
-	const coverage = (checkpointEntries(manager.getBranch()).at(-1)!.data as any).inputCoverage;
+	const coverage = generatedDelta(latestCompaction(manager.getBranch())).inputCoverage;
 	assert.equal(coverage.representation, "rendered-text-with-image-references");
-	const reference = coverage.projections.find((part: any) => part.entryId === anchor);
+	const reference = coverage.projections.find((part) => part.entryId === anchor)!;
 	assert.equal(reference.kind, "reference");
 	assert.equal(reference.providedChars, reference.totalChars);
 	assert.ok(reference.providedChars > 0);
-	const part = coverage.partialEntries.find((part: any) => part.entryId === long);
+	const part = coverage.partialEntries.find((part) => part.entryId === long)!;
 	const rendered = `[entry ${long}] user\n${longText}`;
 	assert.equal(part.totalChars, rendered.length);
 	assert.ok(part.providedChars > 0 && part.providedChars < part.totalChars);
@@ -6061,7 +6127,7 @@ test("coverage records task references, exact text prefixes and image representa
 	}));
 });
 
-test("ledger refresh projects checkpoint bodies while explicit reads retain complete coverage", async (t) => {
+test("delta updates project the previous delta without recursively copying compaction packets", async (t) => {
 	const previousTail = process.env.LEDGER_CONTEXT_TAIL_TOKENS;
 	process.env.LEDGER_CONTEXT_TAIL_TOKENS = "128";
 	t.after(() => { if (previousTail === undefined) delete process.env.LEDGER_CONTEXT_TAIL_TOKENS; else process.env.LEDGER_CONTEXT_TAIL_TOKENS = previousTail; });
@@ -6073,11 +6139,10 @@ test("ledger refresh projects checkpoint bodies while explicit reads retain comp
 	manager.appendMessage({ role: "user", content: "Save the first window", timestamp: Date.now() });
 	ledgerFaux.setResponses([fauxAssistantMessage("checkpoint-ledger-sentinel: preserve decisions. Skills: none.")]);
 	await session.compact();
-	const first = checkpointEntries(manager.getBranch()).at(-1)!;
-	const original = JSON.stringify(first.data);
-	assert.ok((first.data as any).inputCoverage.partialEntries.length >= 100);
+	const first = latestCompaction(manager.getBranch());
+	const original = JSON.stringify(generatedDelta(first));
+	assert.ok(generatedDelta(first).inputCoverage.partialEntries.length >= 100);
 	assert.ok(original.length > 8000);
-	const invalid = manager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, { schemaVersion: 3, inputCoverage: { payload: "invalid-manifest-sentinel".repeat(500) } });
 	process.env.LEDGER_CONTEXT_TAIL_TOKENS = "4096";
 	manager.appendMessage({ role: "user", content: "Keep fresh-work-sentinel in the next ledger", timestamp: Date.now() });
 	manager.appendMessage(fauxAssistantMessage("Additional recent evidence. ".repeat(30)));
@@ -6087,17 +6152,16 @@ test("ledger refresh projects checkpoint bodies while explicit reads retain comp
 	assert.match(input, /checkpoint-ledger-sentinel/);
 	assert.match(input, /fresh-work-sentinel/);
 	assert.ok(input.includes(`pi://entry/${first.id}`));
-	assert.ok(input.includes(`pi://entry/${invalid}`));
-	assert.doesNotMatch(input, /"fullRanges":\[|"partialEntries":\[|"projections":\[|invalid-manifest-sentinel/);
+	assert.doesNotMatch(input, /"fullRanges":\[|"partialEntries":\[|"projections":\[|# Ledger Context Recovery/);
 	assert.ok(input.length < original.length, "the refresh must not pay for the full manifest");
-	const coverage = (checkpointEntries(manager.getBranch()).at(-1)!.data as any).inputCoverage;
-	for (const id of [first.id, invalid]) {
-		const projection = coverage.projections.find((part: any) => part.entryId === id);
-		assert.equal(projection.kind, "checkpoint_summary");
+	const coverage = generatedDelta(latestCompaction(manager.getBranch())).inputCoverage;
+	for (const id of [first.id]) {
+		const projection = coverage.projections.find((part) => part.entryId === id)!;
+		assert.equal(projection.kind, "delta-ledger");
 		assert.ok(projection.providedChars > 0 && projection.providedChars <= projection.totalChars);
 		assert.equal(coverage.partialEntries.some((part: any) => part.entryId === id), false);
 	}
-	assert.equal(JSON.stringify(first.data), original);
+	assert.equal(JSON.stringify(generatedDelta(first)), original);
 	let params: Record<string, unknown> | null = { entryId: first.id, length: 65536 };
 	let recovered = "";
 	for (let count = 0; params; count++) {
@@ -6112,7 +6176,7 @@ test("ledger refresh projects checkpoint bodies while explicit reads retain comp
 test("unmeasured input records expose no invented coverage and reject mixed formats", async (t) => {
 	const fixture = await createFixture(false, [], 64, { compactionEnabled: false });
 	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
-	const data = { schemaVersion: 3, ledger: "Saved by the agent.", activeRequestEntryIds: [], sourceWindowId: "initial", requestHistoryPosition: { entryId: null, branchDepth: 0 }, inputCoverage: UNMEASURED_INPUT_RECORD };
+	const data = { schemaVersion: 4, kind: "agent-checkpoint", ledger: "Saved by the agent.", activeRequestEntryIds: [], sourceWindowId: "initial", requestHistoryPosition: { entryId: null, branchDepth: 0 }, inputCoverage: UNMEASURED_INPUT_RECORD };
 	for (const invalid of [
 		{ ...data, inputCoverage: { ...UNMEASURED_INPUT_RECORD, omittedRanges: [] } },
 		{ ...data, inputCoverage: { ...UNMEASURED_INPUT_RECORD, baseCheckpointEntryId: "invented-basis" } },
@@ -6125,6 +6189,141 @@ test("unmeasured input records expose no invented coverage and reject mixed form
 	}
 	const entryId = fixture.sessionManager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, data);
 	const read = await inspectHistory(fixture, "history_read", { entryId });
-	assert.deepEqual((read.details as any).inputRecord, { measurement: "unmeasured", source: "agent-context" });
+	assert.deepEqual((read.details as any).inputRecord, { measurement: "unmeasured", source: "agent-context", recoveryBasis: null });
 	assert.doesNotMatch((read.details as any).text, /omittedRanges|Input record browse calls/);
+});
+
+test("unchanged compactions reuse the delta owner and custom instructions request a new cumulative delta", async (t) => {
+	const fixture = await createFixture(false, [], 64, { compactionEnabled: false, extraToolNames: ["history_list_items", "history_list_windows"] });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager: manager, faux, ledgerFaux } = fixture;
+	faux.setResponses([fauxAssistantMessage("Executed once; source is available."), fauxAssistantMessage("Ready for recovery.")]);
+	await session.prompt("Track this operation. " + "source material ".repeat(80));
+	await session.prompt("Prepare the recovery summary. " + "current request ".repeat(80));
+	ledgerFaux.setResponses([fauxAssistantMessage("Operation completed once; first-delta.")]);
+	await session.compact();
+	const first = latestCompaction(manager.getBranch());
+	for (let index = 0; index < 2; index++) {
+		manager.appendCustomMessageEntry(REMINDER_MESSAGE_TYPE, "checkpoint budget reminder ".repeat(20), false);
+		await session.compact();
+		assert.deepEqual((latestCompaction(manager.getBranch()).details as LedgerCompactionDetails).delta, { status: "reused", sourceCompactionEntryId: first.id });
+	}
+	assert.equal(ledgerFaux.state.callCount, 1);
+	assert.equal(checkpointEntries(manager.getBranch()).length, 0);
+	const latest = manager.appendCustomMessageEntry(REMINDER_MESSAGE_TYPE, "checkpoint budget reminder ".repeat(20), false);
+	ledgerFaux.setResponses([(context) => {
+		assert.match(JSON.stringify(context.messages), /first-delta/);
+		assert.match(JSON.stringify(context.messages), /Focus on verification/);
+		assert.doesNotMatch(context.systemPrompt ?? "", /Write a recovery ledger/);
+		return fauxAssistantMessage("Operation completed; verification pending. second-delta.");
+	}]);
+	await session.compact("Focus on verification");
+	const second = latestCompaction(manager.getBranch());
+	const record = generatedDelta(second);
+	assert.equal(record.scope.afterEntryId, null);
+	assert.equal(record.scope.throughEntryId, latest);
+	assert.equal(record.inputCoverage.baseDeltaCompactionEntryId, first.id);
+	assert.equal(record.inputCoverage.historyScope.afterEntryId, generatedDelta(first).scope.throughEntryId);
+	const listed = await inspectHistory(fixture, "history_list_items", { filter: { kinds: ["compaction_delta"] }, order: "oldest" });
+	assert.deepEqual((listed.details as any).items.map((item: any) => item.entryId), [first.id, second.id]);
+	assert.deepEqual((listed.details as any).items.map((item: any) => item.active), [false, true]);
+	const checkpoints = await inspectHistory(fixture, "history_list_items", { filter: { kinds: ["checkpoint"] } });
+	assert.deepEqual((checkpoints.details as any).items, []);
+	const windows = await inspectHistory(fixture, "history_list_windows", { limit: 1 });
+	assert.equal((windows.details as any).windows[0].deltaCompactionEntryId, second.id);
+	assert.equal((windows.details as any).windows[0].checkpointCount, 0);
+});
+
+test("delta selection distinguishes maintenance, filtered messages and recovered history evidence", async (t) => {
+	const fixture = await createFixture(false, [], 64, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager: manager, ledgerFaux } = fixture;
+	manager.appendMessage({ role: "user", content: "Track the changes. " + "source material ".repeat(80), timestamp: Date.now() });
+	const mixed = manager.appendMessage(fauxAssistantMessage([{ type: "text", text: "Observed new decision." }, fauxToolCall("checkpoint", { ledger: "excluded-checkpoint-argument" }, { id: "maintenance-call" })]));
+	const receipt = manager.appendMessage({ role: "toolResult", toolName: "checkpoint", toolCallId: "maintenance-call", isError: false, content: [{ type: "text", text: "excluded-checkpoint-receipt" }], timestamp: Date.now() });
+	manager.appendMessage(fauxAssistantMessage(fauxToolCall("history_read", { entryId: mixed }, { id: "history-evidence" })));
+	const evidence = manager.appendMessage({ role: "toolResult", toolName: "history_read", toolCallId: "history-evidence", isError: false, content: [{ type: "text", text: "Recovered user correction: only staging." }], timestamp: Date.now() });
+	manager.appendMessage({ role: "user", content: "Continue with the corrected target. " + "current request ".repeat(80), timestamp: Date.now() });
+	ledgerFaux.setResponses([(context) => {
+		const text = JSON.stringify(context.messages);
+		assert.match(text, /Observed new decision/);
+		assert.match(text, /Recovered user correction: only staging/);
+		assert.doesNotMatch(text, /excluded-checkpoint/);
+		return fauxAssistantMessage("User corrected the target to staging.");
+	}]);
+	await session.compact();
+	const coverage = generatedDelta(latestCompaction(manager.getBranch())).inputCoverage;
+	assert.equal(coverage.projections.find((part) => part.entryId === mixed)?.kind, "filtered-entry");
+	assert.ok(coverage.excludedRanges.some((range) => range.reason === "maintenance" && range.fromEntryId === receipt && range.toEntryId === receipt));
+	const entries = manager.getBranch();
+	const evidenceIndex = entries.findIndex((entry) => entry.id === evidence);
+	assert.ok(coverage.fullRanges.some((range) => entries.findIndex((entry) => entry.id === range.fromEntryId) <= evidenceIndex && entries.findIndex((entry) => entry.id === range.toEntryId) >= evidenceIndex));
+});
+
+test("older schemas and corrupt recovery sources stop resume instead of falling back", async (t) => {
+	for (const source of ["older-schema", "missing-source", "wrong-kind"] as const) {
+		const fixture = await createFixture(false, [], 64, { compactionEnabled: false });
+		t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+		const { session, sessionManager: manager, faux, ledgerFaux } = fixture;
+		faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Valid initial baseline." })), fauxAssistantMessage("saved")]);
+		await session.prompt("Save working state.");
+		const original = checkpointEntries(manager.getBranch()).at(-1)!;
+		const data = structuredClone(original.data) as Record<string, any>;
+		if (source === "older-schema") data.schemaVersion = 3;
+		if (source === "missing-source") {
+			data.requestHistoryPosition.entryId = "off-branch-source";
+			data.inputCoverage.snapshotThrough = "off-branch-source";
+		}
+		if (source === "wrong-kind") data.kind = "compaction-delta";
+		manager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, data);
+		await session.reload();
+		let called = false;
+		faux.setResponses([() => { called = true; return fauxAssistantMessage("must not receive an older baseline"); }]);
+		const errorsBefore = extensionErrors.length;
+		await session.prompt("Resume the current baseline.");
+		assert.equal(called, false);
+		const errors = extensionErrors.splice(errorsBefore);
+		assert.ok(errors.length > 0);
+		assert.ok(errors.every((error) => /incompatible|invalid schema|not an ancestor/.test(error.error)));
+		await assert.rejects(session.compact(), /Compaction cancelled/);
+		assert.equal(ledgerFaux.state.callCount, 0);
+	}
+});
+
+test("compaction provenance must match its native owner even when corrupted IDs are ancestors", async (t) => {
+	for (const field of ["firstKeptEntryId", "sourceBranchTip"] as const) {
+		const fixture = await createFixture(false, [], 64, { compactionEnabled: false });
+		t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+		const { session, sessionManager: manager, faux, ledgerFaux } = fixture;
+		faux.setResponses([fauxAssistantMessage("First result."), fauxAssistantMessage("Second result.")]);
+		await session.prompt("First task.");
+		await session.prompt("Current task " + "evidence ".repeat(80));
+		ledgerFaux.setResponses([fauxAssistantMessage("Observed subsequent results.")]);
+		await session.compact();
+		const owner = latestCompaction(manager.getBranch());
+		const details = owner.details as LedgerCompactionDetails;
+		const other = manager.getBranch().find((entry) => entry.type === "message" && entry.id !== details[field])!;
+		details[field] = other.id;
+		let called = false;
+		faux.setResponses([() => { called = true; return fauxAssistantMessage("must not use corrupt recovery"); }]);
+		const errorsBefore = extensionErrors.length;
+		await session.prompt("Resume.");
+		assert.equal(called, false);
+		const errors = extensionErrors.splice(errorsBefore);
+		assert.ok(errors.length > 0);
+		assert.ok(errors.every((error) => /provenance disagrees/.test(error.error)));
+	}
+});
+
+test("capacity failures are reported and extension handlers have no unexpected errors", () => {
+	assert.equal(extensionErrors.length, 4);
+	for (const [index, pattern] of [
+		/the active compaction summary uses \d+ tokens, above the \d+-token recovery budget/,
+		/stored checkpoint cannot fit the current budget: ledger exceeds 4096 estimated tokens/,
+		/mandatory context requires \d+ tokens, above the 128-token recovery budget/,
+		/fixed context uses \d+ tokens, output reserve uses 6, and the 64-token window cannot fit recovery metadata/,
+	].entries()) {
+		assert.equal(extensionErrors[index].event, "context");
+		assert.match(extensionErrors[index].error, pattern);
+	}
 });
