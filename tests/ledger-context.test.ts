@@ -2457,6 +2457,11 @@ test("steering queued during native compaction is delivered once in order", { ti
 		assert.ok(resultIndex > assistantIndex);
 		assert.match(JSON.stringify(branchMessages[resultIndex].message), /large-tool-result/);
 		assert.match(JSON.stringify(reminderContext.messages), /Ledger Context urgent budget reminder/);
+		const refreshedNotice = reminderContext.messages.flatMap((message) => message.role === "user" && Array.isArray(message.content)
+			? message.content.flatMap((block) => block.type === "text" && block.text.startsWith("Ledger Context urgent budget reminder.") ? [block.text] : []) : [])[0];
+		assert.ok(refreshedNotice);
+		assert.ok(refreshedNotice.includes(`usage window: ${(compactions[0].details as LedgerCompactionDetails).windowId}`), "pressure that persists after compaction must be reported for the new window");
+		assert.doesNotMatch(refreshedNotice, /stale-volume/);
 		const branchUserMessages = messageEntries(sessionManager.getBranch()).filter((entry) => entry.message.role === "user");
 		assert.equal(branchUserMessages.filter((entry) => JSON.stringify(entry.message).includes("change direction")).length, 1);
 		assert.equal(branchUserMessages.filter((entry) => JSON.stringify(entry.message).includes("follow up direction")).length, 1);
@@ -6315,6 +6320,85 @@ test("compaction provenance must match its native owner even when corrupted IDs 
 		assert.ok(errors.length > 0);
 		assert.ok(errors.every((error) => /provenance disagrees/.test(error.error)));
 	}
+});
+
+test("committed compaction restarts volume reminders beyond retained history across reload", async (t) => {
+	const saved = { tail: process.env.LEDGER_CONTEXT_TAIL_TOKENS, soft: process.env.LEDGER_CONTEXT_REMINDER_TOKENS, urgent: process.env.LEDGER_CONTEXT_URGENT_TOKENS };
+	process.env.LEDGER_CONTEXT_TAIL_TOKENS = "6000";
+	process.env.LEDGER_CONTEXT_REMINDER_TOKENS = "100";
+	process.env.LEDGER_CONTEXT_URGENT_TOKENS = "50";
+	t.after(() => {
+		for (const [name, value] of [["LEDGER_CONTEXT_TAIL_TOKENS", saved.tail], ["LEDGER_CONTEXT_REMINDER_TOKENS", saved.soft], ["LEDGER_CONTEXT_URGENT_TOKENS", saved.urgent]]) {
+			if (value === undefined) delete process.env[name!]; else process.env[name!] = value;
+		}
+	});
+	const fixture = await createFixture(true, [], 5000, { contextWindow: 32000, maxTokens: 512, reserveTokens: 0, compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager: manager, faux, ledgerFaux } = fixture;
+	faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Preserve the task state." })), fauxAssistantMessage("Saved.")]);
+	await session.prompt("Save the baseline.");
+	const checkpoint = checkpointEntries(manager.getBranch()).at(-1)!;
+	const original = JSON.stringify(checkpoint.data);
+	manager.appendMessage({ role: "user", content: "Earlier work " + "x".repeat(30000), timestamp: Date.now() });
+	manager.appendMessage({ role: "user", content: "Retained work " + "r".repeat(16000), timestamp: Date.now() });
+	ledgerFaux.setResponses([fauxAssistantMessage("Subsequent work remains available in history.")]);
+	await session.compact();
+	const compact = latestCompaction(manager.getBranch());
+	const entries = manager.getBranch();
+	const compactIndex = entries.findIndex((entry) => entry.id === compact.id);
+	const retained = entries.slice(entries.findIndex((entry) => entry.id === compact.firstKeptEntryId), compactIndex).flatMap(sessionEntryToContextMessages);
+	assert.ok(retained.reduce((total, message) => total + estimateTokens(message), 0) >= 3200);
+	const notices = () => manager.getBranch().filter((entry) => entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE);
+	for (const reload of [false, true]) {
+		if (reload) await session.reload();
+		faux.setResponses([(context) => { assert.doesNotMatch(JSON.stringify(context.messages), /Ledger Context stale-volume reminder/); return fauxAssistantMessage("Ready."); }]);
+		await session.prompt("Resume.");
+		assert.equal(notices().length, 0, "retained pre-compaction work must not trigger a new volume reminder");
+	}
+	manager.appendMessage({ role: "user", content: "New work " + "n".repeat(13200), timestamp: Date.now() });
+	faux.setResponses([fauxAssistantMessage("Fresh work recorded.")]);
+	await session.prompt("Continue.");
+	assert.equal(notices().length, 1);
+	const notice = notices()[0];
+	assert.equal(notice.type, "custom_message");
+	if (notice.type === "custom_message") {
+		const details = notice.details as { windowId: string; checkpointEntryId: string; fromEntryId: string };
+		assert.equal(details.windowId, (compact.details as LedgerCompactionDetails).windowId);
+		assert.equal(details.checkpointEntryId, checkpoint.id);
+		assert.ok(manager.getBranch().findIndex((entry) => entry.id === details.fromEntryId) > compactIndex);
+	}
+	assert.equal(JSON.stringify(checkpoint.data), original);
+});
+
+test("queued volume and budget reminders are rechecked after native compaction before provider delivery", async (t) => {
+	const soft = process.env.LEDGER_CONTEXT_REMINDER_TOKENS;
+	const urgent = process.env.LEDGER_CONTEXT_URGENT_TOKENS;
+	process.env.LEDGER_CONTEXT_REMINDER_TOKENS = "100";
+	process.env.LEDGER_CONTEXT_URGENT_TOKENS = "50";
+	t.after(() => {
+		if (soft === undefined) delete process.env.LEDGER_CONTEXT_REMINDER_TOKENS; else process.env.LEDGER_CONTEXT_REMINDER_TOKENS = soft;
+		if (urgent === undefined) delete process.env.LEDGER_CONTEXT_URGENT_TOKENS; else process.env.LEDGER_CONTEXT_URGENT_TOKENS = urgent;
+	});
+	const resultText = "Result " + "x".repeat(60000);
+	const largeTool = (pi: ExtensionAPI) => pi.registerTool({ name: "reminder_crossing", label: "Crossing", description: "Produces enough ordinary work to cross the native boundary.", parameters: Type.Object({}), execute: async () => ({ content: [{ type: "text" as const, text: resultText }], details: {} }) });
+	const fixture = await createFixture(true, [largeTool], textTokenEstimate(resultText) + 1, { contextWindow: 32000, maxTokens: 512, reserveTokens: 20000, extraToolNames: ["reminder_crossing"] });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager: manager, faux, ledgerFaux } = fixture;
+	faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Current task baseline." })), fauxAssistantMessage("Saved.")]);
+	await session.prompt("Save current state.");
+	const checkpoint = checkpointEntries(manager.getBranch()).at(-1)!;
+	ledgerFaux.setResponses([fauxAssistantMessage("The tool returned a large result; inspect it as needed.")]);
+	let request: Context | undefined;
+	faux.setResponses([fauxAssistantMessage(fauxToolCall("reminder_crossing", {})), (context) => { request = context; return fauxAssistantMessage("Recovered."); }]);
+	await session.prompt("Run the tool.");
+	assert.ok(request);
+	const compact = latestCompaction(manager.getBranch());
+	const entries = manager.getBranch();
+	const notice = entries.find((entry) => entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE && entry.parentId === compact.id);
+	assert.ok(notice && notice.type === "custom_message", "reproduce a pre-compaction notice persisted after the compaction entry");
+	assert.notEqual((notice.details as { usageWindowId: string }).usageWindowId, (compact.details as LedgerCompactionDetails).windowId);
+	assert.doesNotMatch(JSON.stringify(request.messages), /Ledger Context (stale-volume|soft budget|urgent budget) reminder/);
+	assert.equal(checkpointEntries(entries).at(-1)?.id, checkpoint.id);
 });
 
 test("capacity failures are reported and extension handlers have no unexpected errors", () => {

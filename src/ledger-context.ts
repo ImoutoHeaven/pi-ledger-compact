@@ -516,7 +516,7 @@ interface ReminderUsage {
 	nativeBoundaryMode: "native" | "disabled" | "unknown";
 }
 
-function reminderUsage(pi: ExtensionAPI, ctx: ExtensionContext, settingsReader?: LedgerContextSettingsReader): ReminderUsage | undefined {
+function reminderUsage(pi: ExtensionAPI, ctx: ExtensionContext, settingsReader?: LedgerContextSettingsReader, messages?: ContextMessage[]): ReminderUsage | undefined {
 	const usage = ctx.getContextUsage();
 	const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
 	if (!Number.isFinite(contextWindow) || contextWindow <= 0) return undefined;
@@ -525,7 +525,7 @@ function reminderUsage(pi: ExtensionAPI, ctx: ExtensionContext, settingsReader?:
 	if (usageKnown) {
 		tokens = Math.floor(usage.tokens as number);
 	} else {
-		const visibleMessages = ctx.sessionManager.buildContextEntries().flatMap(sessionEntryToContextMessages);
+		const visibleMessages = messages ?? ctx.sessionManager.buildContextEntries().flatMap(sessionEntryToContextMessages);
 		const boundedProjection = projectContextMessages(visibleMessages, pi, ctx);
 		if (boundedProjection.error) return undefined;
 		tokens = providerMessageTokens(boundedProjection.messages) + requestFixedTokens(pi, ctx);
@@ -697,14 +697,16 @@ function positionStartIndex(entries: SessionEntry[], position: RequestHistoryPos
 }
 
 function volumeOrigin(state: SessionState, entries: SessionEntry[]): { position: RequestHistoryPosition; checkpointEntryId: string | null; windowId: string } {
-	if (state.checkpoint?.data.requestHistoryPosition) {
-		return {
-			position: state.checkpoint.data.requestHistoryPosition,
-			checkpointEntryId: state.checkpoint.entryId,
-			windowId: state.checkpoint.data.sourceWindowId,
-		};
-	}
-	return { position: { entryId: null, branchDepth: 0 }, checkpointEntryId: null, windowId: "branch-start" };
+	const checkpointPosition = state.checkpoint?.data.requestHistoryPosition ?? { entryId: null, branchDepth: 0 };
+	const compaction = latestBranchCompaction(entries);
+	const compactionIndex = compaction ? entries.findIndex((entry) => entry.id === compaction.id) : -1;
+	return {
+		position: compactionIndex >= positionStartIndex(entries, checkpointPosition)
+			? { entryId: compaction!.id, branchDepth: compactionIndex + 1 }
+			: checkpointPosition,
+		checkpointEntryId: state.checkpoint?.entryId ?? null,
+		windowId: compaction ? (isLedgerCompactionDetails(compaction.details) ? compaction.details.windowId : `compaction:${compaction.id}`) : state.activeWindowId,
+	};
 }
 
 function isReminderReason(value: unknown): value is ReminderReason {
@@ -1121,7 +1123,7 @@ function contextMessagesMatch(a: ContextMessage, b: ContextMessage): boolean {
 		return JSON.stringify(aIds) === JSON.stringify(bIds) && (aIds.length > 0 || safeJson(a.content) === safeJson(right.content));
 	}
 	if (a.role === "toolResult") return contextToolResultId(a) === contextToolResultId(b);
-	if (a.role === "custom") return a.customType === right.customType;
+	if (a.role === "custom") return a.customType === right.customType && (a.customType !== REMINDER_MESSAGE_TYPE || (a.details as ReminderDetails | undefined)?.reminderKey === (right.details as ReminderDetails | undefined)?.reminderKey);
 	if (a.role === "compactionSummary") return a.timestamp === right.timestamp && a.tokensBefore === right.tokensBefore;
 	if (a.role === "branchSummary") return a.summary === right.summary;
 	return safeJson((a as any).content) === safeJson(right.content);
@@ -3523,6 +3525,7 @@ function collectReminderReasons(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	settingsReader?: LedgerContextSettingsReader,
+	messages?: ContextMessage[],
 ): { usage: ReminderUsage | undefined; reasons: ReminderReason[] } {
 	const entries = ctx.sessionManager.getBranch();
 	const origin = volumeOrigin(state, entries);
@@ -3542,7 +3545,7 @@ function collectReminderReasons(
 			cause: `new nonmaintenance volume (${metric.tokens} tokens) reached interval ${bucket}; each interval is 10% of the current model window (${interval} tokens)`,
 		});
 	}
-	const usage = reminderUsage(pi, ctx, settingsReader);
+	const usage = reminderUsage(pi, ctx, settingsReader, messages);
 	if (usage) {
 		const thresholds = reminderThresholds(usage.contextWindow);
 		const level: ReminderLevel | undefined =
@@ -3561,6 +3564,37 @@ function collectReminderReasons(
 		}
 	}
 	return { usage, reasons: [...new Map(reasons.map((reason) => [reason.key, reason])).values()] };
+}
+
+function revalidateReminderMessages(messages: ContextMessage[], state: SessionState, pi: ExtensionAPI, ctx: ExtensionContext, settingsReader?: LedgerContextSettingsReader): ContextMessage[] {
+	const isReminder = (message: ContextMessage) => message.role === "custom" && message.customType === REMINDER_MESSAGE_TYPE;
+	if (!messages.some(isReminder)) return messages;
+	const ordinaryMessages = messages.filter((message) => !isReminder(message));
+	try {
+		const { usage, reasons } = collectReminderReasons(state, pi, ctx, settingsReader, ordinaryMessages);
+		if (!usage) return ordinaryMessages;
+		const seen = new Set<ReminderReasonKind>();
+		return messages.slice().reverse().flatMap((message): ContextMessage[] => {
+			if (message.role !== "custom" || message.customType !== REMINDER_MESSAGE_TYPE) return [message];
+			if (!isReminderDetails(message.details)) return [];
+			const details = message.details;
+			const applicable = reasons.filter((reason) => {
+				if (seen.has(reason.kind)) return false;
+				if (reason.kind === "budget") return details.reasonDetails
+					? details.reasonDetails.some((old) => old.kind === "budget")
+					: details.reasonKinds === undefined || details.reasonKinds.includes("budget");
+				return details.reasonDetails?.some((old) => old.kind === "stale-volume" && old.windowId === reason.windowId && old.checkpointEntryId === reason.checkpointEntryId) ?? false;
+			});
+			if (applicable.length === 0) return [];
+			for (const reason of applicable) seen.add(reason.kind);
+			const level = applicable.some((reason) => reason.level === "urgent") ? "urgent" : "soft";
+			// Keep persisted provenance for source matching; only the request's notice text is refreshed.
+			return [{ ...message, content: reminderText(level, state.activeWindowId, usage, applicable, state.activeWindowId) }];
+		}).reverse();
+	} catch (error) {
+		notify(ctx, `Ledger Context reminders disabled: ${error instanceof Error ? error.message : String(error)}`, "error");
+		return ordinaryMessages;
+	}
 }
 
 function volumeReminderMark(key: string): { prefix: string; tokens: number } | undefined {
@@ -3612,10 +3646,9 @@ function deliverReminderReasons(
 	if (state.persistenceUncertain) return;
 	reconcileReminderQueue(state, ctx, false);
 	const collected = collectReminderReasons(state, pi, ctx, settingsReader);
-	const pendingReasons = state.pendingReminderReasons.filter((reason) => reason.kind !== "stale-volume");
-	const reasons = mergeReminderReasons(pendingReasons, collected.reasons).filter((reason) => !reminderReasonKnown(state, reason));
+	const reasons = collected.reasons.filter((reason) => !reminderReasonKnown(state, reason));
 	if (delivery === "defer") {
-		state.pendingReminderReasons = mergeReminderReasons(state.pendingReminderReasons, collected.reasons);
+		state.pendingReminderReasons = collected.reasons;
 		return;
 	}
 	if (reasons.length === 0) return;
@@ -4068,7 +4101,8 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		if (blockIfPersistenceUncertain(state, ctx)) return { messages: [] };
 		reconcileReminderQueue(state, ctx, false);
 		try {
-			const projection = projectContextMessages(event.messages, pi, ctx, state);
+			const messages = revalidateReminderMessages(event.messages, state, pi, ctx, settingsReader);
+			const projection = projectContextMessages(messages, pi, ctx, state);
 			if (projection.error) throw new Error(projection.error);
 			state.currentAgentRequest = { position: requestPositionForContext(entries), recoveryBasis: projection.recoveryBasis ?? null };
 			return { messages: projection.messages };
