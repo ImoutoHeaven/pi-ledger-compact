@@ -4268,6 +4268,7 @@ test("compaction without an agent checkpoint accumulates deltas and preserves th
 		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 0);
 		assert.equal(generatedDelta(checkpoint).ledger, ledger);
 		assert.equal((checkpoint.details as LedgerCompactionDetails).checkpointEntryId, null);
+		assert.match(checkpoint.summary, /^inputRecordDetails: checkpoint=none; delta=this compaction entry$/m);
 		assert.match(latestCompaction(sessionManager.getBranch()).summary, /operation completed once/);
 		const reopened = SessionManager.open(sessionManager.getSessionFile()!);
 		assert.equal(latestCompaction(reopened.getBranch()).id, checkpoint.id);
@@ -4561,6 +4562,7 @@ test("failed delta updates expose chronological ranges without changing the chec
 		};
 		assert.equal(details.checkpointEntryId, checkpoint.id);
 		const range = JSON.parse(compaction.summary.match(/^eventsAfterDeltaInput: (.+)$/m)![1]);
+		assert.match(compaction.summary, new RegExp(`^inputRecordDetails: checkpoint=pi://entry/${checkpoint.id}; delta=none$`, "m"));
 		assert.equal(range.fromEntryId, expectedFrom);
 		assert.equal(range.toEntryId, expectedTo);
 	} finally {

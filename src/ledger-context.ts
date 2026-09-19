@@ -3489,7 +3489,7 @@ function renderBootstrap(
 		"",
 		`agentCheckpoint: ${safeJson(checkpoint ? { entryId: checkpoint.entryId, ledger: checkpoint.data.ledger, requestHistoryPosition: checkpoint.data.requestHistoryPosition, inputRecord: inputRecordSummary(checkpoint.data.inputCoverage) } : null)}`,
 		`postCheckpointDelta: ${safeJson({ status: slot.status, ...(slot.status === "unavailable" ? { reason: slot.reason } : {}), baseCheckpointEntryId: checkpoint?.entryId ?? null, sourceCompactionEntryId: deltaEntryId, ...(delta ? { ledger: delta.ledger, scope: delta.scope, inputRecord: inputRecordSummary(delta.inputCoverage) } : {}) })}`,
-		`inputRecordDetails: checkpoint=${checkpoint ? historyEntryReference(checkpoint.entryId) : "none"}; delta=${deltaEntryId ? historyEntryReference(deltaEntryId) : "this compaction entry"}`,
+		`inputRecordDetails: checkpoint=${checkpoint ? historyEntryReference(checkpoint.entryId) : "none"}; delta=${deltaEntryId ? historyEntryReference(deltaEntryId) : delta ? "this compaction entry" : "none"}`,
 		"",
 		task,
 		"",
