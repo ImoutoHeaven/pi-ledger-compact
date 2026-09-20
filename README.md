@@ -4,7 +4,7 @@ Ledger Context preserves the main agent's working checkpoint and a separate cumu
 
 ## Requirements
 
-- Runtime baseline: `@earendil-works/pi-coding-agent` 0.85.1 with Node.js `>=22.19.0`.
+- Runtime baseline: `@earendil-works/pi-coding-agent` 0.86.0 with Node.js `>=22.19.0`.
 - Keep pi native automatic compaction enabled for automatic window changes. Pi owns the compaction threshold, session log, steering and follow-up queues, overflow retry, and compaction lifecycle.
 - Configure one compaction content extension per session. Ledger Context supplies the compaction summary and recovery bootstrap for each window.
 - All six model tools and manual `/compact` remain available when automatic compaction is disabled.
@@ -78,9 +78,9 @@ The package reads native settings through the public `SettingsManager`, using th
 import { createLedgerContext } from "./src/ledger-context.ts";
 
 const ledgerExtension = createLedgerContext({
-  settingsReader: () => ({
+  settingsReader: (ctx) => ({
     source: "host SettingsManager",
-    compaction: settingsManager.getCompactionSettings(),
+    compaction: settingsManager.getCompactionSettings(ctx.model ?? undefined),
   }),
 });
 ```

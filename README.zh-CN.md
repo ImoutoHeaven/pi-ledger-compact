@@ -4,7 +4,7 @@ Ledger Context 在 pi 会话日志中保存主 agent 的工作 checkpoint 和独
 
 ## 运行前提
 
-- 运行基线为 `@earendil-works/pi-coding-agent` 0.85.1，要求 Node.js `>=22.19.0`。
+- 运行基线为 `@earendil-works/pi-coding-agent` 0.86.0，要求 Node.js `>=22.19.0`。
 - 开启 pi 原生自动压缩以自动切换上下文窗口。pi 管理压缩阈值、会话日志、插入消息（steering）和后续消息（follow-up）队列，以及上下文溢出重试和压缩生命周期。
 - 每个会话配置一个压缩内容扩展。Ledger Context 为每个窗口提供压缩摘要和恢复引导。
 - 关闭原生自动压缩时，六个模型工具和手动 `/compact` 仍然可用。
@@ -78,9 +78,9 @@ Ledger Context 从当前分支最新 agent checkpoint 的请求位置与最近�
 import { createLedgerContext } from "./src/ledger-context.ts";
 
 const ledgerExtension = createLedgerContext({
-  settingsReader: () => ({
+  settingsReader: (ctx) => ({
     source: "host SettingsManager",
-    compaction: settingsManager.getCompactionSettings(),
+    compaction: settingsManager.getCompactionSettings(ctx.model ?? undefined),
   }),
 });
 ```

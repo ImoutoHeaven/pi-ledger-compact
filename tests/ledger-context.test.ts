@@ -25,7 +25,18 @@ import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSession,
 } from "@earendil-works/pi-coding-agent";
-import { Type, fauxAssistantMessage, fauxProvider, fauxThinking, fauxToolCall, type Context } from "@earendil-works/pi-ai";
+import {
+	Type,
+	fauxAssistantMessage,
+	fauxProvider,
+	fauxThinking,
+	fauxToolCall,
+	getCurrentSystemPrompt,
+	getCurrentTools,
+	type Context,
+	type JsonObject,
+	type TranscriptContext,
+} from "@earendil-works/pi-ai";
 import { CHECKPOINT_ENTRY_TYPE, MAX_HISTORY_IMAGE_BASE64_BYTES, REMINDER_MESSAGE_TYPE, createLedgerContext, type LedgerContextSettingsReader, type LedgerCompactionDetails } from "../src/ledger-context.ts";
 
 const TEST_TIMEOUT_MS = 5_000;
@@ -168,7 +179,7 @@ function textTokenEstimate(value: unknown): number {
 	return estimateTokens({ role: "user", content: [{ type: "text", text }], timestamp: 0 });
 }
 
-function conservativeContextTokens(context: Context, session: AgentSession, outputReserve: number): number {
+function conservativeContextTokens(context: Context | TranscriptContext, session: AgentSession, outputReserve: number): number {
 	const activeNames = new Set(session.getActiveToolNames());
 	const activeToolSchemas = session
 		.getAllTools()
@@ -187,7 +198,7 @@ function conservativeContextTokens(context: Context, session: AgentSession, outp
 	};
 	return (
 		convertToLlm(context.messages).reduce((total, message) => total + estimateTokens(message), 0) +
-		textTokenEstimate(context.systemPrompt ?? "") +
+		textTokenEstimate("systemPrompt" in context ? context.systemPrompt ?? "" : getCurrentSystemPrompt(context.messages)) +
 		textTokenEstimate(activeToolSchemas) +
 		textTokenEstimate(modelMetadata) +
 		outputReserve
@@ -197,7 +208,7 @@ function conservativeContextTokens(context: Context, session: AgentSession, outp
 function registerFixtureProvider(modelRuntime: ModelRuntime, faux: ReturnType<typeof fauxProvider>) {
 	// Separate scripts for maintenance generation keep ordinary run assertions meaningful.
 	const ledgerFaux = fauxProvider({ provider: faux.provider.id, models: faux.models, tokenSize: { min: 1_024, max: 1_024 } });
-	const providerFor = (context: Context) => context.systemPrompt?.startsWith("Write the cumulative changes since the main agent's checkpoint.")
+	const providerFor = (context: TranscriptContext) => getCurrentSystemPrompt(context.messages).startsWith("Write the cumulative changes since the main agent's checkpoint.")
 		? ledgerFaux.provider : faux.provider;
 	modelRuntime.registerNativeProvider({
 		...faux.provider,
@@ -259,7 +270,7 @@ async function createFixture(
 	const settingsManager = SettingsManager.create(cwd, agentDir);
 	const settingsReader = options.settingsReader === null
 		? undefined
-		: options.settingsReader ?? (() => ({ source: "fixture SettingsManager", compaction: settingsManager.getCompactionSettings() }));
+		: options.settingsReader ?? ((ctx) => ({ source: "fixture SettingsManager", compaction: settingsManager.getCompactionSettings(ctx.model ?? undefined) }));
 	const ledgerExtension = createLedgerContext({ settingsReader });
 	const resourceLoader = new DefaultResourceLoader({
 		cwd,
@@ -2129,6 +2140,50 @@ test("default settings reader reports malformed native configuration as unknown"
 	}
 });
 
+test("default settings reader resolves the active model's compaction override", { timeout: TEST_TIMEOUT_MS }, async () => {
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const fixture = await createFixture(false, [], 2_000, {
+		contextWindow: 16_000,
+		maxTokens: 512,
+		reserveTokens: 1_000,
+		compactionEnabled: true,
+		settingsReader: null,
+		extraToolNames: ["get_context_remaining"],
+	});
+	const { root, faux, session, agentDir, sessionManager } = fixture;
+	try {
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({
+			compaction: {
+				enabled: true,
+				reserveTokens: 1_000,
+				keepRecentTokens: 2_000,
+				modelOverrides: {
+					"ledger-test/ledger-test-model": { reserveTokens: 6_000 },
+				},
+			},
+		}));
+		faux.setResponses([
+			fauxAssistantMessage(fauxToolCall("get_context_remaining", {})),
+			fauxAssistantMessage("model override inspected"),
+		]);
+		await session.prompt("inspect the active model compaction boundary");
+		const result = messageEntries(sessionManager.getBranch())
+			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "get_context_remaining")
+			.at(-1);
+		assert.ok(result);
+		const details = (result.message as { details: { effectiveBoundaryTokens: number; nativeCompactionMode: string; configSource: string } }).details;
+		assert.equal(details.effectiveBoundaryTokens, 10_000);
+		assert.equal(details.nativeCompactionMode, "native");
+		assert.equal(details.configSource, "settings-manager");
+	} finally {
+		session.dispose();
+		rmSync(root, { recursive: true, force: true });
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+	}
+});
+
 test("known native boundary uses actual provider usage and lead times", { timeout: 60_000 }, async () => {
 	const previousTailLimit = process.env.LEDGER_CONTEXT_TAIL_TOKENS;
 	const previousOutputReserve = process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS;
@@ -3444,7 +3499,7 @@ test("history_search keeps a window-filtered cursor stable across a later compac
 		assert.match(JSON.stringify((mismatched.message as { content: unknown }).content), /history_cursor_invalid/);
 		assert.match(JSON.stringify((mismatched.message as { content: unknown }).content), /Rerun history_search/);
 
-		const assertInvalidCursor = async (parameters: Record<string, unknown>, prompt: string): Promise<void> => {
+		const assertInvalidCursor = async (parameters: JsonObject, prompt: string): Promise<void> => {
 			faux.setResponses([
 				fauxAssistantMessage(fauxToolCall("history_search", parameters)),
 				fauxAssistantMessage("invalid cursor case complete"),
@@ -3849,7 +3904,7 @@ test("history_read image errors remain explicit and source-bearing", { timeout: 
 			{ type: "image" as const, mimeType: "image/png", data: "aGVsbG8=" },
 		];
 		const invalidEntryId = sessionManager.appendMessage({ role: "user", content: invalidContent, timestamp: Date.now() });
-		const runRead = async (params: Record<string, unknown>, prompt: string) => {
+		const runRead = async (params: JsonObject, prompt: string) => {
 			faux.setResponses([
 				fauxAssistantMessage(fauxToolCall("history_read", params)),
 				fauxAssistantMessage("image validation complete"),
@@ -4257,11 +4312,12 @@ test("compaction without an agent checkpoint accumulates deltas and preserves th
 		await session.prompt(`Latest constraint: keep Unicode 原文. ${"材料".repeat(30_000)}`);
 		const ledger = "Goal: preserve the approved operation. Verified: operation completed once. Next: inspect the result. Skills: none. Earlier omitted evidence needs history_read.";
 		ledgerFaux.setResponses([(context, options, _state, model) => {
-			assert.equal(context.tools?.length ?? 0, 0);
+			const systemPrompt = getCurrentSystemPrompt(context.messages);
+			assert.equal(getCurrentTools(context.messages).length, 0);
 			assert.equal(options?.timeoutMs, undefined, "ledger generation must not impose a waiting timeout");
 			assert.equal(options?.maxRetries, 0);
-			assert.match(context.systemPrompt ?? "", /bounded selection/);
-			const input = context.messages.reduce((sum, message) => sum + estimateTokens(message), 0) + textTokenEstimate(context.systemPrompt);
+			assert.match(systemPrompt, /bounded selection/);
+			const input = context.messages.reduce((sum, message) => sum + estimateTokens(message), 0) + textTokenEstimate(systemPrompt);
 			assert.ok(input + (options?.maxTokens ?? 0) <= model.contextWindow);
 			assert.match(JSON.stringify(context.messages), /Latest constraint/);
 			assert.match(JSON.stringify(context.messages), /pi:\/\/entry\//);
@@ -5522,7 +5578,7 @@ test("context capacity failure aborts the active provider request", { timeout: T
 	}
 });
 
-async function navigationCall(fixture: Awaited<ReturnType<typeof createFixture>>, name: string, args: Record<string, unknown>) {
+async function navigationCall(fixture: Awaited<ReturnType<typeof createFixture>>, name: string, args: JsonObject) {
 	await fixture.session.reload();
 	fixture.session.agent.state.messages = fixture.sessionManager.buildSessionContext().messages;
 	fixture.faux.setResponses([
@@ -6112,7 +6168,12 @@ test("coverage records task references, exact text prefixes and image representa
 	const image = manager.appendMessage({ role: "user", content: [{ type: "image", mimeType: "image/png", data: RED_2X2_PNG }], timestamp: Date.now() });
 	manager.appendMessage({ role: "user", content: "Short latest task", timestamp: Date.now() });
 	let actualInput = "";
-	ledgerFaux.setResponses([(context) => { actualInput = String(context.messages[0].content); return fauxAssistantMessage("Image references and partial text supplied. Skills: none."); }]);
+	ledgerFaux.setResponses([(context) => {
+		const input = context.messages.find((message) => message.role === "user");
+		assert.ok(input);
+		actualInput = typeof input.content === "string" ? input.content : input.content.map((block) => block.type === "text" ? block.text : "").join("\n");
+		return fauxAssistantMessage("Image references and partial text supplied. Skills: none.");
+	}]);
 	await session.compact();
 	const coverage = generatedDelta(latestCompaction(manager.getBranch())).inputCoverage;
 	assert.equal(coverage.representation, "rendered-text-with-image-references");
@@ -6154,7 +6215,12 @@ test("delta updates project the previous delta without recursively copying compa
 	manager.appendMessage({ role: "user", content: "Keep fresh-work-sentinel in the next ledger", timestamp: Date.now() });
 	manager.appendMessage(fauxAssistantMessage("Additional recent evidence. ".repeat(30)));
 	let input = "";
-	ledgerFaux.setResponses([(context) => { input = String(context.messages[0].content); return fauxAssistantMessage("New ledger. Skills: none."); }]);
+	ledgerFaux.setResponses([(context) => {
+		const user = context.messages.find((message) => message.role === "user");
+		assert.ok(user);
+		input = typeof user.content === "string" ? user.content : user.content.map((block) => block.type === "text" ? block.text : "").join("\n");
+		return fauxAssistantMessage("New ledger. Skills: none.");
+	}]);
 	await session.compact();
 	assert.match(input, /checkpoint-ledger-sentinel/);
 	assert.match(input, /fresh-work-sentinel/);
@@ -6221,7 +6287,7 @@ test("unchanged compactions reuse the delta owner and custom instructions reques
 	ledgerFaux.setResponses([(context) => {
 		assert.match(JSON.stringify(context.messages), /first-delta/);
 		assert.match(JSON.stringify(context.messages), /Focus on verification/);
-		assert.doesNotMatch(context.systemPrompt ?? "", /Write a recovery ledger/);
+		assert.doesNotMatch(getCurrentSystemPrompt(context.messages), /Write a recovery ledger/);
 		return fauxAssistantMessage("Operation completed; verification pending. second-delta.");
 	}]);
 	await session.compact("Focus on verification");

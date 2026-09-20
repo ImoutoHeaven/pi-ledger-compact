@@ -462,7 +462,7 @@ function defaultSettingsSnapshot(ctx: ExtensionContext): LedgerContextSettingsSn
 		const settingsManager = SettingsManager.create(ctx.cwd, getAgentDir(), { projectTrusted: ctx.isProjectTrusted() });
 		const errors = settingsManager.drainErrors();
 		if (errors.length > 0) return { source: "settings-manager", error: "settings-read-failed" };
-		return { source: "settings-manager", compaction: settingsManager.getCompactionSettings() };
+		return { source: "settings-manager", compaction: settingsManager.getCompactionSettings(ctx.model ?? undefined) };
 	} catch {
 		return { source: "settings-manager", error: "settings-read-failed" };
 	}
