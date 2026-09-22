@@ -4,7 +4,7 @@ Ledger Context 在 pi 会话日志中保存主 agent 的工作 checkpoint 和独
 
 ## 运行前提
 
-- 运行基线为 `@earendil-works/pi-coding-agent` 0.86.0，要求 Node.js `>=22.19.0`。
+- 运行基线为 `@earendil-works/pi-coding-agent` 和 `@earendil-works/pi-ai` 0.87.x，要求 Node.js `>=22.19.0`；开发依赖固定为 0.87.0。
 - 开启 pi 原生自动压缩以自动切换上下文窗口。pi 管理压缩阈值、会话日志、插入消息（steering）和后续消息（follow-up）队列，以及上下文溢出重试和压缩生命周期。
 - 每个会话配置一个压缩内容扩展。Ledger Context 为每个窗口提供压缩摘要和恢复引导。
 - 关闭原生自动压缩时，六个模型工具和手动 `/compact` 仍然可用。
@@ -34,7 +34,11 @@ pi install -l .
 
 Checkpoint 由主 agent 的 `checkpoint` 工具写入，其提示要求整理当前工作状态。压缩提示要求描述此后的变化：用户更正、决策、执行结果、验证和下一步的变化。生成器接收只读 checkpoint、作为摘要的上一份匹配 delta，以及有界的新证据。连续压缩更新累计 delta，保留 checkpoint 原文。尚无 checkpoint 时，delta 从分支起点开始。
 
-恢复记录使用 schema version 4。从较早的恢复协议切换时，请新建会话。原始日志保持完整；协议不匹配或恢复记录损坏时，恢复过程会明确报错并停止。
+恢复记录使用 schema version 5。从较早的恢复协议（含 version 4）切换时，请新建会话。原始日志保持完整；协议不匹配或恢复记录损坏时，恢复过程会明确报错并停止。
+
+Pi 的 `buildSessionProjection()` 为请求投影、保留尾部选择和 delta 自动取材提供有效消息；当前分支的 context edit 控制内容排除与替换。显式任务锚点和最近用户请求跨压缩保留，正文应用分支上最新的编辑。对仍保留的较早证据所作的新替换参与下一次 delta 取材；替换正文引用编辑记录，替换图片的来源引用也归属于该记录。原始条目、checkpoint 和 delta 记录继续作为历史及来源依据。
+
+Context edit 控制后续取材中的来源正文。已有 checkpoint 和 delta 的文字保留当时的记录含义；已总结事实需要更正时，由主 agent 保存修订后的 checkpoint。
 
 `inputCoverage` 是不可变的输入记录。Agent checkpoint 使用 `measurement: "unmeasured"`、`source: "agent-context"`、`snapshotThrough` 和 `recoveryBasis`；后者记录生成它的主请求中投影的 checkpoint/delta ID，没有恢复视图时为 null。Delta 请求使用 `measurement: "measured"` 和 `source: "compaction-delta"`，包含以下字段：
 
@@ -46,9 +50,9 @@ Checkpoint 由主 agent 的 `checkpoint` 工具写入，其提示要求整理当
 | `representation` | `rendered-text-with-image-references`：提供的文字包含图片引用；像素通过独立图像读取获取。 |
 | `fullRanges` | 本次 delta 请求完整提供了渲染正文的条目范围，包含首尾条目。 |
 | `partialEntries` | 原始渲染正文的前缀：来源条目 ID、正数 `providedChars` 和更大的 `totalChars`，单位为 UTF-16。 |
-| `projections` | `reference`、`checkpoint-ledger`、`delta-ledger` 或 `filtered-entry`，记录来源 ID 和投影文字已提供/总 UTF-16 长度。 |
+| `projections` | `reference`、`checkpoint-ledger`、`delta-ledger`、`filtered-entry` 或 `context-edit`，记录来源 ID 和投影文字已提供/总 UTF-16 长度；`context-edit` 另以 `editEntryId` 定位所用替换记录。 |
 | `omittedRanges` | `historyScope` 内未选入有界输入的范围，包含首尾条目和条目数。 |
-| `excludedRanges` | 按固定规则排除的 `maintenance` 或 `structural-metadata` 范围；包含实质证据的历史工具结果仍参与选择。 |
+| `excludedRanges` | 按 `maintenance`、`structural-metadata`、`context-omitted`（显式排除）或 `inactive-context`（位于 Pi 活动投影之外）排除的范围；显式任务锚点及包含实质证据的历史工具结果仍参与选择。 |
 
 Delta 的 `scope` 表示累计目标区间，输入记录的 `historyScope` 表示本次考虑的新历史区间。任务锚点可以位于该区间之前。旧 delta 正文记录为摘要投影，其原始来源继续保留各自早期的输入记录。任务相关性、理解和核验由 agent 在正常工作中结合证据判断。
 
@@ -56,7 +60,7 @@ Delta 的 `scope` 表示累计目标区间，输入记录的 `historyScope` 表�
 
 回执、列表和恢复视图展示简短的 `inputRecord` 来源信息。通过 `history_read` 读取 checkpoint 或承载 delta 的 compaction 条目，并跟随 `nextRead` 获取完整细节。生成的 delta 记录提供可选的来源浏览调用，定位未选入范围、部分原文和投影来源。Agent 根据当前任务选择证据。
 
-压缩后，每次主 agent 请求将最新 checkpoint 及其匹配 delta 投影到本扩展的恢复摘要中。新 checkpoint 立即成为基线，早期 checkpoint/delta 版本继续保留在历史中。持久化 compaction 包及其有界 task/tail 材料保持原样；投影前根据当前分支核对恢复记录归属。
+压缩后，每次主 agent 请求将最新 checkpoint 及其匹配 delta 投影到本扩展的恢复摘要中。新 checkpoint 立即成为基线，早期 checkpoint/delta 版本继续保留在历史中。持久化 compaction 包保存 task/tail 来源 ID 和可选的自定义指令；每次请求按当前分支编辑与预算重新渲染这些来源，包括压缩后追加的编辑，持久化包保持原样。投影前根据当前分支核对恢复记录归属。
 
 Delta 使用当前模型和宿主认证生成。暂时性错误和无效输出共享最多三次尝试，并使用可取消的退避等待；认证、请求格式和账户额度错误直接进入恢复流程。每次尝试等待响应或错误，期间可由用户取消。没有新增合格材料或 custom instructions 时，压缩复用匹配 delta 或记录 empty 状态。新 delta 随 pi compaction 条目提交后生效。
 
@@ -89,7 +93,7 @@ const ledgerExtension = createLedgerContext({
 
 ## 历史恢复
 
-历史查询工具共用结构化 `filter`。不同字段按 AND 组合，同一数组内的值按 OR 组合，`excludeKinds` 优先。查询范围限定在当前会话分支。
+历史查询工具共用结构化 `filter`。不同字段按 AND 组合，同一数组内的值按 OR 组合，`excludeKinds` 优先。查询范围限定在当前会话分支。历史读取返回原始日志正文，包含已压缩或从上下文排除的条目；条目正文列出相关 context edit ID，读取编辑记录可查看目标、替换正文或排除标记。替换图片使用编辑记录 ID 下的引用，并支持 `view: "image"`。
 
 | 过滤条件 | 含义 |
 | --- | --- |
@@ -132,7 +136,7 @@ history_read({ entryId: "result-id", view: "exchange" });
 
 使用 `history_read({ entryId, view: "image", contentIndex })` 加载 `pi://entry/<id>/content/<index>` 对应的原始图片。该视图接受条目 ID 和内容下标，成功时返回一个规范化 `ImageContent`、有界来源说明，以及来源条目、窗口、尺寸、MIME 类型和编码前后大小信息。
 
-图像读取需要支持图像输入的模型和有效图像字节。pi 的公开图像工具将副本规范化至最多 2000×2000 像素，base64 载荷小于 4.5 MiB。图像无效、来源不可用、模型不支持图像或容量不足时，返回带来源引用的明确文本错误。
+图像读取需要支持图像输入的模型和有效图像字节。pi 的公开图像工具按当前模型 `inputLimits.images.resize` 与扩展 2000×2000 像素、4.5 MiB base64 上限中较严格的值规范化副本，同时采用模型的 JPEG 质量设置。来源信息描述交给 Pi 的规范化结果。图像无效、来源不可用、模型不支持图像或容量不足时，返回带来源引用的明确文本错误。
 
 符合请求预算的图像会出现在紧接的下一次实际模型请求中，包括发生原生压缩，或同批包含大型普通工具结果和多个图像读取的情况。每个工具调用均保留匹配结果。无法容纳的图像会在该请求中替换为带来源引用的文本错误。若连包含这些错误和必需上下文的最小请求也无法容纳，运行会因容量错误而停止。后续请求可用元数据引用表示已投递的图像。
 
@@ -157,12 +161,13 @@ history_read({ entryId: "result-id", view: "exchange" });
 
 Checkpoint 和 delta 正文各自最多包含 `65,536` 个 UTF-8 字节；checkpoint 最多接受 `8` 个活动请求引用。历史搜索文本最多包含 `8,192` 个 UTF-8 字节，标识符最多包含 `1,024` 个 UTF-16 代码单元，每页历史查询最多返回 `100` 项。正文读取接受的最大长度为 `65,536` 个 UTF-16 代码单元。这些输入限制与输出预算共同生效。
 
-pi 的上下文用量由提供方报告的用量与后续消息的估算量组成。提供方用量未知时，Ledger Context 根据请求中的有界消息、系统提示、活动工具定义和模型元数据估算用量；完整请求容量另计输出预留。文本和图像估算用于容量决策，其精度取决于模型的 token 计量方式。
+pi 的上下文用量由提供方报告的用量与后续消息的估算量组成。提供方用量未知时，Ledger Context 从会话的有效投影取得对话消息，并将系统提示、活动工具定义和模型元数据各计一次。`context` hook 处理对话消息，Pi 保留系统提示及工具声明；完整请求容量另计输出预留。文本和图像估算用于容量决策，其精度取决于模型的 token 计量方式。
 
 ## 恢复状态
 
 - Delta 状态为 `generated`、`reused`、`empty`、`stale` 或 `unavailable`。生成失败时保留 checkpoint 和早期匹配 delta，后续工作通过保留消息和来源引用恢复。
 - 已保存的 checkpoint 和 delta 正文须完整容纳。容量不足时保留其身份并停止请求或压缩；恢复足够的模型窗口或预算后，可让主 agent 保存更小的 checkpoint。
 - 压缩正常取消和无效检查点输入保留上一有效窗口和检查点。
+- Pi 先准备压缩再调用扩展。可总结内容不足时返回 `Nothing to compact`，带自定义指令的手动 `/compact` 同样遵守此规则；checkpoint、delta 和窗口保持原样，checkpoint 保存仍可独立执行。
 - 持久会话日志写入失败时，当前运行及后续保存和切窗停止。使用新的公开 `SessionManager` 重新打开持久文件以继续持久恢复。
 - `fork`、`tree`、`resume`、`reload`、新会话和模型切换都沿选中分支重建状态，每条分支保留自己的账本、窗口记录和待处理提醒来源。

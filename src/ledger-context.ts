@@ -4,6 +4,7 @@ import { Type, isRetryableAssistantError, type Static } from "@earendil-works/pi
 import {
 	SessionManager,
 	SettingsManager,
+	buildSessionProjection,
 	convertToLlm,
 	convertToPng,
 	estimateTokens,
@@ -11,12 +12,12 @@ import {
 	resizeImage,
 	sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
-import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { ContextEditEntry, ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 
 export const CHECKPOINT_ENTRY_TYPE = "ledger-context/checkpoint";
 export const RAW_TAIL_MARKER_ENTRY_TYPE = "ledger-context/tail-marker";
 export const COMPACTION_DETAILS_KIND = "ledger-context";
-export const LEDGER_SCHEMA_VERSION = 4 as const;
+export const LEDGER_SCHEMA_VERSION = 5 as const;
 export const MAX_ACTIVE_REQUEST_IDS = 8;
 export const LEDGER_BYTE_LIMIT = 65_536;
 export const DEFAULT_LEDGER_TOKEN_LIMIT = 4_096;
@@ -250,7 +251,8 @@ interface CoverageRange {
 
 interface InputProjection {
 	entryId: string;
-	kind: "reference" | "checkpoint-ledger" | "delta-ledger" | "filtered-entry";
+	kind: "reference" | "checkpoint-ledger" | "delta-ledger" | "filtered-entry" | "context-edit";
+	editEntryId?: string;
 	providedChars: number;
 	totalChars: number;
 }
@@ -281,8 +283,59 @@ type DeltaInputCoverage = {
 	partialEntries: Array<{ entryId: string; providedChars: number; totalChars: number }>;
 	projections: InputProjection[];
 	omittedRanges: CoverageRange[];
-	excludedRanges: Array<CoverageRange & { reason: "maintenance" | "structural-metadata" }>;
+	excludedRanges: Array<CoverageRange & { reason: HistoryExclusion }>;
 };
+
+const HISTORY_EXCLUSIONS = ["maintenance", "structural-metadata", "context-omitted", "inactive-context"] as const;
+type HistoryExclusion = typeof HISTORY_EXCLUSIONS[number];
+
+function contextEdits(entries: SessionEntry[]): Map<string, ContextEditEntry> {
+	return new Map(entries.flatMap((entry) => entry.type === "context_edit" ? [[entry.targetId, entry] as const] : []));
+}
+
+/** Apply a branch edit when rendering explicitly selected historical sources. */
+function editedHistoryEntry(entry: SessionEntry, edit: ContextEditEntry | undefined): SessionEntry | undefined {
+	if (edit?.replacement === null) return undefined;
+	if (!edit?.replacement) return entry;
+	const content = edit.replacement.content;
+	if (entry.type === "custom_message") return { ...entry, content } as SessionEntry;
+	if (entry.type !== "message") return entry;
+	const normalized = (entry.message.role === "assistant" || entry.message.role === "toolResult") && typeof content === "string"
+		? [{ type: "text" as const, text: content }] : content;
+	return { ...entry, message: { ...entry.message, content: normalized } } as SessionEntry;
+}
+
+/** Automatic recovery uses Pi's effective content; the raw branch remains the history source. */
+function recoveryHistory(entries: SessionEntry[]) {
+	const projection = buildSessionProjection(entries);
+	const edits = contextEdits(entries);
+	const effective = new Map<string, SessionEntry>();
+	for (const { sourceEntry, messages } of projection.entries) {
+		const message = messages.find((message) => message.role !== "system");
+		if (sourceEntry.type === "message") {
+			if (message) effective.set(sourceEntry.id, { ...sourceEntry, message });
+		} else if (sourceEntry.type === "custom_message") {
+			if (message?.role === "custom") effective.set(sourceEntry.id, { ...sourceEntry, content: message.content });
+		} else if (sourceEntry.type !== "compaction" || message) {
+			effective.set(sourceEntry.id, sourceEntry);
+		}
+	}
+	const excluded = new Map<string, HistoryExclusion>();
+	for (const entry of entries) {
+		if (!effective.has(entry.id)) {
+			excluded.set(entry.id, edits.get(entry.id)?.replacement === null ? "context-omitted" : "inactive-context");
+		}
+	}
+	return { entries: entries.flatMap((entry) => effective.get(entry.id) ?? []), edits, excluded };
+}
+
+function recordContextEditProjection(entry: SessionEntry, edit: ContextEditEntry | undefined, supplied: Map<string, number>, projections: Map<string, InputProjection>): void {
+	const existing = projections.get(entry.id);
+	const providedChars = supplied.get(entry.id) ?? (existing?.kind === "filtered-entry" ? existing.providedChars : undefined);
+	if (!edit?.replacement || providedChars === undefined) return;
+	supplied.delete(entry.id);
+	projections.set(entry.id, { entryId: entry.id, kind: "context-edit", editEntryId: edit.id, providedChars, totalChars: renderEntry(entry, edit.id).length });
+}
 
 type InputCoverage = AgentInputRecord | DeltaInputCoverage;
 
@@ -331,7 +384,7 @@ export interface LedgerCompactionDetails {
 	firstKeptEntryId: string;
 	snapshotPosition: RequestHistoryPosition;
 	delta: DeltaSlot;
-	recoveryContext: { task: string; tail: string };
+	recoveryContext: { taskEntryIds: string[]; tailEntryIds: string[]; customInstructions?: string };
 	previousCheckpointEntryId?: string | null;
 	lastUserEntryId?: string | null;
 	lastAssistantEntryId?: string | null;
@@ -525,7 +578,7 @@ function reminderUsage(pi: ExtensionAPI, ctx: ExtensionContext, settingsReader?:
 	if (usageKnown) {
 		tokens = Math.floor(usage.tokens as number);
 	} else {
-		const visibleMessages = messages ?? ctx.sessionManager.buildContextEntries().flatMap(sessionEntryToContextMessages);
+		const visibleMessages = messages ?? ctx.sessionManager.buildSessionProjection().messages.filter((message) => message.role !== "system");
 		const boundedProjection = projectContextMessages(visibleMessages, pi, ctx);
 		if (boundedProjection.error) return undefined;
 		tokens = providerMessageTokens(boundedProjection.messages) + requestFixedTokens(pi, ctx);
@@ -1036,6 +1089,7 @@ function historyParts(entry: SessionEntry, filter: HistoryFilter): HistoryPart[]
 	}
 	if (!accepts("metadata")) return [];
 	return [{ kind: "metadata", text: (projection) => {
+		if (projection === "text" && entry.type === "context_edit") return projectedHistoryEntry(entry, projection);
 		if (projection === "text" && entry.type === "custom_message" && Array.isArray(entry.content)) {
 			return contentText(entry.content.filter((block: any) => block?.type !== "image"), entry.id);
 		}
@@ -1131,8 +1185,9 @@ function contextMessagesMatch(a: ContextMessage, b: ContextMessage): boolean {
 
 function contextEntryIds(messages: ContextMessage[], ctx: ExtensionContext): Array<string | undefined> {
 	const entries = ctx.sessionManager
-		.buildContextEntries()
-		.flatMap((entry) => sessionEntryToContextMessages(entry).map((message) => ({ message, entryId: entry.id })));
+		.buildSessionProjection().entries
+		.flatMap(({ sourceEntry, messages }) => messages.filter((message) => message.role !== "system")
+			.map((message) => ({ message, entryId: sourceEntry.id })));
 	const ids: Array<string | undefined> = Array.from({ length: messages.length }, () => undefined);
 	let messageIndex = 0;
 	for (const candidate of entries) {
@@ -1296,7 +1351,7 @@ function clippedContextMessages(
 	availableTokens: number,
 	itemTokenLimit: number,
 ): ContextMessage[] {
-	const freshImageEntryIds = latestFreshHistoryImageBatch(ctx.sessionManager.getBranch())?.resultEntryIds ?? new Set<string>();
+	const freshImageEntryIds = latestFreshHistoryImageBatch(recoveryHistory(ctx.sessionManager.getBranch()).entries)?.resultEntryIds ?? new Set<string>();
 	const units = markFreshHistoryImagesByEntryIds(createContextUnits(messages, contextEntryIds(messages, ctx)), freshImageEntryIds);
 	const retainedEntryIds = retainedEntryIdsForCompaction(ctx);
 	const freshIndexes = units
@@ -1580,12 +1635,13 @@ function projectRecoveryMessages(messages: ContextMessage[], entries: SessionEnt
 	};
 }
 
-function renderEntry(entry: SessionEntry): string {
+function renderEntry(entry: SessionEntry, contentEntryId = entry.id): string {
+	const replacementNote = contentEntryId === entry.id ? "" : `[content replacement: ${historyEntryReference(contentEntryId)}]\n`;
 	if (entry.type === "message") {
 		const message = entry.message as MessageLike;
 		const role = message.role ?? "unknown";
-		const body = contentText(message.content, entry.id) || (role === "assistant"
-			? [message.stopReason ? `stopReason: ${message.stopReason}` : "", message.errorMessage].filter(Boolean).join("\n") : "");
+		const body = replacementNote + (contentText(message.content, contentEntryId) || (role === "assistant"
+			? [message.stopReason ? `stopReason: ${message.stopReason}` : "", message.errorMessage].filter(Boolean).join("\n") : ""));
 		if (role === "toolResult") {
 			const error = message.isError ? " error" : "";
 			return `[entry ${entry.id}] ${role}${error} tool=${message.toolName ?? "unknown"} call=${message.toolCallId ?? "unknown"}\n${body}`;
@@ -1599,7 +1655,7 @@ function renderEntry(entry: SessionEntry): string {
 		return `[entry ${entry.id}] compaction firstKept=${entry.firstKeptEntryId}\n${entry.summary}`;
 	}
 	if (entry.type === "custom_message") {
-		return `[entry ${entry.id}] custom-message:${entry.customType}\n${contentText(entry.content, entry.id)}`;
+		return `[entry ${entry.id}] custom-message:${entry.customType}\n${replacementNote}${contentText(entry.content, contentEntryId)}`;
 	}
 	if (entry.type === "branch_summary") {
 		return `[entry ${entry.id}] branch-summary\n${entry.summary}`;
@@ -1616,7 +1672,10 @@ function renderEntry(entry: SessionEntry): string {
 	if (entry.type === "session_info") {
 		return `[entry ${entry.id}] session ${entry.name ?? ""}`;
 	}
-	return "[entry unknown]";
+	if (entry.type === "context_edit") {
+		return `[entry ${entry.id}] context_edit target=${entry.targetId}\n${entry.replacement === null ? "omitted from model context" : contentText(entry.replacement.content, entry.id)}`;
+	}
+	return `[entry ${entry.id}] ${entry.type}\n${safeJson(entry)}`;
 }
 
 function historyRole(entry: SessionEntry): string {
@@ -1646,7 +1705,9 @@ function originalContentArray(entry: SessionEntry): unknown[] | undefined {
 		? (entry.message as MessageLike).content
 		: entry.type === "custom_message"
 			? entry.content
-			: undefined;
+			: entry.type === "context_edit"
+				? entry.replacement?.content
+				: undefined;
 	return Array.isArray(content) ? content : undefined;
 }
 
@@ -1684,6 +1745,10 @@ function historyViewAt(entries: SessionEntry[], ctx: ExtensionContext, index: nu
 	const entry = entries[index];
 	const windowIds = branchWindowIds(entries, ctx);
 	let text = projectedHistoryEntry(entry, projection, contentIndex);
+	const edits = entries.filter((candidate): candidate is ContextEditEntry => candidate.type === "context_edit" && candidate.targetId === entry.id);
+	if (edits.length > 0 && contentIndex === undefined && (projection === "all" || projection === "text")) {
+		text += `\nContext edit history (body above is the original log record):\n${edits.map((edit) => `${historyEntryReference(edit.id)}: ${edit.replacement === null ? "omission" : "replacement"}`).join("\n")}`;
+	}
 	const delta = entry.type === "compaction" ? deltaForCompaction(entry, entries) : undefined;
 	if (entry.type === "compaction" && isLedgerCompactionDetails(entry.details) && contentIndex === undefined && (projection === "all" || projection === "text")) text += `\nCompaction recovery details:\n${safeJson(entry.details)}`;
 	if (delta && delta.entryId === entry.id && contentIndex === undefined && (projection === "all" || projection === "text")) {
@@ -1697,7 +1762,7 @@ function historyViewAt(entries: SessionEntry[], ctx: ExtensionContext, index: nu
 				return { ...range, inputForm: "omitted", tool: "history_list_items", arguments: { filter: { includeMaintenance: true, ...(from > 0 ? { afterEntryId: entries[from - 1].id } : {}), beforeEntryId: entries[to + 1].id }, order: "oldest", projection: "references" } };
 			}),
 			...coverage.partialEntries.map((part) => ({ entryId: part.entryId, inputForm: "text_prefix", tool: "history_read", arguments: { entryId: part.entryId, offset: part.providedChars } })),
-			...coverage.projections.map((part) => ({ entryId: part.entryId, inputForm: part.kind, tool: "history_read", arguments: { entryId: part.entryId } })),
+			...coverage.projections.map((part) => ({ entryId: part.entryId, inputForm: part.kind, tool: "history_read", arguments: { entryId: part.editEntryId ?? part.entryId } })),
 		];
 		text += `\nInput record browse calls (inclusive recorded ranges, exclusive query bounds):\n${safeJson(browsing)}`;
 	}
@@ -1944,13 +2009,16 @@ async function historyReadImageResult(
 	}
 	if (!canonical) throw historyValidationError("image source " + reference + " could not be decoded as an image");
 	const canonicalBytes = new Uint8Array(Buffer.from(canonical.data, "base64"));
+	const modelResize = ctx.model?.inputLimits?.images?.resize;
+	const resizeOptions = {
+		...modelResize,
+		maxWidth: Math.min(MAX_HISTORY_IMAGE_WIDTH, modelResize?.maxWidth ?? MAX_HISTORY_IMAGE_WIDTH),
+		maxHeight: Math.min(MAX_HISTORY_IMAGE_HEIGHT, modelResize?.maxHeight ?? MAX_HISTORY_IMAGE_HEIGHT),
+		maxBytes: Math.min(MAX_HISTORY_IMAGE_BASE64_BYTES, modelResize?.maxBytes ?? MAX_HISTORY_IMAGE_BASE64_BYTES),
+	};
 	let normalized: Awaited<ReturnType<typeof resizeImage>>;
 	try {
-		normalized = await resizeImage(canonicalBytes, canonical.mimeType, {
-			maxWidth: MAX_HISTORY_IMAGE_WIDTH,
-			maxHeight: MAX_HISTORY_IMAGE_HEIGHT,
-			maxBytes: MAX_HISTORY_IMAGE_BASE64_BYTES,
-		});
+		normalized = await resizeImage(canonicalBytes, canonical.mimeType, resizeOptions);
 		signal?.throwIfAborted();
 	} catch {
 		signal?.throwIfAborted();
@@ -1958,7 +2026,7 @@ async function historyReadImageResult(
 	}
 	if (!normalized) throw historyValidationError("image source " + reference + " exceeds the normalized image capacity");
 	const normalizedEncodedBytes = utf8Bytes(normalized.data);
-	if (normalizedEncodedBytes >= MAX_HISTORY_IMAGE_BASE64_BYTES || normalized.width > MAX_HISTORY_IMAGE_WIDTH || normalized.height > MAX_HISTORY_IMAGE_HEIGHT) {
+	if (normalizedEncodedBytes >= resizeOptions.maxBytes || normalized.width > resizeOptions.maxWidth || normalized.height > resizeOptions.maxHeight) {
 		throw historyValidationError("image source " + reference + " exceeds the normalized image capacity");
 	}
 	const sourceMimeType = typeof sourceBlock.mimeType === "string" && sourceBlock.mimeType.length > 0 ? sourceBlock.mimeType : "unknown";
@@ -2071,6 +2139,7 @@ function projectedHistoryEntry(entry: SessionEntry, projection: HistoryProjectio
 	const textContent = content.filter((block: any) => block?.type !== "image");
 	if (entry.type === "message") return renderEntry({ ...entry, message: { ...entry.message, content: textContent } } as SessionEntry);
 	if (entry.type === "custom_message") return renderEntry({ ...entry, content: textContent } as SessionEntry);
+	if (entry.type === "context_edit") return renderEntry({ ...entry, replacement: { content: textContent } } as SessionEntry);
 	return renderEntry(entry);
 }
 
@@ -2769,11 +2838,6 @@ function renderTailReference(entry: SessionEntry): string {
 	].join("\n");
 }
 
-function renderRecentInteraction(entries: SessionEntry[], firstKeptIndex: number, tokenLimit: number): string {
-	const units = createTailUnits(entries, firstKeptIndex);
-	return renderTailReferences(units, tokenLimit);
-}
-
 function tailUnitMessages(unit: TailUnit): ContextMessage[] {
 	return unit.entries.flatMap(({ entry }) => sessionEntryToContextMessages(entry));
 }
@@ -2790,33 +2854,34 @@ function renderTailUnitReferences(unit: TailUnit): string {
 		.join("\n");
 }
 
-function renderTailReferences(units: TailUnit[], tokenLimit: number): string {
-	if (units.length === 0 || tokenLimit <= 0) return "";
+function renderTailReferences(units: TailUnit[], tokenLimit: number): { text: string; entryIds: string[] } {
 	const selected: string[] = [];
+	const entryIds: string[] = [];
+	if (units.length === 0 || tokenLimit <= 0) return { text: "", entryIds };
 	for (let index = units.length - 1; index >= 0; index--) {
 		const reference = renderTailUnitReferences(units[index]);
 		if (!reference) continue;
 		const candidate = [reference, ...selected].join("\n\n");
 		if (ledgerTokenEstimate(candidate) <= tokenLimit) {
 			selected.unshift(reference);
+			entryIds.unshift(...units[index].entries.map(({ entry }) => entry.id));
 			continue;
 		}
-		if (selected.length === 0) return "";
 		break;
 	}
-	return selected.join("\n\n");
+	return { text: selected.join("\n\n"), entryIds };
 }
 
 interface TailSelection {
 	firstKeptEntryId: string;
-	display: string;
+	entryIds: string[];
 	needsMarker: boolean;
 }
 
 function selectCompactionTail(entries: SessionEntry[], firstKeptIndex: number, tokenLimit: number): TailSelection {
 	const units = createTailUnits(entries, firstKeptIndex);
 	if (units.length === 0) {
-		return { firstKeptEntryId: entries[firstKeptIndex].id, display: "", needsMarker: false };
+		return { firstKeptEntryId: entries[firstKeptIndex].id, entryIds: [], needsMarker: false };
 	}
 	const contentBudget = tokenLimit;
 	const rawTokens: number[] = units.map(tailUnitTokens);
@@ -2834,15 +2899,15 @@ function selectCompactionTail(entries: SessionEntry[], firstKeptIndex: number, t
 		if (retainedRawTokens + retainedReferenceTokens > contentBudget) continue;
 		return {
 			firstKeptEntryId: units[start].entries[0].entry.id,
-			display: retainedReferences,
+			entryIds: units.slice(start).flatMap((unit) => unit.entries.map(({ entry }) => entry.id)),
 			needsMarker: false,
 		};
 	}
 	const display = renderTailReferences(units, contentBudget);
-	if (!display) throw new Error("tail recovery references cannot fit the configured tail budget");
+	if (!display.text) throw new Error("tail recovery references cannot fit the configured tail budget");
 	return {
 		firstKeptEntryId: entries[firstKeptIndex].id,
-		display,
+		entryIds: display.entryIds,
 		needsMarker: true,
 	};
 }
@@ -2876,7 +2941,7 @@ function coverageRanges(entries: SessionEntry[], ids: Set<string>): CoverageRang
 	return ranges;
 }
 
-function buildInputCoverage(entries: SessionEntry[], position: RequestHistoryPosition, base: StoredCheckpoint | undefined, previous: StoredDelta | undefined, supplied: Map<string, number>, projections: Map<string, InputProjection>, excluded: Map<string, "maintenance" | "structural-metadata">): DeltaInputCoverage {
+function buildInputCoverage(entries: SessionEntry[], position: RequestHistoryPosition, base: StoredCheckpoint | undefined, previous: StoredDelta | undefined, supplied: Map<string, number>, projections: Map<string, InputProjection>, excluded: Map<string, HistoryExclusion>): DeltaInputCoverage {
 	const snapshot = entries.slice(0, positionStartIndex(entries, position));
 	const positions = new Map(snapshot.map((entry, index) => [entry.id, index]));
 	const afterEntryId = previous?.data.scope.throughEntryId ?? base?.data.requestHistoryPosition.entryId ?? null;
@@ -2901,7 +2966,7 @@ function buildInputCoverage(entries: SessionEntry[], position: RequestHistoryPos
 		historyScope: { afterEntryId, throughEntryId: position.entryId },
 		fullRanges: coverageRanges(snapshot, full), partialEntries,
 		projections: [...projections.values()], omittedRanges: coverageRanges(snapshot, omitted),
-		excludedRanges: (["maintenance", "structural-metadata"] as const).flatMap((reason) => coverageRanges(snapshot.slice(scopeStart), new Set([...excluded].filter(([id, value]) => value === reason && !supplied.has(id) && !projections.has(id)).map(([id]) => id))).map((range) => ({ ...range, reason }))),
+		excludedRanges: HISTORY_EXCLUSIONS.flatMap((reason) => coverageRanges(snapshot.slice(scopeStart), new Set([...excluded].filter(([id, value]) => value === reason && !supplied.has(id) && !projections.has(id)).map(([id]) => id))).map((range) => ({ ...range, reason }))),
 	};
 }
 
@@ -2929,9 +2994,11 @@ function parseInputCoverage(value: unknown): InputCoverage | undefined {
 	if (data.source !== "compaction-delta" || data.representation !== "rendered-text-with-image-references" || !nullableId(data.baseCheckpointEntryId) || !nullableId(data.baseDeltaCompactionEntryId) ||
 		!data.historyScope || !nullableId(data.historyScope.afterEntryId) || data.historyScope.throughEntryId !== data.snapshotThrough ||
 		!Array.isArray(data.fullRanges) || !data.fullRanges.every(range) || !Array.isArray(data.omittedRanges) || !data.omittedRanges.every(range) ||
-		!Array.isArray(data.excludedRanges) || !data.excludedRanges.every((part) => range(part) && ["maintenance", "structural-metadata"].includes(part.reason)) ||
+		!Array.isArray(data.excludedRanges) || !data.excludedRanges.every((part) => range(part) && HISTORY_EXCLUSIONS.includes(part.reason)) ||
 		!Array.isArray(data.partialEntries) || !data.partialEntries.every((part) => part && id(part.entryId) && lengths(part) && part.providedChars < part.totalChars) ||
-		!Array.isArray(data.projections) || !data.projections.every((part) => part && id(part.entryId) && lengths(part) && ["reference", "checkpoint-ledger", "delta-ledger", "filtered-entry"].includes(part.kind))) return undefined;
+		!Array.isArray(data.projections) || !data.projections.every((part) => part && id(part.entryId) && lengths(part) &&
+			["reference", "checkpoint-ledger", "delta-ledger", "filtered-entry", "context-edit"].includes(part.kind) &&
+			(part.kind === "context-edit" ? id(part.editEntryId) : part.editEntryId === undefined))) return undefined;
 	return data;
 }
 
@@ -2988,7 +3055,9 @@ function isLedgerCompactionDetails(value: unknown): value is LedgerCompactionDet
 	if (input.sourceBranchTip !== null && !id(input.sourceBranchTip)) return false;
 	if (!parseRequestPosition(input.snapshotPosition)) return false;
 	const recoveryContext = input.recoveryContext as LedgerCompactionDetails["recoveryContext"] | undefined;
-	if (!recoveryContext || typeof recoveryContext.task !== "string" || typeof recoveryContext.tail !== "string") return false;
+	if (!recoveryContext || !Array.isArray(recoveryContext.taskEntryIds) || !recoveryContext.taskEntryIds.every(id) ||
+		!Array.isArray(recoveryContext.tailEntryIds) || !recoveryContext.tailEntryIds.every(id) ||
+		(recoveryContext.customInstructions !== undefined && typeof recoveryContext.customInstructions !== "string")) return false;
 	const slot = input.delta as DeltaSlot | undefined;
 	if (!slot || typeof slot !== "object") return false;
 	if (slot.status === "generated") {
@@ -3232,7 +3301,8 @@ function hydrateState(state: SessionState, entries: SessionEntry[], ctx: Extensi
 			const details = entry.details;
 			position(details.snapshotPosition, index);
 			ancestor(details.sourceBranchTip, index);
-			ancestor(details.firstKeptEntryId, index);
+				ancestor(details.firstKeptEntryId, index);
+				for (const id of [...details.recoveryContext.taskEntryIds, ...details.recoveryContext.tailEntryIds]) ancestor(id, index);
 			if (details.firstKeptEntryId !== entry.firstKeptEntryId || details.sourceBranchTip !== entry.parentId) throw new Error(`compaction ${entry.id} provenance disagrees with its native retained boundary or source parent`);
 			if (details.checkpointEntryId !== (state.checkpoint?.entryId ?? null)) throw new Error("compaction checkpoint does not match its branch baseline");
 			const delta = deltaForCompaction(entry, entries);
@@ -3252,6 +3322,12 @@ function hydrateState(state: SessionState, entries: SessionEntry[], ctx: Extensi
 				if (coverage.historyScope.afterEntryId !== expectedAfter) throw new Error("delta input scope does not follow its actual base");
 				ancestor(expectedAfter, through);
 				for (const part of [...coverage.partialEntries, ...coverage.projections]) ancestor(part.entryId, through);
+				for (const part of coverage.projections) if (part.kind === "context-edit") {
+					const editIndex = ancestor(part.editEntryId!, through);
+					const edit = entries[editIndex];
+					ancestor(part.entryId, editIndex);
+					if (edit.type !== "context_edit" || edit.targetId !== part.entryId || edit.replacement === null) throw new Error("invalid context edit projection source");
+				}
 				for (const range of [...coverage.fullRanges, ...coverage.omittedRanges, ...coverage.excludedRanges]) {
 					const from = ancestor(range.fromEntryId, through);
 					const to = ancestor(range.toEntryId, through);
@@ -3310,13 +3386,13 @@ function taskSectionText(active: string, latest: string, focus?: string): string
 	return sections.join("\n\n");
 }
 
-function renderTaskEntryReferences(entries: SessionEntry[], tokenLimit: number, supplied?: Map<string, number>, projections?: Map<string, InputProjection>): string {
+function renderTaskEntryReferences(entries: SessionEntry[], tokenLimit: number, edits: Map<string, ContextEditEntry>, supplied?: Map<string, number>, projections?: Map<string, InputProjection>): string {
 	supplied?.clear();
 	projections?.clear();
 	if (entries.length === 0) return "(none recorded)";
 	const selected: string[] = [];
 	for (const entry of entries) {
-		const full = renderEntry(entry);
+		const full = renderEntry(entry, edits.get(entry.id)?.id);
 		const fullCandidate = [...selected, full].join("\n\n");
 		if (ledgerTokenEstimate(fullCandidate) <= tokenLimit) {
 			selected.push(full);
@@ -3396,6 +3472,13 @@ function renderTaskSection(
 	supplied?: Map<string, number>,
 	projections?: Map<string, InputProjection>,
 ): string {
+	// Checkpoint request IDs explicitly anchor historical user evidence, including compacted requests.
+	const edits = contextEdits(entries);
+	entries = entries.flatMap((entry): SessionEntry[] => {
+		if (entry.type !== "message" || entry.message.role !== "user") return [];
+		const effective = editedHistoryEntry(entry, edits.get(entry.id));
+		return effective ? [effective] : [];
+	});
 	const taskBudget = Math.max(1, taskTokenLimit - 4);
 	const activeEntries = activeRequestEntryIds
 		.map((id) => findEntry(entries, id))
@@ -3404,8 +3487,8 @@ function renderTaskSection(
 	const activeWithoutLatest = activeEntries.filter((entry) => entry.id !== latest?.id);
 	const activeSupplied = new Map<string, number>();
 	const activeProjections = new Map<string, InputProjection>();
-	const fullActive = renderTaskEntryReferences(activeWithoutLatest, taskBudget, activeSupplied, activeProjections);
-	const fullLatest = latest ? renderEntry(latest) : "(none recorded)";
+	const fullActive = renderTaskEntryReferences(activeWithoutLatest, taskBudget, edits, activeSupplied, activeProjections);
+	const fullLatest = latest ? renderEntry(latest, edits.get(latest.id)?.id) : "(none recorded)";
 	let latestChars = fullLatest.length;
 	const fullFocus = customInstructions?.trim() ? customInstructions.trim() : "";
 	const compose = (active: string, latestText: string, focus?: string): string => taskSectionText(active, latestText, focus);
@@ -3415,11 +3498,11 @@ function renderTaskSection(
 	let output = compose(active, latestText, focus);
 	if (ledgerTokenEstimate(output) > taskBudget) {
 		let activeBudget = Math.max(1, Math.floor(taskBudget / 2));
-		active = renderTaskEntryReferences(activeWithoutLatest, activeBudget, activeSupplied, activeProjections);
+		active = renderTaskEntryReferences(activeWithoutLatest, activeBudget, edits, activeSupplied, activeProjections);
 		output = compose(active, latestText, focus);
 		while (ledgerTokenEstimate(output) > taskBudget && activeBudget > 1) {
 			activeBudget = Math.max(1, Math.floor(activeBudget / 2));
-			active = renderTaskEntryReferences(activeWithoutLatest, activeBudget, activeSupplied, activeProjections);
+			active = renderTaskEntryReferences(activeWithoutLatest, activeBudget, edits, activeSupplied, activeProjections);
 			output = compose(active, latestText, focus);
 		}
 		if (ledgerTokenEstimate(output) > taskBudget) {
@@ -3456,6 +3539,7 @@ function renderTaskSection(
 		if (latestChars > 0) supplied?.set(latest.id, latestChars);
 		else projections?.set(latest.id, { entryId: latest.id, kind: "reference", providedChars: latestText.length, totalChars: latestText.length });
 	}
+	if (supplied && projections) for (const entry of entries) recordContextEditProjection(entry, edits.get(entry.id), supplied, projections);
 	return output;
 }
 
@@ -3476,7 +3560,13 @@ function renderBootstrap(
 	}
 	const deltaEntryId = slot.status === "generated" ? (state.delta && state.delta.data === delta ? state.delta.entryId : null) : (slot.status === "reused" || slot.status === "stale") ? slot.sourceCompactionEntryId : null;
 	const after = delta?.scope.throughEntryId ?? checkpoint?.data.requestHistoryPosition.entryId ?? null;
-	const { task, tail } = details.recoveryContext;
+	const sources = details.recoveryContext;
+	const taskIds = new Set(sources.taskEntryIds);
+	const tailIds = new Set(sources.tailEntryIds);
+	const edits = contextEdits(entries);
+	const task = renderTaskSection(entries.filter((entry) => taskIds.has(entry.id) || entry.type === "context_edit"), sources.taskEntryIds, sources.customInstructions, budgets.taskTokens);
+	const tailEntries = entries.filter((entry) => tailIds.has(entry.id)).flatMap((entry) => editedHistoryEntry(entry, edits.get(entry.id)) ?? []);
+	const tail = renderTailReferences(createTailUnits(tailEntries, 0), budgets.tailTokens).text;
 	return [
 		"# Ledger Context Recovery",
 		`schemaVersion: ${LEDGER_SCHEMA_VERSION}`,
@@ -3799,8 +3889,8 @@ function retryableLedgerError(error: unknown): boolean | undefined {
 	return undefined;
 }
 
-function deltaHistoryMaterial(entry: SessionEntry): { text?: string; filtered?: boolean; excluded?: "maintenance" | "structural-metadata" } {
-	if (entry.type === "compaction" || entry.type === "model_change" || entry.type === "thinking_level_change" || entry.type === "label" || entry.type === "session_info") return { excluded: "structural-metadata" };
+function deltaHistoryMaterial(entry: SessionEntry, contentEntryId = entry.id): { text?: string; filtered?: boolean; excluded?: HistoryExclusion } {
+	if (entry.type === "compaction" || entry.type === "model_change" || entry.type === "thinking_level_change" || entry.type === "label" || entry.type === "session_info" || entry.type === "context_edit" || entry.type === "usage" || (entry.type === "message" && entry.message.role === "system")) return { excluded: "structural-metadata" };
 	if ((entry.type === "custom" && [CHECKPOINT_ENTRY_TYPE, RAW_TAIL_MARKER_ENTRY_TYPE, REMINDER_HANDOFF_ENTRY_TYPE].includes(entry.customType)) || (entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE)) return { excluded: "maintenance" };
 	if (entry.type === "message") {
 		const message = entry.message;
@@ -3810,10 +3900,10 @@ function deltaHistoryMaterial(entry: SessionEntry): { text?: string; filtered?: 
 			const maintenanceOnly = calls.length > 0 && calls.every((block) => ["checkpoint", "get_context_remaining"].includes(block.name));
 			const content = message.content.filter((block) => !(block.type === "toolCall" && ["checkpoint", "get_context_remaining"].includes(block.name)) && !(maintenanceOnly && block.type === "thinking"));
 			if (content.length === 0 && message.content.length > 0) return { excluded: "maintenance" };
-			if (content.length !== message.content.length) return { text: renderEntry({ ...entry, message: { ...message, content } }), filtered: true };
+			if (content.length !== message.content.length) return { text: renderEntry({ ...entry, message: { ...message, content } }, contentEntryId), filtered: true };
 		}
 	}
-	return { text: renderEntry(entry) };
+	return { text: renderEntry(entry, contentEntryId) };
 }
 
 async function generateCompactionDelta(
@@ -3831,7 +3921,11 @@ async function generateCompactionDelta(
 	const position = requestPositionForContext(entries);
 	const failure = (reason: "generation-failed" | "input-capacity" | "no-model"): DeltaSlot => previous ? { status: "stale", sourceCompactionEntryId: previous.entryId } : { status: "unavailable", reason };
 	const after = previous?.data.scope.throughEntryId ?? base?.data.requestHistoryPosition.entryId ?? null;
-	const candidates = entries.slice(positionStartIndex(entries, { entryId: after, branchDepth: 0 })).map((entry) => ({ entry, ...deltaHistoryMaterial(entry) }));
+	const history = recoveryHistory(entries);
+	const newIds = new Set(entries.slice(positionStartIndex(entries, { entryId: after, branchDepth: 0 })).map((entry) => entry.id));
+	const candidates = history.entries
+		.filter((entry) => newIds.has(entry.id) || newIds.has(history.edits.get(entry.id)?.id ?? ""))
+		.map((entry) => ({ entry, ...deltaHistoryMaterial(entry, history.edits.get(entry.id)?.id) }));
 	if (!candidates.some((candidate) => candidate.text) && !customInstructions?.trim()) return previous ? { status: "reused", sourceCompactionEntryId: previous.entryId } : { status: "empty" };
 	if (!model) return failure("no-model");
 	if (deltaTokenLimit < 1 || entries.length === 0) return failure("input-capacity");
@@ -3862,7 +3956,7 @@ async function generateCompactionDelta(
 		const previousLedger = bases.map((item) => item.text).join("\n\n") || "No agent checkpoint or previous delta exists. Origin: branch beginning.";
 		const selected: string[] = [];
 		let used = ledgerTokenEstimate(task) + ledgerTokenEstimate(previousLedger) + 32;
-		const excluded = new Map(candidates.filter((candidate) => candidate.excluded).map((candidate) => [candidate.entry.id, candidate.excluded!]));
+		const excluded = new Map([...history.excluded, ...candidates.filter((candidate) => candidate.excluded).map((candidate) => [candidate.entry.id, candidate.excluded!] as const)]);
 		for (const candidate of [...candidates].reverse()) {
 			const remaining = inputBudget - used;
 			if (remaining < 64) break;
@@ -3879,6 +3973,7 @@ async function generateCompactionDelta(
 			used += cost;
 		}
 		const content = [task, previousLedger, "Bounded new history since the previous delta input, or checkpoint request if no delta exists (oldest to newest; omissions may exist):", ...selected].join("\n\n");
+		for (const entry of history.entries) recordContextEditProjection(entry, history.edits.get(entry.id), supplied, projections);
 		const inputCoverage = buildInputCoverage(entries, position, base, previous, supplied, projections, excluded);
 		if (ledgerTokenEstimate(content) > inputBudget) return failure("input-capacity");
 		signal.throwIfAborted();
@@ -3959,17 +4054,13 @@ function appendTailMarker(pi: ExtensionAPI, ctx: ExtensionContext, state: Sessio
 }
 
 function buildCompactionDetails(
-	ctx: ExtensionContext,
 	state: SessionState,
 	entries: SessionEntry[],
 	firstKeptEntryId: string,
 	windowId: string,
-	delta: DeltaSlot = state.delta ? { status: "reused", sourceCompactionEntryId: state.delta.entryId } : { status: "empty" },
-	snapshotPosition = requestPositionForContext(entries),
-	recoveryContext = {
-		task: renderTaskSection(entries, state.checkpoint?.data.activeRequestEntryIds ?? state.inferredActiveRequestEntryIds, undefined, contentBudgets(ctx.model?.contextWindow ?? 0).taskTokens),
-		tail: renderRecentInteraction(entries, entries.findIndex((entry) => entry.id === firstKeptEntryId), contentBudgets(ctx.model?.contextWindow ?? 0).tailTokens),
-	},
+	delta: DeltaSlot,
+	snapshotPosition: RequestHistoryPosition,
+	recoveryContext: LedgerCompactionDetails["recoveryContext"],
 ): LedgerCompactionDetails {
 	const checkpointEntryId = state.checkpoint?.entryId ?? null;
 	const sourceBranchTip = entries.at(-1)?.id ?? null;
@@ -3988,21 +4079,6 @@ function buildCompactionDetails(
 		lastUserEntryId: latestUserEntry(entries)?.id ?? null,
 		lastAssistantEntryId: latestAssistantAnswerId(entries),
 	};
-}
-
-function compactionDetails(
-	ctx: ExtensionContext,
-	state: SessionState,
-	entries: SessionEntry[],
-	firstKeptEntryId: string,
-): LedgerCompactionDetails {
-	return buildCompactionDetails(
-		ctx,
-		state,
-		entries,
-		firstKeptEntryId,
-		`window:${ctx.sessionManager.getSessionId()}:${randomUUID()}`,
-	);
 }
 
 function reminderHandoffForState(state: SessionState): ReminderHandoffRecord | undefined {
@@ -4313,12 +4389,21 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		try {
 			if (blockIfPersistenceUncertain(state, ctx)) return { cancel: true };
 			if (event.signal.aborted) return { cancel: true };
-			let entries = event.branchEntries;
+			let branch = event.branchEntries;
+			const entries = recoveryHistory(branch).entries;
 			const budgets = contentBudgets(ctx.model?.contextWindow ?? 0);
-			hydrateState(state, entries, ctx, false);
+			hydrateState(state, branch, ctx, false);
 			if (state.recoveryError) throw new Error(state.recoveryError);
 			let firstKeptEntryId = completeUnitFirstKeptEntryId(entries, event.preparation.firstKeptEntryId);
 			let firstKeptIndex = entries.findIndex((entry) => entry.id === firstKeptEntryId);
+			if (firstKeptIndex < 0) {
+				const boundary = branch.findIndex((entry) => entry.id === firstKeptEntryId);
+				if (boundary >= 0) {
+					const suffixIds = new Set(branch.slice(boundary).map((entry) => entry.id));
+					firstKeptIndex = entries.findIndex((entry) => suffixIds.has(entry.id));
+				}
+				if (firstKeptIndex >= 0) firstKeptEntryId = entries[firstKeptIndex].id;
+			}
 			if (firstKeptIndex < 0) {
 				throw new Error("first kept entry " + firstKeptEntryId + " is not on the current branch");
 			}
@@ -4333,9 +4418,9 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 				tailSelection = selectCompactionTail(entries, firstKeptIndex, budgets.tailTokens);
 			} catch (error) {
 				if (!freshImageUnit) throw error;
-				tailSelection = { firstKeptEntryId: entries[firstKeptIndex].id, display: "", needsMarker: true };
+				tailSelection = { firstKeptEntryId: entries[firstKeptIndex].id, entryIds: [], needsMarker: true };
 			}
-			let tailDisplay = tailSelection.display;
+			let tailEntryIds = tailSelection.entryIds;
 			let needsTailMarker = false;
 			const selectedTailIndex = entries.findIndex((entry) => entry.id === tailSelection.firstKeptEntryId);
 			const retainFreshImageUnit = freshImageUnit !== undefined && (
@@ -4344,21 +4429,27 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 			if (retainFreshImageUnit) {
 				firstKeptIndex = Math.min(firstKeptIndex, freshImageStartIndex);
 				firstKeptEntryId = entries[firstKeptIndex].id;
-				tailDisplay = renderTailReferences([freshImageUnit], budgets.tailTokens);
+				tailEntryIds = renderTailReferences([freshImageUnit], budgets.tailTokens).entryIds;
 			} else if (tailSelection.needsMarker) {
 				needsTailMarker = true;
 			} else {
 				firstKeptEntryId = tailSelection.firstKeptEntryId;
 				firstKeptIndex = entries.findIndex((entry) => entry.id === firstKeptEntryId);
 			}
-			let details = compactionDetails(ctx, state, entries, firstKeptEntryId);
-			details.recoveryContext = { task: renderTaskSection(entries, state.checkpoint?.data.activeRequestEntryIds ?? state.inferredActiveRequestEntryIds, event.customInstructions, budgets.taskTokens), tail: tailDisplay };
-			let summary = renderBootstrap(entries, state, details, budgets);
+			const snapshotPosition = requestPositionForContext(branch);
+			const recoveryContext = {
+				taskEntryIds: [...new Set([...(state.checkpoint?.data.activeRequestEntryIds ?? state.inferredActiveRequestEntryIds), ...userRequestEntryIds(branch).slice(-1)])],
+				tailEntryIds,
+				customInstructions: event.customInstructions,
+			};
+			let details = buildCompactionDetails(state, branch, firstKeptEntryId,
+				`window:${ctx.sessionManager.getSessionId()}:${randomUUID()}`,
+				state.delta ? { status: "reused", sourceCompactionEntryId: state.delta.entryId } : { status: "empty" }, snapshotPosition, recoveryContext);
+			let summary = renderBootstrap(branch, state, details, budgets);
 			const availableTokens = (ctx.model?.contextWindow ?? 0) - requestFixedTokens(pi, ctx) - budgets.outputReserveTokens;
 			const generationLeaf = ctx.sessionManager.getLeafId();
 			const generationModel = ctx.model;
-			const snapshotPosition = requestPositionForContext(entries);
-			const delta = await generateCompactionDelta(ctx, state.checkpoint, state.delta, state.inferredActiveRequestEntryIds, entries, budgets,
+			const delta = await generateCompactionDelta(ctx, state.checkpoint, state.delta, state.inferredActiveRequestEntryIds, branch, budgets,
 				Math.min(budgets.deltaTokens, availableTokens - ledgerTokenEstimate(summary) + ledgerTokenEstimate(state.delta?.data.ledger ?? "") - 256),
 				event.signal, event.customInstructions);
 			event.signal.throwIfAborted();
@@ -4367,12 +4458,12 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 			}
 			if (needsTailMarker) {
 				firstKeptEntryId = appendTailMarker(pi, ctx, state, firstKeptEntryId);
-				entries = ctx.sessionManager.getBranch();
-				firstKeptIndex = entries.findIndex((entry) => entry.id === firstKeptEntryId);
+				branch = ctx.sessionManager.getBranch();
+				firstKeptIndex = branch.findIndex((entry) => entry.id === firstKeptEntryId);
 				if (firstKeptIndex < 0) throw new Error("tail marker " + firstKeptEntryId + " is not on the current branch");
 			}
-			details = buildCompactionDetails(ctx, state, entries, firstKeptEntryId, details.windowId, delta, snapshotPosition, details.recoveryContext);
-			summary = renderBootstrap(entries, state, details, budgets);
+			details = buildCompactionDetails(state, branch, firstKeptEntryId, details.windowId, delta, snapshotPosition, recoveryContext);
+			summary = renderBootstrap(branch, state, details, budgets);
 			const summaryTokens = ledgerTokenEstimate(summary);
 			if (summaryTokens > availableTokens) {
 				throw new Error(`recovery bootstrap requires ${summaryTokens} tokens, above the ${availableTokens}-token budget`);

@@ -4,7 +4,7 @@ Ledger Context preserves the main agent's working checkpoint and a separate cumu
 
 ## Requirements
 
-- Runtime baseline: `@earendil-works/pi-coding-agent` 0.86.0 with Node.js `>=22.19.0`.
+- Runtime baseline: `@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` 0.87.x with Node.js `>=22.19.0`; development dependencies are pinned to 0.87.0.
 - Keep pi native automatic compaction enabled for automatic window changes. Pi owns the compaction threshold, session log, steering and follow-up queues, overflow retry, and compaction lifecycle.
 - Configure one compaction content extension per session. Ledger Context supplies the compaction summary and recovery bootstrap for each window.
 - All six model tools and manual `/compact` remain available when automatic compaction is disabled.
@@ -34,7 +34,11 @@ Keep the ledger brief: goal and status, constraints and decisions, verified resu
 
 Only the main agent's `checkpoint` tool writes checkpoints. Its prompt asks for the current working state. The compaction prompt asks for subsequent changes: user corrections, decisions, execution outcomes, verification and changed next steps. It receives the checkpoint as read-only background, the previous matching delta as a summary, and bounded new evidence. Repeated compactions update the cumulative delta while preserving the checkpoint text. With no checkpoint, the origin is the branch beginning.
 
-Recovery records use schema version 4. Start a new session when switching from an earlier recovery schema. Original logs remain intact; incompatible or corrupt recovery records stop resume with an explicit error.
+Recovery records use schema version 5. Start a new session when switching from an earlier recovery schema, including version 4. Original logs remain intact; incompatible or corrupt recovery records stop resume with an explicit error.
+
+Pi's `buildSessionProjection()` supplies the effective messages for request projection, retained-tail selection and automatic delta history. Current-branch context edits control omission and replacement. Explicit task anchors and the latest user request remain available across compactions, with the latest branch edits applied to their text. New replacements of retained earlier evidence qualify for the next delta. Replacement text cites its edit record, which also owns replacement-image references. Original entries, checkpoints and delta records remain the history and provenance source.
+
+Context edits govern subsequent selection of source text. Existing checkpoint and delta prose keeps its recorded meaning; the main agent can save a revised checkpoint when previously summarized facts need correction.
 
 Each `inputCoverage` is an immutable input record. Agent checkpoints use `measurement: "unmeasured"`, `source: "agent-context"`, `snapshotThrough`, and `recoveryBasis`: the checkpoint/delta IDs projected for the generating main-agent request, or null when no recovery view was supplied. Delta requests use `measurement: "measured"` and `source: "compaction-delta"` with these fields:
 
@@ -46,9 +50,9 @@ Each `inputCoverage` is an immutable input record. Agent checkpoints use `measur
 | `representation` | `rendered-text-with-image-references`: supplied text includes image references; pixels require a separate image read. |
 | `fullRanges` | Inclusive ranges whose complete rendered entry text was supplied to this delta request. |
 | `partialEntries` | Original rendered text prefixes: source entry ID, positive `providedChars`, and larger `totalChars`, in UTF-16 units. |
-| `projections` | `reference`, `checkpoint-ledger`, `delta-ledger`, or `filtered-entry`, with source IDs and supplied/total UTF-16 lengths of projection text. |
+| `projections` | `reference`, `checkpoint-ledger`, `delta-ledger`, `filtered-entry`, or `context-edit`, with source IDs and supplied/total UTF-16 lengths of projection text. `context-edit` also records `editEntryId` for the applied replacement. |
 | `omittedRanges` | Inclusive ranges within `historyScope` left out of the bounded input, with entry counts. |
-| `excludedRanges` | Inclusive ranges excluded by the fixed `maintenance` or `structural-metadata` policy. Substantive history-tool results remain eligible evidence. |
+| `excludedRanges` | Inclusive ranges excluded as `maintenance`, `structural-metadata`, `context-omitted` (explicit omission), or `inactive-context` (outside Pi's active projection). Explicit task anchors and substantive history-tool results remain eligible evidence. |
 
 The delta's `scope` spans its cumulative target interval. Its input record's `historyScope` spans the new history considered for that request. Task anchors may precede this interval. Earlier delta text counts as a summary projection; its original sources retain their earlier input records. Relevance, understanding and verification remain judgments supported by evidence during ordinary agent work.
 
@@ -56,7 +60,7 @@ Generation receives the base checkpoint and previous delta explicitly. Compactio
 
 Receipts, listings and recovery views show compact `inputRecord` provenance. Read the checkpoint or delta's owning compaction entry with `history_read`, following `nextRead` for full details. Generated delta records include optional browse calls for omitted ranges, partial text and projected sources. Choose evidence according to the current task.
 
-After compaction, each main-agent request projects the latest checkpoint and its matching delta into the extension's recovery summary. A new checkpoint immediately becomes the baseline; earlier checkpoint/delta versions remain readable in history. The persisted compaction packet and its bounded task/tail material remain unchanged. Recovery ownership is checked against the current branch before projection.
+After compaction, each main-agent request projects the latest checkpoint and its matching delta into the extension's recovery summary. A new checkpoint immediately becomes the baseline; earlier checkpoint/delta versions remain readable in history. The persisted compaction packet keeps its task/tail source IDs and optional custom instructions. Each request renders those sources with current branch edits and budgets, including edits appended after compaction, while the packet remains unchanged. Recovery ownership is checked against the current branch before projection.
 
 Delta generation uses the current model and host authentication. Transient failures and invalid outputs share at most three attempts with cancellable backoff; authentication, invalid-request and account-limit failures go directly to recovery. Each attempt waits for a response or error, subject to cancellation. With no new eligible material or custom instructions, compaction reuses the matching delta or records an empty delta. New deltas become active with the committed pi compaction entry.
 
@@ -89,7 +93,7 @@ Settings failures mark the native boundary as unknown and use window protection.
 
 ## History recovery
 
-The history query tools share a structured `filter`. Fields combine with AND, array values with OR, and `excludeKinds` takes precedence. Queries stay on the current session branch.
+The history query tools share a structured `filter`. Fields combine with AND, array values with OR, and `excludeKinds` takes precedence. Queries stay on the current session branch. History reads return original log content, including compacted or context-omitted entries. Entry text lists related context-edit IDs; reading an edit shows its target and replacement or omission. Replacement images have references under the edit entry ID and support `view: "image"`.
 
 | Filter | Meaning |
 | --- | --- |
@@ -132,7 +136,7 @@ Tool-call pairing metadata in listings and search results fits the output budget
 
 Use `history_read({ entryId, view: "image", contentIndex })` to load the original image block identified by `pi://entry/<id>/content/<index>`. This view accepts the entry ID and content index. Each successful call returns one normalized `ImageContent` block, a bounded source note, and provenance with the source entry, window, dimensions, MIME types, and encoded and decoded sizes.
 
-Image reads require an image-capable model and valid image bytes. Pi's public image utilities normalize a copy to at most 2000 by 2000 pixels and less than 4.5 MiB of base64 payload. Invalid, unavailable, unsupported, and capacity-limited selections return an explicit text error with the source reference.
+Image reads require an image-capable model and valid image bytes. Pi's public image utilities normalize a copy using the stricter of the current model's `inputLimits.images.resize` profile and the extension's 2000-by-2000-pixel, 4.5-MiB base64 limits. The model's JPEG quality setting also applies. Provenance describes the normalized result delivered to Pi. Invalid, unavailable, unsupported, and capacity-limited selections return an explicit text error with the source reference.
 
 Images that fit the request budget appear in the next actual provider request, including across native compaction or a batch containing large ordinary results and multiple image reads. Every tool call stays paired with its matching results. Images that cannot fit are replaced in that request by text errors with source references. If even the minimum request containing those errors and mandatory context cannot fit, the run stops with a capacity error. Later requests may represent already-delivered images with metadata references.
 
@@ -157,12 +161,13 @@ Each request budget includes the system prompt, active tool schemas and prompt g
 
 Checkpoint and delta text each have a `65,536` UTF-8 byte limit; checkpoints accept at most `8` active request references. History search text allows up to `8,192` UTF-8 bytes, identifiers up to `1,024` UTF-16 code units, and history pages up to `100` results. Text reads accept a maximum length of `65,536` UTF-16 code units. These input limits apply alongside the output budgets.
 
-Pi context usage combines the provider's reported usage with estimates for subsequent messages. When provider usage is unknown, Ledger Context estimates the bounded messages, system prompt, active tools, and model metadata sent in the request. Full request capacity adds output reserve separately. Text and image estimates guide capacity decisions; their accuracy depends on the model's token accounting.
+Pi context usage combines the provider's reported usage with estimates for subsequent messages. When provider usage is unknown, Ledger Context estimates conversation messages from the canonical session projection, then counts the system prompt, active tools and model metadata once. The `context` hook transforms conversation messages; Pi retains the system prompt and tool declarations. Full request capacity adds output reserve separately. Text and image estimates guide capacity decisions; their accuracy depends on the model's token accounting.
 
 ## Recovery states
 
 - Delta state is `generated`, `reused`, `empty`, `stale`, or `unavailable`. Generation failure preserves the checkpoint and earlier matching delta; retained messages and source references support subsequent work.
 - Saved checkpoint and delta text must fit in full. Capacity errors preserve their identity and stop the request or compaction. Restore a sufficient model/budget before asking the main agent to save a smaller checkpoint.
 - Normal compaction cancellation and invalid checkpoint input preserve the previous valid window and checkpoint.
+- Pi prepares compaction before invoking the extension. Insufficient summarizable content returns `Nothing to compact`, including for manual `/compact` with custom instructions. The checkpoint, delta and window remain unchanged; checkpoint saves remain available independently.
 - A persistent session log failure stops the current run and future saves or compactions. Reopen the persisted file with a fresh public `SessionManager` to resume durable recovery.
 - Fork, tree, resume, reload, new session, and model changes rebuild state from the selected branch. Each branch keeps its own ledger, window records, and pending reminder provenance.
