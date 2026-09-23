@@ -140,14 +140,15 @@ history_read({ entryId: "result-id", view: "exchange" });
 
 符合请求预算的图像会出现在紧接的下一次实际模型请求中，包括发生原生压缩，或同批包含大型普通工具结果和多个图像读取的情况。每个工具调用均保留匹配结果。无法容纳的图像会在该请求中替换为带来源引用的文本错误。若连包含这些错误和必需上下文的最小请求也无法容纳，运行会因容量错误而停止。后续请求可用元数据引用表示已投递的图像。
 
-使用 `openai-responses` 时，请求中的工具图像以 user 内容附在完整工具结果批次之后，并标明来源调用 ID。工具结果保留文字和调用配对，会话日志保留原始图像块。
+工具图像默认使用 Pi 原生的请求表示。对于要求图像作为 user 内容的 provider，设置 `LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES=user-message`。该兼容模式将请求中的工具图像以 user 内容附在完整工具结果批次之后，并标明来源调用 ID。工具结果保留文字和调用配对，会话日志保留原始图像块。模式在扩展加载时读取，适用于进程内所有 `openai-responses` 模型。
 
 ## 配置与预算
 
-扩展配置均使用 `LEDGER_CONTEXT_` 命名空间。所有覆盖值都必须是正整数，且 `LEDGER_CONTEXT_URGENT_TOKENS` 小于 `LEDGER_CONTEXT_REMINDER_TOKENS`。
+扩展配置均使用 `LEDGER_CONTEXT_` 命名空间。Token 预算值必须是正整数，且 `LEDGER_CONTEXT_URGENT_TOKENS` 小于 `LEDGER_CONTEXT_REMINDER_TOKENS`。图像模式接受 `native` 或 `user-message`，其他值会触发扩展加载错误。
 
 | 配置项 | 默认值 | 作用 |
 | --- | --- | --- |
+| `LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES` | `native` | `openai-responses` 工具图像的请求表示；`user-message` 启用兼容转换 |
 | `LEDGER_CONTEXT_REMINDER_TOKENS` | `max(2, floor(min(window × 0.20, 32768)))` | 柔性提醒在有效边界前的提前量；已用 token 触发值为 `B - 提前量` |
 | `LEDGER_CONTEXT_URGENT_TOKENS` | `max(1, min(默认柔性提醒提前量 − 1, floor(min(window × 0.10, 16384))))` | 紧急提醒在有效边界前的提前量；已用 token 触发值为 `B - 提前量` |
 | `LEDGER_CONTEXT_LEDGER_TOKENS` | `4096` | Agent checkpoint 的估计 token 上限 |

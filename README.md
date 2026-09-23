@@ -140,14 +140,15 @@ Image reads require an image-capable model and valid image bytes. Pi's public im
 
 Images that fit the request budget appear in the next actual provider request, including across native compaction or a batch containing large ordinary results and multiple image reads. Every tool call stays paired with its matching results. Images that cannot fit are replaced in that request by text errors with source references. If even the minimum request containing those errors and mandatory context cannot fit, the run stops with a capacity error. Later requests may represent already-delivered images with metadata references.
 
-For `openai-responses`, outgoing tool images are attached as user content after the complete tool-result batch, labeled with their source call IDs. Tool results retain their text and pairing; the session log retains the original image blocks.
+Tool images use Pi's native provider-request representation by default. For providers that require images as user content, set `LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES=user-message`. This compatibility mode attaches outgoing tool images as user content after the complete tool-result batch, labeled with their source call IDs. Tool results retain their text and pairing; the session log retains the original image blocks. The mode is read when the extension loads and applies to all `openai-responses` models in the process.
 
 ## Configuration and budgets
 
-All extension settings use the `LEDGER_CONTEXT_` namespace. Every configured value is a positive integer. `LEDGER_CONTEXT_URGENT_TOKENS` is smaller than `LEDGER_CONTEXT_REMINDER_TOKENS`.
+All extension settings use the `LEDGER_CONTEXT_` namespace. Token budget values are positive integers. `LEDGER_CONTEXT_URGENT_TOKENS` is smaller than `LEDGER_CONTEXT_REMINDER_TOKENS`. The image mode accepts `native` or `user-message`; other values produce an extension load error.
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
+| `LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES` | `native` | Tool-image request representation for `openai-responses`; `user-message` enables the compatibility rewrite |
 | `LEDGER_CONTEXT_REMINDER_TOKENS` | `max(2, floor(min(window × 0.20, 32768)))` | Soft reminder lead time before the effective boundary; the used-token trigger is `B - lead time` |
 | `LEDGER_CONTEXT_URGENT_TOKENS` | `max(1, min(default soft lead time − 1, floor(min(window × 0.10, 16384))))` | Urgent reminder lead time before the effective boundary; the used-token trigger is `B - lead time` |
 | `LEDGER_CONTEXT_LEDGER_TOKENS` | `4096` | Estimated token limit for an agent checkpoint |

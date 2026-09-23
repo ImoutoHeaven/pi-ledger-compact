@@ -4099,11 +4099,15 @@ function reminderHandoffForState(state: SessionState): ReminderHandoffRecord | u
 }
 
 function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): void {
+	const responsesToolImages = process.env.LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES ?? "native";
+	if (responsesToolImages !== "native" && responsesToolImages !== "user-message") {
+		throw new Error("LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES must be native or user-message");
+	}
 	const settingsReader = options.settingsReader;
 	const states = new Map<string, SessionState>();
 
 	pi.on("before_provider_request", (event, ctx) => {
-		if (ctx.model?.api !== "openai-responses") return;
+		if (responsesToolImages !== "user-message" || ctx.model?.api !== "openai-responses") return;
 		const payload = event.payload as { input?: any[] } | null;
 		if (!payload || !Array.isArray(payload.input)) return;
 		const input: any[] = [];

@@ -4377,7 +4377,14 @@ test("compaction without an agent checkpoint accumulates deltas and preserves th
 	}
 });
 
-test("Responses tool images follow the complete result batch without changing source payloads", { timeout: TEST_TIMEOUT_MS }, async () => {
+for (const mode of [undefined, "native", "user-message"]) test(`Responses tool images use ${mode ?? "native by default"} without changing source payloads`, { timeout: TEST_TIMEOUT_MS }, async (t) => {
+	const previousMode = process.env.LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES;
+	t.after(() => {
+		if (previousMode === undefined) delete process.env.LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES;
+		else process.env.LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES = previousMode;
+	});
+	if (mode === undefined) delete process.env.LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES;
+	else process.env.LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES = mode;
 	const { root, faux, session, sessionManager } = await createFixture(false);
 	try {
 		const image = { type: "input_image", image_url: `data:image/png;base64,${RED_2X2_PNG}`, detail: "auto" };
@@ -4391,14 +4398,21 @@ test("Responses tool images follow the complete result batch without changing so
 		await session.setModel({ ...faux.getModel(), api: "openai-responses" });
 		faux.setResponses([async (_context, options, _state, model) => {
 			const rewritten = await options?.onPayload?.(payload, model);
-			assert.ok(rewritten && typeof rewritten === "object" && "input" in rewritten && Array.isArray(rewritten.input));
 			assert.deepEqual(payload, original);
+			if (mode !== "user-message") {
+				assert.deepEqual(rewritten ?? payload, original, "native mode preserves Pi's outgoing payload");
+				return fauxAssistantMessage("wire verified");
+			}
+			assert.ok(rewritten && typeof rewritten === "object" && "input" in rewritten && Array.isArray(rewritten.input));
 			assert.deepEqual(rewritten.input.slice(0, 3).map((item) => item.call_id), ["first", "second", "third"]);
 			assert.deepEqual(rewritten.input[0].output, [{ type: "input_text", text: "evidence" }]);
 			assert.equal(rewritten.input[1].output, "plain result");
 			assert.equal(typeof rewritten.input[2].output, "string");
 			assert.deepEqual(rewritten.input.slice(3, 5).map((item) => item.role), ["user", "user"]);
 			assert.deepEqual(rewritten.input[3].content.slice(1), [image, image]);
+			assert.deepEqual(rewritten.input[4].content.slice(1), [image]);
+			assert.match(rewritten.input[3].content[0].text, /tool call first;/);
+			assert.match(rewritten.input[4].content[0].text, /tool call third;/);
 			assert.deepEqual(rewritten.input.at(-1), payload.input.at(-1));
 			const repeated = await options?.onPayload?.(rewritten, model);
 			assert.deepEqual(repeated ?? rewritten, rewritten, "normalization is idempotent");
@@ -4417,6 +4431,30 @@ test("Responses tool images follow the complete result batch without changing so
 	} finally {
 		session.dispose();
 		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("Responses tool image mode reports invalid configuration when loading the extension", { timeout: TEST_TIMEOUT_MS }, async (t) => {
+	const previousMode = process.env.LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES;
+	t.after(() => {
+		if (previousMode === undefined) delete process.env.LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES;
+		else process.env.LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES = previousMode;
+	});
+	const root = mkdtempSync(join(tmpdir(), "pi-ledger-image-mode-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const resourceLoader = new DefaultResourceLoader({
+		cwd: root,
+		agentDir: root,
+		noExtensions: true,
+		extensionFactories: [createLedgerContext()],
+	});
+	for (const mode of ["", "user-mesage", "1"]) {
+		process.env.LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES = mode;
+		await resourceLoader.reload();
+		const loaded = resourceLoader.getExtensions();
+		assert.equal(loaded.extensions.length, 0);
+		assert.equal(loaded.errors.length, 1);
+		assert.match(loaded.errors[0].error, /LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES must be native or user-message/);
 	}
 });
 
