@@ -42,6 +42,9 @@ export const MAX_HISTORY_IMAGE_HEIGHT = 2_000;
 export const MAX_HISTORY_IMAGE_BASE64_BYTES = 4.5 * 1024 * 1024;
 export const MAX_HISTORY_IMAGE_NOTE_LENGTH = 1_024;
 
+const LEDGER_CONTENTS = "goal/status; still-applicable constraints and decisions; execution and verification evidence; next step/wait; recovery references; and useful skills (or none)";
+const CHECKPOINT_LEDGER_GUIDELINES = `Write a complete ledger of the current working state covering ${LEDGER_CONTENTS}. Integrate still-needed state from the current checkpoint, subsequent delta and recent work. Replace the complete baseline. Separate plans from facts; distinguish executed work from verified results and redact secrets.`;
+
 const checkpointParameters = Type.Object({
 	ledger: Type.String({ minLength: 1, description: "Complete active working ledger; at most 65536 UTF-8 bytes and the configured ledger token budget. The receipt reports coverage separately." }),
 	sourceQuotes: Type.Optional(
@@ -643,7 +646,8 @@ function reminderText(
 	return [
 		`Ledger Context ${noticeLabel} reminder.`,
 		"Automated maintenance request from the Ledger Context extension.",
-		"Call the checkpoint tool now with a complete ledger of the ongoing task: goal/status, applicable constraints and decisions, execution and verification evidence, and next action or wait condition.",
+		"Call the checkpoint tool now.",
+		CHECKPOINT_LEDGER_GUIDELINES,
 		"Optional sourceQuotes: exact phrases from relevant task messages or ordinary execution evidence. Keep essential facts in ledger. Exclude this maintenance notice from task facts and sourceQuotes.",
 		'After the tool confirms "Checkpoint saved", continue the ongoing task.',
 		`Trigger: ${[...new Set(reasons.map((reason) => reason.kind === "stale-volume" ? "stale-volume (10% work interval)" : `${reason.level} budget pressure`))].join("; ")}.`,
@@ -3920,7 +3924,7 @@ async function generateCompactionDelta(
 		if (maxTokens < 1) return failure("input-capacity");
 		const systemPrompt = [
 			"Write the cumulative changes since the main agent's checkpoint. Return only the delta text, without tool calls.",
-			"The checkpoint describes the saved working state and is read-only background. Describe what changed after that state: user corrections, decisions, execution outcomes, verification, changed next steps or waits. Do not rewrite or repeat the complete checkpoint.",
+			`The checkpoint describes the saved working state and is read-only background. Describe changes to ${LEDGER_CONTENTS}, including user corrections. Report changed dimensions only; keep the complete baseline in the checkpoint.`,
 			"Carry forward still-relevant changes from the previous delta. It is a lossy summary, not original evidence. Mark an earlier change superseded only when later supplied evidence supports that conclusion. If no checkpoint exists, the origin is the branch beginning; the output remains a delta.",
 			"Distinguish user requirements, plans, requested operations, tool-reported outcomes and independent verification. Preserve constraints introduced or changed after the checkpoint and facts that prevent repeating side effects. Attach supplied pi://entry references to consequential changes; never invent source IDs.",
 			'Optionally end with a new line starting <source-references>[{"entryId":"supplied ID","quote":"optional exact source phrase"}]</source-references>. This JSON array replaces the complete cumulative source list; omission clears it. Order up to 8 sources by recovery priority. Copy only supplied IDs; optional phrases are at most 512 characters. Keep essential facts in the delta body.',
@@ -4244,7 +4248,8 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		promptSnippet: "save working state for context recovery",
 		promptGuidelines: [
 			"Optionally supply sourceQuotes copied exactly from source messages, in recovery priority order. This replaces the full source list; omission clears it. Ledger must contain all essential facts. Quote resolution warnings do not undo a successful save.",
-			"After important decisions or user corrections, describe the current working state: goal/status, still-applicable constraints and decisions, execution and verification evidence, next step/wait, recovery references and useful skills (or none). Integrate still-needed state from the current checkpoint, subsequent delta and recent work. This replaces the complete baseline; a short change note is insufficient. Old versions remain in history. Separate plans from facts and redact secrets. Input measurement is unmeasured. A save continues this window; pi controls compaction.",
+			CHECKPOINT_LEDGER_GUIDELINES,
+			"Save after important decisions or user corrections. Old versions remain in history. Input measurement is unmeasured. A save continues this window; pi controls compaction.",
 		],
 		parameters: checkpointParameters,
 		executionMode: "sequential",
