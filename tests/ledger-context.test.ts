@@ -33,10 +33,14 @@ import {
 	fauxToolCall,
 	getCurrentSystemPrompt,
 	getCurrentTools,
+	normalizeContext,
 	type Context,
 	type JsonObject,
 	type TranscriptContext,
 } from "@earendil-works/pi-ai";
+import { stream as streamResponses } from "@earendil-works/pi-ai/api/openai-responses";
+import { stream as streamCompletions } from "@earendil-works/pi-ai/api/openai-completions";
+import { stream as streamAnthropic } from "@earendil-works/pi-ai/api/anthropic-messages";
 import { CHECKPOINT_ENTRY_TYPE, MAX_HISTORY_IMAGE_BASE64_BYTES, REMINDER_MESSAGE_TYPE, createLedgerContext, type LedgerContextSettingsReader, type LedgerCompactionDetails } from "../src/ledger-context.ts";
 
 const TEST_TIMEOUT_MS = 5_000;
@@ -45,13 +49,134 @@ const RED_2X2_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEUlEQVR4nGP
 const BLUE_3X2_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAYAAACddGYaAAAAEElEQVR4nGNgYPj/H4GROACPigv118uacgAAAABJRU5ErkJggg==";
 const UNMEASURED_INPUT_RECORD = { measurement: "unmeasured", source: "agent-context", snapshotThrough: null, recoveryBasis: null };
 
+test("checkpoint source quotes resolve snapshot evidence without blocking saves or inheriting old references", async (t) => {
+	const fixture = await createFixture(true, [], 1, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager: manager, faux, ledgerFaux } = fixture;
+	const unique = manager.appendMessage({ role: "user", content: "u".repeat(8_000) + " exact quoted constraint " + "z".repeat(8_000), timestamp: Date.now() });
+	const repeated = [manager.appendMessage({ role: "user", content: "shared exact phrase", timestamp: Date.now() }),
+		manager.appendMessage(fauxAssistantMessage("shared exact phrase"))];
+	const sourceQuotes = ["exact quoted constraint", "shared exact phrase", "absent original phrase"];
+	faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Keep the constraint and continue.", sourceQuotes })), fauxAssistantMessage("saved")]);
+	await session.prompt("Save working state.");
+	const saved = checkpointEntries(manager.getBranch()).at(-1)!;
+	const references = (saved.data as any).sourceReferences;
+	assert.deepEqual(references.map((reference: any) => reference.matchCount), [1, 2, 0]);
+	assert.equal(references[0].matches[0].entryId, unique);
+	assert.deepEqual(references[1].matches.map((match: any) => match.entryId), repeated);
+	const receipt = messageEntries(manager.getBranch()).find(entry => entry.message.role === "toolResult" && entry.message.toolName === "checkpoint")!;
+	assert.match(toolResultText(receipt), /Checkpoint saved/);
+	assert.match(toolResultText(receipt), /ambiguous/);
+	assert.match(toolResultText(receipt), /unmatched/);
+	assert.equal((receipt.message as any).isError, false);
+	ledgerFaux.setResponses([fauxAssistantMessage("No new material changes.")]);
+	await session.compact();
+	const recovery = latestCompaction(manager.getBranch()).summary;
+	assert.match(recovery, /exact quoted constraint/);
+	assert.match(recovery, /shared exact phrase/);
+	assert.match(recovery, /ambiguous/);
+	assert.match(recovery, /unmatched/);
+	assert.doesNotMatch(recovery, /u{2000}|z{2000}/);
+	await session.reload();
+	assert.deepEqual((checkpointEntries(manager.getBranch()).at(-1)!.data as any).sourceReferences, references);
+	faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "The current state needs no source excerpts." })), fauxAssistantMessage("saved")]);
+	await session.prompt("Save a fresh baseline.");
+	assert.deepEqual((checkpointEntries(manager.getBranch()).at(-1)!.data as any).sourceReferences, []);
+});
+
 function generatedDelta(entry: Extract<SessionEntry, { type: "compaction" }>) {
 	const details = entry.details as LedgerCompactionDetails;
-	assert.equal(details.schemaVersion, 5);
+	assert.equal(details.schemaVersion, 6);
 	assert.equal(details.delta.status, "generated");
 	assert.ok(details.delta.status === "generated");
 	return details.delta.record;
 }
+
+test("quote resolution respects request boundaries, edits, maintenance exclusion and bounded ambiguity", async (t) => {
+	let manager: SessionManager;
+	const mutate: ToolDefinition = { name: "late_input", label: "Late input", description: "Append evidence after the request snapshot.", parameters: Type.Object({}), executionMode: "sequential",
+		execute: async () => { manager.appendMessage({ role: "user", content: "arrived after the request", timestamp: Date.now() }); return { content: [{ type: "text", text: "appended" }], details: {} }; } };
+	const fixture = await createFixture(false, [], 1, { compactionEnabled: false, extraToolNames: ["late_input"], customTools: [mutate] });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	manager = fixture.sessionManager;
+	const edited = manager.appendMessage({ role: "user", content: "original replaced phrase", timestamp: Date.now() });
+	const edit = manager.appendContextEdit(edited, { content: "effective replacement phrase" });
+	const omitted = manager.appendMessage({ role: "user", content: "excluded source phrase", timestamp: Date.now() });
+	manager.appendContextEdit(omitted, null);
+	const duplicates = Array.from({ length: 6 }, () => manager.appendMessage({ role: "user", content: "shared candidate phrase", timestamp: Date.now() }));
+	manager.appendCustomMessageEntry("generated-note", "generated source phrase", false);
+	manager.appendMessage({ role: "toolResult", toolCallId: "old-history", toolName: "history_read", content: [{ type: "text", text: "generated source phrase" }], isError: false, timestamp: Date.now() });
+	fixture.faux.setResponses([fauxAssistantMessage([
+		fauxToolCall("late_input", {}),
+		fauxToolCall("checkpoint", { ledger: "Use the effective replacement.", sourceQuotes: ["effective replacement phrase", "original replaced phrase", "excluded source phrase", "shared candidate phrase", "generated source phrase", "arrived after the request"] }),
+	]), fauxAssistantMessage("saved")]);
+	await fixture.session.prompt("Save the snapshot.");
+	const checkpoint = checkpointEntries(manager.getBranch()).at(-1)!;
+	const data = checkpoint.data as any;
+	assert.deepEqual(data.sourceReferences.map((reference: any) => reference.matchCount), [1, 0, 0, 6, 0, 0]);
+	assert.deepEqual(data.sourceReferences[0].matches, [{ entryId: edited, editEntryId: edit, offset: 0 }]);
+	assert.deepEqual(data.sourceReferences[3].matches.map((match: any) => match.entryId), duplicates.slice(0, 4));
+	await fixture.session.reload();
+	assert.deepEqual((checkpointEntries(manager.getBranch()).at(-1)!.data as any).sourceReferences, data.sourceReferences);
+});
+
+test("delta reference footers are parsed, bounded to supplied sources and replaced with each cumulative ledger", async (t) => {
+	const fixture = await createFixture(false, [], 1, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager: manager, ledgerFaux } = fixture;
+	const source = manager.appendMessage({ role: "user", content: "Original wording.", timestamp: Date.now() });
+	const phrase = "Delta source <source-references> and </source-references> constraint.";
+	const edit = manager.appendContextEdit(source, { content: phrase });
+	manager.appendMessage(fauxAssistantMessage("observed work ".repeat(100)));
+	const footer = `<source-references>${JSON.stringify([{ entryId: edit, quote: phrase }, { entryId: "unseen-source" }])}</source-references>`;
+	ledgerFaux.setResponses([fauxAssistantMessage("Changes.\n<source-references>[broken]</source-references>"), fauxAssistantMessage(`Changes.\n${footer}`)]);
+	await session.compact();
+	const first = latestCompaction(manager.getBranch());
+	const delta = generatedDelta(first);
+	assert.equal(ledgerFaux.state.callCount, 2);
+	assert.equal(delta.ledger, "Changes.");
+	assert.deepEqual(delta.sourceReferences.map(reference => reference.matchCount), [1, 0]);
+	assert.ok(first.summary.includes(phrase));
+	assert.match(first.summary, /unmatched/);
+	assert.doesNotMatch(first.summary, /<source-references>\[/);
+	manager.appendMessage({ role: "user", content: "Another operation.", timestamp: Date.now() });
+	manager.appendMessage(fauxAssistantMessage("new evidence ".repeat(100)));
+	ledgerFaux.setResponses([(context) => {
+		assert.match(JSON.stringify(context.messages), new RegExp(source));
+		return fauxAssistantMessage(`Cumulative changes.\n${footer}`);
+	}]);
+	await session.compact();
+	assert.equal(generatedDelta(latestCompaction(manager.getBranch())).sourceReferences[0].matches[0].entryId, source);
+	manager.appendMessage({ role: "user", content: "The source is no longer needed.", timestamp: Date.now() });
+	manager.appendMessage(fauxAssistantMessage("done ".repeat(100)));
+	ledgerFaux.setResponses([fauxAssistantMessage("Final cumulative changes.")]);
+	await session.compact();
+	const cleared = latestCompaction(manager.getBranch());
+	assert.deepEqual(generatedDelta(cleared).sourceReferences, []);
+	assert.ok(!cleared.summary.includes(phrase));
+	assert.equal(delta.ledger, "Changes.");
+	await session.reload();
+});
+
+test("source recovery spends tight budgets in selector priority order and merges overlapping excerpts", async (t) => {
+	const previous = process.env.LEDGER_CONTEXT_SOURCE_TOKENS;
+	process.env.LEDGER_CONTEXT_SOURCE_TOKENS = "250";
+	t.after(() => { if (previous === undefined) delete process.env.LEDGER_CONTEXT_SOURCE_TOKENS; else process.env.LEDGER_CONTEXT_SOURCE_TOKENS = previous; });
+	const fixture = await createFixture(false, [], 1, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager: manager, faux, ledgerFaux } = fixture;
+	const source = manager.appendMessage({ role: "user", content: "LOW PRIORITY " + "a".repeat(3000) + " HIGH PRIORITY " + "z".repeat(3000), timestamp: Date.now() });
+	faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Current state.", sourceQuotes: ["HIGH PRIORITY", "LOW PRIORITY", "HIGH PRIOR", "missing one", "missing two", "missing three", "missing four", "missing five"] })), fauxAssistantMessage("saved")]);
+	await session.prompt("Preserve selected evidence.");
+	ledgerFaux.setResponses([fauxAssistantMessage("Current changes.")]);
+	await session.compact();
+	const summary = latestCompaction(manager.getBranch()).summary;
+	const sources = summary.slice(summary.indexOf("<source-recovery>"), summary.indexOf("</source-recovery>") + "</source-recovery>".length);
+	assert.match(sources, /HIGH PRIORITY/);
+	assert.doesNotMatch(sources, /LOW PRIORITY/);
+	assert.equal(sources.split(`[entry ${source}]`).length - 1, 1);
+	assert.ok(textTokenEstimate(sources) <= 250);
+});
 
 test("agent checkpoint ownership survives cumulative deltas and updates the next request", { timeout: TEST_TIMEOUT_MS }, async () => {
 	const { root, faux, ledgerFaux, session, sessionManager } = await createFixture(true, [], 1, { compactionEnabled: false });
@@ -99,7 +224,7 @@ test("agent checkpoint ownership survives cumulative deltas and updates the next
 });
 
 function use4kRecoveryBudgets(t: TestContext): void {
-	for (const name of ["LEDGER_CONTEXT_TASK_TOKENS", "LEDGER_CONTEXT_TAIL_TOKENS"]) {
+	for (const name of ["LEDGER_CONTEXT_SOURCE_TOKENS", "LEDGER_CONTEXT_TAIL_TOKENS"]) {
 		const previous = process.env[name];
 		process.env[name] = "4096";
 		t.after(() => {
@@ -788,6 +913,7 @@ test("checkpoint and manual compaction use the public SDK seam", { timeout: TEST
 			fauxAssistantMessage(
 				fauxToolCall("checkpoint", {
 					ledger: "Goal: preserve the task across compaction.\nNext: verify the restored request.",
+					sourceQuotes: ["Continue the ledger integration task"],
 				}),
 			),
 			fauxAssistantMessage("checkpoint saved"),
@@ -800,15 +926,13 @@ test("checkpoint and manual compaction use the public SDK seam", { timeout: TEST
 		assert.ok(checkpoint);
 		assert.equal(checkpoint.type, "custom");
 		const checkpointData = checkpoint.data as {
-			activeRequestEntryIds?: string[];
+			sourceReferences?: Array<{ matches: Array<{ entryId: string }> }>;
 			requestHistoryPosition?: { entryId: string | null };
 			sourceWindowId?: string;
 		};
 		assert.match(JSON.stringify(checkpoint.data), /preserve the task/);
 		const userEntryId = messageEntries(sessionManager.getBranch()).find((entry) => entry.message.role === "user")!.id;
-		assert.ok(
-			checkpointData.activeRequestEntryIds?.includes(userEntryId),
-		);
+		assert.deepEqual(checkpointData.sourceReferences?.[0].matches.map(match => match.entryId), [userEntryId]);
 		assert.equal(checkpointData.requestHistoryPosition?.entryId, userEntryId);
 		const toolReceipt = messageEntries(sessionManager.getBranch()).find(
 			(entry) => entry.message.role === "toolResult" && entry.message.toolName === "checkpoint",
@@ -830,7 +954,7 @@ test("checkpoint and manual compaction use the public SDK seam", { timeout: TEST
 		const compaction = branch.filter((entry) => entry.type === "compaction").at(-1);
 		assert.ok(compaction);
 		assert.ok(branch.some((entry) => entry.id === compaction.firstKeptEntryId));
-		assert.equal((compaction.details as { schemaVersion: number; kind: string }).schemaVersion, 5);
+		assert.equal((compaction.details as { schemaVersion: number; kind: string }).schemaVersion, 6);
 		assert.equal((compaction.details as { schemaVersion: number; kind: string }).kind, "ledger-context");
 		const provenance = compaction.details as {
 			checkpointEntryId: string | null;
@@ -1175,7 +1299,7 @@ test("long native run recovers twenty windows and reads its earliest operation",
 	};
 	try {
 		const responses: Array<(context: Context) => ReturnType<typeof fauxAssistantMessage>> = [
-			wrapResponse(() => fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "long-run ledger: execute and verify every planned operation" }), { stopReason: "toolUse" })),
+			wrapResponse(() => fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "long-run ledger: execute and verify every planned operation", sourceQuotes: ["run the 40 operation ledger recovery task"] }), { stopReason: "toolUse" })),
 			...Array.from({ length: operationIds.length / 2 }, (_value, index) =>
 				wrapResponse(() =>
 					fauxAssistantMessage(
@@ -1361,13 +1485,33 @@ test("tool-batch reminders reach the next same-run provider request", { timeout:
 		const reminderIndex = messages.findIndex(
 			(message, index) =>
 				index > resultIndex &&
-				message.role === "user" &&
-				Array.isArray(message.content) &&
-				message.content.some((block) => block.type === "text" && block.text.includes("Ledger Context")),
+				message.role === "system" &&
+				JSON.stringify(message.content).includes("Call the checkpoint tool"),
 		);
 		assert.ok(assistantIndex >= 0);
 		assert.ok(resultIndex > assistantIndex);
 		assert.ok(reminderIndex > resultIndex, "the reminder must follow the complete tool batch");
+		for (const native of [true, false]) {
+			const model = { ...faux.getModel(), id: "inspection-only", provider: "openai", baseUrl: "http://127.0.0.1:1", reasoning: true,
+				compat: { supportsDeveloperRole: true, supportsMidConvoSystemMessages: native } };
+			const context = normalizeContext(resumedContext);
+			let payload: any;
+			const options = { apiKey: "inspection-only", maxTokens: 64, onPayload: (value: unknown) => { payload = value; throw new Error("payload captured before network"); } };
+			for (const run of [
+				() => streamResponses({ ...model, api: "openai-responses" }, context, options),
+				() => streamCompletions({ ...model, api: "openai-completions" }, context, options),
+				() => streamAnthropic({ ...model, provider: "anthropic", api: "anthropic-messages" }, context, options),
+			]) {
+				payload = undefined;
+				const result = await run().result();
+				assert.match(result.errorMessage ?? "", /payload captured before network/);
+				assert.ok(payload);
+				const instructionMessages = (payload.input ?? payload.messages).filter((message: any) => message.role === "system" || message.role === "developer");
+				const instructions = JSON.stringify([payload.system, ...instructionMessages]);
+				assert.match(instructions, /Call the checkpoint tool/);
+				assert.ok(!(payload.input ?? payload.messages).some((message: any) => message.role === "user" && JSON.stringify(message.content).includes("Call the checkpoint tool")));
+			}
+		}
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 		if (previousSoft === undefined) delete process.env.LEDGER_CONTEXT_REMINDER_TOKENS;
@@ -1405,9 +1549,14 @@ test("budget reminders are bounded, deduplicated per window, and explicit about 
 				providerContexts.push(context);
 				return fauxAssistantMessage("third reminder checkpoint");
 			},
+			(context) => {
+				providerContexts.push(context);
+				return fauxAssistantMessage("fourth reminder checkpoint");
+			},
 		]);
 		await session.prompt("small first turn");
 		await session.prompt("medium second turn " + "m".repeat(2_000));
+		await session.prompt("deliver the soft reminder before increasing pressure");
 		await session.prompt("large third turn " + "l".repeat(8_000));
 		faux.setResponses([
 			(context) => {
@@ -1498,14 +1647,7 @@ test("budget reminders are bounded, deduplicated per window, and explicit about 
 			assert.equal(new Set(persistedBudgetKeys).size, persistedBudgetKeys.length);
 			assert.equal(reopenContexts.length, 2);
 			const currentWindowReminderMessages = reopenContexts.flatMap((context) => context.messages).filter(
-				(message) =>
-					message.role === "user" &&
-					Array.isArray(message.content) &&
-					message.content.some(
-						(block) =>
-							block.type === "text" &&
-							(block.text.includes(`window: ${latestDetails.windowId}`) || block.text.includes(`pi://entry/${latest.id}`)),
-					),
+				(message) => message.role === "system" && JSON.stringify(message.content).includes(`window: ${latestDetails.windowId}`),
 			);
 			assert.ok(currentWindowReminderMessages.length >= 1);
 		} finally {
@@ -1595,7 +1737,7 @@ test("malformed persisted reminder details do not suppress a valid level", { tim
 		await session.prompt("deliver the soft reminder");
 		const windowId = `window:${sessionManager.getSessionId()}:initial`;
 		sessionManager.appendCustomMessageEntry(REMINDER_MESSAGE_TYPE, "malformed reminder", false, {
-			schemaVersion: 5,
+			schemaVersion: 6,
 			reminderKey: `${windowId}:urgent`,
 			level: "urgent",
 			windowId,
@@ -2490,7 +2632,7 @@ test("steering queued during native compaction is delivered once in order", { ti
 			(entry): entry is Extract<SessionEntry, { type: "compaction" }> => entry.type === "compaction",
 		);
 		assert.ok(compactions.length >= 1);
-		assert.ok(compactions.every((entry) => entry.fromHook === true && (entry.details as { schemaVersion?: number; kind?: string }).schemaVersion === 5));
+		assert.ok(compactions.every((entry) => entry.fromHook === true && (entry.details as { schemaVersion?: number; kind?: string }).schemaVersion === 6));
 		assert.equal(new Set(compactions.map((entry) => (entry.details as { windowId: string }).windowId)).size, compactions.length);
 		assert.ok(reminderContext);
 		assert.ok(steeringContext);
@@ -2516,8 +2658,7 @@ test("steering queued during native compaction is delivered once in order", { ti
 		assert.ok(resultIndex > assistantIndex);
 		assert.match(JSON.stringify(branchMessages[resultIndex].message), /large-tool-result/);
 		assert.match(JSON.stringify(reminderContext.messages), /Ledger Context urgent budget reminder/);
-		const refreshedNotice = reminderContext.messages.flatMap((message) => message.role === "user" && Array.isArray(message.content)
-			? message.content.flatMap((block) => block.type === "text" && block.text.startsWith("Ledger Context urgent budget reminder.") ? [block.text] : []) : [])[0];
+		const refreshedNotice = reminderContext.messages.flatMap((message) => message.role === "system" && typeof message.content === "string" && message.content.startsWith("Ledger Context urgent budget reminder.") ? [message.content] : [])[0];
 		assert.ok(refreshedNotice);
 		assert.ok(refreshedNotice.includes(`usage window: ${(compactions[0].details as LedgerCompactionDetails).windowId}`), "pressure that persists after compaction must be reported for the new window");
 		assert.doesNotMatch(refreshedNotice, /stale-volume/);
@@ -2592,7 +2733,7 @@ test("rejects invalid checkpoint input while retaining the previous version", { 
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "checkpoint")
 			.at(-1);
 		assert.ok(invalidReceipt);
-		assert.match(JSON.stringify((invalidReceipt.message as { content: unknown }).content), /must reference a user message/);
+		assert.match(JSON.stringify((invalidReceipt.message as { content: unknown }).content), /must not have additional properties/);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 		if (previousLimit === undefined) delete process.env.LEDGER_CONTEXT_LEDGER_TOKENS;
@@ -4098,12 +4239,12 @@ test("history_read image capacity aborts when the mandatory minimum cannot fit",
 test("history_read image remains in the immediate provider request across native compaction", { timeout: 15_000 }, async () => {
 	const previousTailLimit = process.env.LEDGER_CONTEXT_TAIL_TOKENS;
 	const previousReserve = process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS;
-	const previousTaskLimit = process.env.LEDGER_CONTEXT_TASK_TOKENS;
+	const previousTaskLimit = process.env.LEDGER_CONTEXT_SOURCE_TOKENS;
 	const previousSoftReminder = process.env.LEDGER_CONTEXT_REMINDER_TOKENS;
 	const previousUrgentReminder = process.env.LEDGER_CONTEXT_URGENT_TOKENS;
 	process.env.LEDGER_CONTEXT_TAIL_TOKENS = "4096";
 	process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS = "256";
-	process.env.LEDGER_CONTEXT_TASK_TOKENS = "64";
+	process.env.LEDGER_CONTEXT_SOURCE_TOKENS = "64";
 	process.env.LEDGER_CONTEXT_REMINDER_TOKENS = "2";
 	process.env.LEDGER_CONTEXT_URGENT_TOKENS = "1";
 	let firstToolStarted = () => {};
@@ -4206,8 +4347,8 @@ test("history_read image remains in the immediate provider request across native
 		else process.env.LEDGER_CONTEXT_TAIL_TOKENS = previousTailLimit;
 		if (previousReserve === undefined) delete process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS;
 		else process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS = previousReserve;
-		if (previousTaskLimit === undefined) delete process.env.LEDGER_CONTEXT_TASK_TOKENS;
-		else process.env.LEDGER_CONTEXT_TASK_TOKENS = previousTaskLimit;
+		if (previousTaskLimit === undefined) delete process.env.LEDGER_CONTEXT_SOURCE_TOKENS;
+		else process.env.LEDGER_CONTEXT_SOURCE_TOKENS = previousTaskLimit;
 		if (previousSoftReminder === undefined) delete process.env.LEDGER_CONTEXT_REMINDER_TOKENS;
 		else process.env.LEDGER_CONTEXT_REMINDER_TOKENS = previousSoftReminder;
 		if (previousUrgentReminder === undefined) delete process.env.LEDGER_CONTEXT_URGENT_TOKENS;
@@ -4567,8 +4708,8 @@ test("missing checkpoint generation cancellation and persistence failures cancel
 	}
 });
 
-test("task and tail defaults scale with the model window and allow independent overrides", { timeout: TEST_TIMEOUT_MS }, async () => {
-	const previousTask = process.env.LEDGER_CONTEXT_TASK_TOKENS;
+test("source and tail budgets scale with the model window and allow independent overrides", { timeout: TEST_TIMEOUT_MS }, async () => {
+	const previousTask = process.env.LEDGER_CONTEXT_SOURCE_TOKENS;
 	const previousTail = process.env.LEDGER_CONTEXT_TAIL_TOKENS;
 	try {
 		for (const { window, taskLimit, tailOverride, keepsAnswer } of [
@@ -4577,27 +4718,27 @@ test("task and tail defaults scale with the model window and allow independent o
 			{ window: 500_000, taskLimit: 25_000, tailOverride: undefined, keepsAnswer: true },
 			{ window: 40_000, taskLimit: 256, tailOverride: 64, keepsAnswer: false },
 		]) {
-			delete process.env.LEDGER_CONTEXT_TASK_TOKENS;
+			delete process.env.LEDGER_CONTEXT_SOURCE_TOKENS;
 			delete process.env.LEDGER_CONTEXT_TAIL_TOKENS;
 			if (tailOverride !== undefined) {
-				process.env.LEDGER_CONTEXT_TASK_TOKENS = String(taskLimit);
+				process.env.LEDGER_CONTEXT_SOURCE_TOKENS = String(taskLimit);
 				process.env.LEDGER_CONTEXT_TAIL_TOKENS = String(tailOverride);
 			}
 			const { root, faux, session, sessionManager } = await createFixture(true, [], 1_500, {
 				contextWindow: window, maxTokens: 512, reserveTokens: 0, compactionEnabled: false,
 			});
 			try {
-				faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Preserve the current task and recent evidence." })), fauxAssistantMessage("Saved.")]);
+				faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Preserve the current task and recent evidence.", sourceQuotes: ["Earlier task:"] })), fauxAssistantMessage("Saved.")]);
 				await session.prompt(`Earlier task: ${"a".repeat(12_000)}`);
 				const answer = `tail-budget-probe:${"t".repeat(4_800)}`;
 				faux.setResponses([fauxAssistantMessage(answer)]);
 				await session.prompt(`Latest task: ${"u".repeat(Math.max(8_000, taskLimit * 8))}`);
 				await session.compact();
 				const summary = latestCompaction(sessionManager.getBranch()).summary;
-				const task = summary.slice(summary.indexOf("<active>"), summary.indexOf("</latest>") + "</latest>".length);
-				assert.match(task, /Latest task/);
+				const task = summary.slice(summary.indexOf("<source-recovery>"), summary.indexOf("</source-recovery>") + "</source-recovery>".length);
+				assert.match(task, /Earlier task/);
 				assert.ok(textTokenEstimate(task) <= taskLimit);
-				assert.ok(textTokenEstimate(task) > taskLimit / 2, "the default budget must be available for a long request");
+				assert.ok(task.length > 0);
 				let context: Context | undefined;
 				faux.setResponses([(input) => { context = input; return fauxAssistantMessage("Resumed."); }]);
 				await session.prompt("Continue.");
@@ -4610,8 +4751,8 @@ test("task and tail defaults scale with the model window and allow independent o
 			}
 		}
 	} finally {
-		if (previousTask === undefined) delete process.env.LEDGER_CONTEXT_TASK_TOKENS;
-		else process.env.LEDGER_CONTEXT_TASK_TOKENS = previousTask;
+		if (previousTask === undefined) delete process.env.LEDGER_CONTEXT_SOURCE_TOKENS;
+		else process.env.LEDGER_CONTEXT_SOURCE_TOKENS = previousTask;
 		if (previousTail === undefined) delete process.env.LEDGER_CONTEXT_TAIL_TOKENS;
 		else process.env.LEDGER_CONTEXT_TAIL_TOKENS = previousTail;
 	}
@@ -4808,7 +4949,7 @@ test("global recovery pressure drops optional retained units before the latest r
 			retainedIds[0],
 			8_000,
 			{
-				schemaVersion: 5,
+				schemaVersion: 6,
 				kind: "ledger-context",
 				windowId,
 				sourceWindowId: `window:${sessionManager.getSessionId()}:initial`,
@@ -4817,7 +4958,7 @@ test("global recovery pressure drops optional retained units before the latest r
 				firstKeptEntryId: retainedIds[0],
 					snapshotPosition: { entryId: retainedIds.at(-1), branchDepth: sessionManager.getBranch().length },
 					delta: { status: "empty" },
-					recoveryContext: { taskEntryIds: [prefixId], tailEntryIds: [] },
+					recoveryContext: { tailEntryIds: [] },
 			},
 			true,
 		);
@@ -4872,12 +5013,12 @@ test("global recovery pressure drops optional retained units before the latest r
 test("native same-run compaction retains a persisted steering correction", { timeout: TEST_TIMEOUT_MS }, async () => {
 	const previousTailLimit = process.env.LEDGER_CONTEXT_TAIL_TOKENS;
 	const previousReserve = process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS;
-	const previousTaskLimit = process.env.LEDGER_CONTEXT_TASK_TOKENS;
+	const previousTaskLimit = process.env.LEDGER_CONTEXT_SOURCE_TOKENS;
 	const previousSoftReminder = process.env.LEDGER_CONTEXT_REMINDER_TOKENS;
 	const previousUrgentReminder = process.env.LEDGER_CONTEXT_URGENT_TOKENS;
 	process.env.LEDGER_CONTEXT_TAIL_TOKENS = "4096";
 	process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS = "256";
-	process.env.LEDGER_CONTEXT_TASK_TOKENS = "64";
+	process.env.LEDGER_CONTEXT_SOURCE_TOKENS = "64";
 	process.env.LEDGER_CONTEXT_REMINDER_TOKENS = "2";
 	process.env.LEDGER_CONTEXT_URGENT_TOKENS = "1";
 	let firstToolStarted = () => {};
@@ -4987,8 +5128,8 @@ test("native same-run compaction retains a persisted steering correction", { tim
 		else process.env.LEDGER_CONTEXT_TAIL_TOKENS = previousTailLimit;
 		if (previousReserve === undefined) delete process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS;
 		else process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS = previousReserve;
-		if (previousTaskLimit === undefined) delete process.env.LEDGER_CONTEXT_TASK_TOKENS;
-		else process.env.LEDGER_CONTEXT_TASK_TOKENS = previousTaskLimit;
+		if (previousTaskLimit === undefined) delete process.env.LEDGER_CONTEXT_SOURCE_TOKENS;
+		else process.env.LEDGER_CONTEXT_SOURCE_TOKENS = previousTaskLimit;
 		if (previousSoftReminder === undefined) delete process.env.LEDGER_CONTEXT_REMINDER_TOKENS;
 		else process.env.LEDGER_CONTEXT_REMINDER_TOKENS = previousSoftReminder;
 		if (previousUrgentReminder === undefined) delete process.env.LEDGER_CONTEXT_URGENT_TOKENS;
@@ -5229,7 +5370,7 @@ test("oversized retained units use a durable non-context tail marker", { timeout
 		if (marker.type !== "custom") throw new Error("missing tail marker");
 		assert.equal(preparations.length, 1);
 		assert.deepEqual(marker.data, {
-			schemaVersion: 5,
+			schemaVersion: 6,
 			sourceEntryId: preparations[0],
 			reason: "tail-budget",
 		});
@@ -5313,9 +5454,9 @@ test("tail marker bootstrap preserves removed tool execution facts and reference
 	}
 });
 
-test("task budget keeps a bounded latest user request and complete reference", { timeout: TEST_TIMEOUT_MS }, async () => {
-	const previousTaskLimit = process.env.LEDGER_CONTEXT_TASK_TOKENS;
-	process.env.LEDGER_CONTEXT_TASK_TOKENS = "64";
+test("small source budget preserves compaction focus while recent messages retain their own references", { timeout: TEST_TIMEOUT_MS }, async () => {
+	const previousTaskLimit = process.env.LEDGER_CONTEXT_SOURCE_TOKENS;
+	process.env.LEDGER_CONTEXT_SOURCE_TOKENS = "64";
 	const { root, faux, session, sessionManager } = await createFixture(true, [], 64, {
 		contextWindow: 32_000,
 		maxTokens: 512,
@@ -5332,13 +5473,11 @@ test("task budget keeps a bounded latest user request and complete reference", {
 		await session.compact(`focus-sentinel:${"c".repeat(20_000)}`);
 		const compaction = sessionManager.getBranch().filter((entry) => entry.type === "compaction").at(-1);
 		assert.ok(compaction);
-		const taskStart = compaction.summary.indexOf("<active>");
+		const taskStart = compaction.summary.indexOf("<source-recovery>");
 		const recentStart = compaction.summary.indexOf("<recent-interaction>");
 		assert.ok(taskStart >= 0 && recentStart > taskStart);
 		const taskText = compaction.summary.slice(taskStart, recentStart);
 		assert.ok(estimateTokens({ role: "user", content: [{ type: "text", text: taskText }], timestamp: 0 }) <= 64);
-		assert.match(taskText, /latest-task-sentinel/);
-		assert.match(taskText, new RegExp(`pi://entry/${latestId}`));
 		assert.match(taskText, /focus-sentinel/);
 
 		let resumedContext: Context | undefined;
@@ -5351,22 +5490,25 @@ test("task budget keeps a bounded latest user request and complete reference", {
 		await session.prompt("resume after bounded task");
 		assert.ok(resumedContext);
 		const providerText = JSON.stringify(resumedContext.messages);
-		assert.match(providerText, /latest-task-sentinel/);
-		assert.match(providerText, new RegExp(`pi://entry/${latestId}`));
 		assert.match(providerText, /focus-sentinel/);
+		assert.match(providerText, new RegExp(latestId));
+		faux.setResponses([fauxAssistantMessage(fauxToolCall("history_read", { entryId: latestId, length: 128 })), fauxAssistantMessage("source expanded")]);
+		await session.prompt("expand the source only when needed");
+		const result = messageEntries(sessionManager.getBranch()).filter(entry => entry.message.role === "toolResult" && entry.message.toolName === "history_read").at(-1)!;
+		assert.match(toolResultText(result), /latest-task-sentinel/);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
-		if (previousTaskLimit === undefined) delete process.env.LEDGER_CONTEXT_TASK_TOKENS;
-		else process.env.LEDGER_CONTEXT_TASK_TOKENS = previousTaskLimit;
+		if (previousTaskLimit === undefined) delete process.env.LEDGER_CONTEXT_SOURCE_TOKENS;
+		else process.env.LEDGER_CONTEXT_SOURCE_TOKENS = previousTaskLimit;
 	}
 });
 
 test("near-capacity context keeps the latest correction when the summary fits", { timeout: TEST_TIMEOUT_MS }, async () => {
-	const previousTaskLimit = process.env.LEDGER_CONTEXT_TASK_TOKENS;
+	const previousTaskLimit = process.env.LEDGER_CONTEXT_SOURCE_TOKENS;
 	const previousTailLimit = process.env.LEDGER_CONTEXT_TAIL_TOKENS;
 	const previousReserve = process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS;
 	const tailBudget = 128;
-	process.env.LEDGER_CONTEXT_TASK_TOKENS = "64";
+	process.env.LEDGER_CONTEXT_SOURCE_TOKENS = "64";
 	process.env.LEDGER_CONTEXT_TAIL_TOKENS = String(tailBudget);
 	process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS = "256";
 	const { root, faux, session, sessionManager } = await createFixture(true, [], 64, {
@@ -5455,8 +5597,8 @@ test("near-capacity context keeps the latest correction when the summary fits", 
 		assert.match(latestUserText, new RegExp(`pi://entry/${correctionEntry.id}`));
 	} finally {
 		rmSync(root, { recursive: true, force: true });
-		if (previousTaskLimit === undefined) delete process.env.LEDGER_CONTEXT_TASK_TOKENS;
-		else process.env.LEDGER_CONTEXT_TASK_TOKENS = previousTaskLimit;
+		if (previousTaskLimit === undefined) delete process.env.LEDGER_CONTEXT_SOURCE_TOKENS;
+		else process.env.LEDGER_CONTEXT_SOURCE_TOKENS = previousTaskLimit;
 		if (previousTailLimit === undefined) delete process.env.LEDGER_CONTEXT_TAIL_TOKENS;
 		else process.env.LEDGER_CONTEXT_TAIL_TOKENS = previousTailLimit;
 		if (previousReserve === undefined) delete process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS;
@@ -5653,7 +5795,7 @@ test("history navigation discovers checkpoint versions independently of recovery
 	const fixture = await createFixture(false, [], 70, { compactionEnabled: false, extraToolNames: ["history_list_items"] });
 	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
 	const { sessionManager } = fixture;
-	const data = { schemaVersion: 5, kind: "agent-checkpoint", activeRequestEntryIds: [], sourceWindowId: "metadata-only-key", requestHistoryPosition: { entryId: null, branchDepth: 0 }, inputCoverage: UNMEASURED_INPUT_RECORD };
+	const data = { schemaVersion: 6, kind: "agent-checkpoint", sourceReferences: [], sourceWindowId: "metadata-only-key", requestHistoryPosition: { entryId: null, branchDepth: 0 }, inputCoverage: UNMEASURED_INPUT_RECORD };
 	const first = sessionManager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, { ...data, ledger: "historic constraint" });
 	const second = sessionManager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, { ...data, ledger: `historic oversized ${"x".repeat(2_000)}` });
 	const listed = await navigationCall(fixture, "history_list_items", { limit: 1, filter: { kinds: ["checkpoint"] } });
@@ -5719,7 +5861,7 @@ test("history navigation freezes windows and item pages across later compaction"
 	const { sessionManager } = fixture;
 	const initial = `window:${sessionManager.getSessionId()}:initial`;
 	const seed = sessionManager.appendMessage({ role: "user", content: "window seed", timestamp: Date.now() });
-	const details = (windowId: string, sourceWindowId: string) => ({ schemaVersion: 5, kind: "ledger-context", windowId, sourceWindowId, checkpointEntryId: null, sourceBranchTip: sessionManager.getLeafId(), firstKeptEntryId: seed, snapshotPosition: { entryId: seed, branchDepth: sessionManager.getBranch().findIndex((entry) => entry.id === seed) + 1 }, delta: { status: "empty" }, recoveryContext: { taskEntryIds: [seed], tailEntryIds: [] } });
+	const details = (windowId: string, sourceWindowId: string) => ({ schemaVersion: 6, kind: "ledger-context", windowId, sourceWindowId, checkpointEntryId: null, sourceBranchTip: sessionManager.getLeafId(), firstKeptEntryId: seed, snapshotPosition: { entryId: seed, branchDepth: sessionManager.getBranch().findIndex((entry) => entry.id === seed) + 1 }, delta: { status: "empty" }, recoveryContext: { tailEntryIds: [] } });
 	sessionManager.appendCompaction("first window", seed, 100, details("window:first", initial), true);
 	const before = await navigationCall(fixture, "history_list_windows", { limit: 1 });
 	const page = (before.message as { details: { windows: Array<Record<string, any>>; nextCursor: string } }).details;
@@ -5836,7 +5978,7 @@ test("history window listing shrinks optional previews before rejecting mandator
 	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
 	const initial = `window:${fixture.sessionManager.getSessionId()}:initial`;
 	const checkpointId = fixture.sessionManager.appendCustomEntry(CHECKPOINT_ENTRY_TYPE, {
-		schemaVersion: 5, kind: "agent-checkpoint", activeRequestEntryIds: [], sourceWindowId: initial,
+		schemaVersion: 6, kind: "agent-checkpoint", sourceReferences: [], sourceWindowId: initial,
 		requestHistoryPosition: { entryId: null, branchDepth: 0 }, ledger: "A".repeat(256),
 		inputCoverage: UNMEASURED_INPUT_RECORD,
 	});
@@ -5879,9 +6021,9 @@ test("history window active flags match restored state after non-ledger compacti
 	const initial = `window:${sessionManager.getSessionId()}:initial`;
 	const seed = sessionManager.appendMessage({ role: "user", content: "window source", timestamp: Date.now() });
 	sessionManager.appendCompaction("ledger summary", seed, 100, {
-		schemaVersion: 5, kind: "ledger-context", windowId: "window:tracked", sourceWindowId: initial,
+		schemaVersion: 6, kind: "ledger-context", windowId: "window:tracked", sourceWindowId: initial,
 		checkpointEntryId: null, sourceBranchTip: seed, firstKeptEntryId: seed,
-		snapshotPosition: { entryId: seed, branchDepth: sessionManager.getBranch().findIndex((entry) => entry.id === seed) + 1 }, delta: { status: "empty" }, recoveryContext: { taskEntryIds: [seed], tailEntryIds: [] },
+		snapshotPosition: { entryId: seed, branchDepth: sessionManager.getBranch().findIndex((entry) => entry.id === seed) + 1 }, delta: { status: "empty" }, recoveryContext: { tailEntryIds: [] },
 	}, true);
 	sessionManager.appendCompaction("native summary", seed, 100);
 	await fixture.session.reload();
@@ -6087,14 +6229,14 @@ test("history read explains view conflicts and supplies exact bounded continuati
 
 test("delta input records remain immutable across cumulative updates, agent saves, reload and branches", async (t) => {
 	const previousTail = process.env.LEDGER_CONTEXT_TAIL_TOKENS;
-	const previousTask = process.env.LEDGER_CONTEXT_TASK_TOKENS;
+	const previousTask = process.env.LEDGER_CONTEXT_SOURCE_TOKENS;
 	process.env.LEDGER_CONTEXT_TAIL_TOKENS = "512";
 	t.after(() => { if (previousTail === undefined) delete process.env.LEDGER_CONTEXT_TAIL_TOKENS; else process.env.LEDGER_CONTEXT_TAIL_TOKENS = previousTail; });
-	t.after(() => { if (previousTask === undefined) delete process.env.LEDGER_CONTEXT_TASK_TOKENS; else process.env.LEDGER_CONTEXT_TASK_TOKENS = previousTask; });
+	t.after(() => { if (previousTask === undefined) delete process.env.LEDGER_CONTEXT_SOURCE_TOKENS; else process.env.LEDGER_CONTEXT_SOURCE_TOKENS = previousTask; });
 	const fixture = await createFixture(true, [], 1, { contextWindow: 32_000, maxTokens: 512, reserveTokens: 0, compactionEnabled: false, extraToolNames: ["history_list_items"] });
 	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
 	const { session, sessionManager: manager, faux, ledgerFaux } = fixture;
-	faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Initial task. Skills: none." })), fauxAssistantMessage("saved")]);
+	faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Initial task. Skills: none.", sourceQuotes: ["Original task anchor"] })), fauxAssistantMessage("saved")]);
 	await session.prompt("Original task anchor");
 	const base = checkpointEntries(manager.getBranch()).at(-1)!;
 	assert.deepEqual((base.data as any).inputCoverage, { ...UNMEASURED_INPUT_RECORD, snapshotThrough: (base.data as any).requestHistoryPosition.entryId });
@@ -6163,7 +6305,7 @@ test("delta input records remain immutable across cumulative updates, agent save
 	} while (cursor);
 	const branch = manager.getBranch();
 	assert.deepEqual(recoveredIds, branch.slice(branch.findIndex(entry => entry.id === recovery.fromEntryId), branch.findIndex(entry => entry.id === recovery.toEntryId) + 1).map(entry => entry.id));
-	faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Make correction an explicit task anchor.", activeRequestEntryIds: [correction] })), fauxAssistantMessage("anchor saved")]);
+	faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Preserve the correction as source evidence.", sourceQuotes: ["Important correction must remain discoverable"] })), fauxAssistantMessage("anchor saved")]);
 	await session.prompt("Carry the correction as an active request");
 	ledgerFaux.setResponses([(context) => {
 		assert.match(JSON.stringify(context.messages), /Important correction/);
@@ -6172,16 +6314,16 @@ test("delta input records remain immutable across cumulative updates, agent save
 	await session.compact();
 	const repaired = generatedDelta(latestCompaction(manager.getBranch())).inputCoverage;
 	assert.equal(repaired.baseDeltaCompactionEntryId, null, "a new checkpoint retires the old delta basis");
-	assert.ok(contains(manager.getBranch(), repaired.fullRanges, correction));
+	assert.ok(repaired.projections.some(part => part.entryId === correction && part.kind === "source-excerpt"));
 	assert.equal("outstandingGaps" in repaired, false);
 	assert.equal(JSON.stringify(first.details), firstRecord, "later input and browsing must not rewrite prior omission records");
-	process.env.LEDGER_CONTEXT_TASK_TOKENS = "128";
+	process.env.LEDGER_CONTEXT_SOURCE_TOKENS = "128";
 	manager.appendMessage({ role: "user", content: "Continue briefly", timestamp: Date.now() });
 	ledgerFaux.setResponses([fauxAssistantMessage("Carry previously supplied correction. Skills: none.")]);
 	await session.compact();
 	const carriedOwner = latestCompaction(manager.getBranch());
 	const carried = generatedDelta(carriedOwner).inputCoverage;
-	assert.equal(carried.projections.find((part) => part.entryId === correction)?.kind, "reference");
+	assert.equal(carried.projections.find((part) => part.entryId === correction)?.kind, "source-excerpt");
 	assert.equal("outstandingGaps" in carried, false);
 	const savedCoverage = JSON.stringify(carried);
 	manager.appendMessage({ role: "user", content: "Refresh will fail", timestamp: Date.now() });
@@ -6198,19 +6340,19 @@ test("delta input records remain immutable across cumulative updates, agent save
 	assert.equal(JSON.stringify(generatedDelta(latestCompaction(manager.getBranch())).inputCoverage).includes(correction), false);
 });
 
-test("coverage records task references, exact text prefixes and image representation", async (t) => {
-	const saved = { task: process.env.LEDGER_CONTEXT_TASK_TOKENS, tail: process.env.LEDGER_CONTEXT_TAIL_TOKENS };
-	process.env.LEDGER_CONTEXT_TASK_TOKENS = "256";
+test("coverage records selected source excerpts, exact history prefixes and image representation", async (t) => {
+	const saved = { task: process.env.LEDGER_CONTEXT_SOURCE_TOKENS, tail: process.env.LEDGER_CONTEXT_TAIL_TOKENS };
+	process.env.LEDGER_CONTEXT_SOURCE_TOKENS = "256";
 	process.env.LEDGER_CONTEXT_TAIL_TOKENS = "256";
 	t.after(() => {
-		for (const [name, value] of [["LEDGER_CONTEXT_TASK_TOKENS", saved.task], ["LEDGER_CONTEXT_TAIL_TOKENS", saved.tail]]) {
+		for (const [name, value] of [["LEDGER_CONTEXT_SOURCE_TOKENS", saved.task], ["LEDGER_CONTEXT_TAIL_TOKENS", saved.tail]]) {
 			if (value === undefined) delete process.env[name!]; else process.env[name!] = value;
 		}
 	});
 	const fixture = await createFixture(false, [], 64, { compactionEnabled: false, contextWindow: 32_000, maxTokens: 512, reserveTokens: 0 });
 	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
 	const { session, sessionManager: manager, faux, ledgerFaux } = fixture;
-	faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Anchor recorded. Skills: none." })), fauxAssistantMessage("saved")]);
+	faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Anchor recorded. Skills: none.", sourceQuotes: ["Large original task:"] })), fauxAssistantMessage("saved")]);
 	await session.prompt("Large original task: " + "anchor-content-".repeat(1000));
 	const anchor = manager.getBranch().find((entry) => entry.type === "message" && entry.message.role === "user")!.id;
 	const longText = "Long observed text: " + "准确🐱内容-".repeat(1000);
@@ -6228,8 +6370,8 @@ test("coverage records task references, exact text prefixes and image representa
 	const coverage = generatedDelta(latestCompaction(manager.getBranch())).inputCoverage;
 	assert.equal(coverage.representation, "rendered-text-with-image-references");
 	const reference = coverage.projections.find((part) => part.entryId === anchor)!;
-	assert.equal(reference.kind, "reference");
-	assert.equal(reference.providedChars, reference.totalChars);
+	assert.equal(reference.kind, "source-excerpt");
+	assert.ok(reference.providedChars < reference.totalChars);
 	assert.ok(reference.providedChars > 0);
 	const part = coverage.partialEntries.find((part) => part.entryId === long)!;
 	const rendered = `[entry ${long}] user\n${longText}`;
@@ -6299,7 +6441,7 @@ test("delta updates project the previous delta without recursively copying compa
 test("unmeasured input records expose no invented coverage and reject mixed formats", async (t) => {
 	const fixture = await createFixture(false, [], 64, { compactionEnabled: false });
 	t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
-	const data = { schemaVersion: 5, kind: "agent-checkpoint", ledger: "Saved by the agent.", activeRequestEntryIds: [], sourceWindowId: "initial", requestHistoryPosition: { entryId: null, branchDepth: 0 }, inputCoverage: UNMEASURED_INPUT_RECORD };
+	const data = { schemaVersion: 6, kind: "agent-checkpoint", ledger: "Saved by the agent.", sourceReferences: [], sourceWindowId: "initial", requestHistoryPosition: { entryId: null, branchDepth: 0 }, inputCoverage: UNMEASURED_INPUT_RECORD };
 	for (const invalid of [
 		{ ...data, inputCoverage: { ...UNMEASURED_INPUT_RECORD, omittedRanges: [] } },
 		{ ...data, inputCoverage: { ...UNMEASURED_INPUT_RECORD, baseCheckpointEntryId: "invented-basis" } },
@@ -6542,11 +6684,11 @@ test("a new edit to retained earlier evidence is supplied to the next cumulative
 	assert.equal(JSON.stringify(first.details), original);
 });
 
-test("edits after compaction refresh task sources on every request without rewriting the saved packet", async (t) => {
+test("edits after compaction refresh selected sources on every request without rewriting the saved packet", async (t) => {
 	const fixture = await createFixture(false, [], 1, { compactionEnabled: false });
 	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
 	const { session, sessionManager: manager, faux, ledgerFaux } = fixture;
-	faux.setResponses([fauxAssistantMessage("neutral result")]);
+	faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Keep source evidence available.", sourceQuotes: ["raw-task-secret-sentinel"] })), fauxAssistantMessage("neutral result")]);
 	await session.prompt("raw-task-secret-sentinel " + "x".repeat(1000));
 	const task = manager.getBranch().find((entry) => entry.type === "message" && entry.message.role === "user")!;
 	ledgerFaux.setResponses([fauxAssistantMessage("neutral delta")]);
@@ -6591,7 +6733,7 @@ test("context edit history exposes replacement image references and pixels", asy
 	const edit = manager.appendContextEdit(target, { content: [{ type: "image", mimeType: "image/png", data: RED_2X2_PNG }] });
 	manager.appendMessage(fauxAssistantMessage("recent evidence ".repeat(100)));
 	let deltaInput = "";
-	ledgerFaux.setResponses([(context) => { deltaInput = JSON.stringify(context.messages); return fauxAssistantMessage("neutral image delta"); }]);
+	ledgerFaux.setResponses([(context) => { deltaInput = JSON.stringify(context.messages); return fauxAssistantMessage(`neutral image delta\n<source-references>${JSON.stringify([{ entryId: anchor }])}</source-references>`); }]);
 	await session.compact();
 	assert.match(deltaInput, new RegExp(`pi://entry/${taskEdit}/content/0`));
 	assert.match(deltaInput, new RegExp(`pi://entry/${edit}/content/0`));
