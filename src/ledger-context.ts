@@ -635,32 +635,18 @@ function reminderUsage(pi: ExtensionAPI, ctx: ExtensionContext, settingsReader?:
 
 function reminderText(
 	level: ReminderLevel,
-	windowId: string,
-	usage: ReminderUsage,
 	reasons: ReminderReason[] = [],
-	usageWindowId = windowId,
 ): string {
-	const usageText = usage.usageKnown ? `${usage.tokens} Pi effective usage` : `${usage.tokens} bounded content estimate`;
-	const causes = reasons.length > 0
-		? reasons.map((reason) => reason.kind === "stale-volume" ? `stale-volume: ${reason.cause}` : `${reason.level} budget`).join("+")
-		: "budget";
-	const scopedReasons = reasons.filter((reason) => reason.windowId === windowId);
-	const referenceReasons = scopedReasons.length > 0 ? scopedReasons : reasons;
-	const checkpointEntryId = referenceReasons.find((reason) => reason.checkpointEntryId !== null)?.checkpointEntryId ?? "none";
-	const fromEntryId = referenceReasons.find((reason) => reason.fromEntryId !== null)?.fromEntryId ?? "none";
-	const toEntryId = referenceReasons.slice().reverse().find((reason) => reason.toEntryId !== null)?.toEntryId ?? "none";
 	const noticeLabel = reasons.some((reason) => reason.kind === "budget")
 		? `${level} budget`
 		: "stale-volume";
 	return [
 		`Ledger Context ${noticeLabel} reminder.`,
-		"Call the checkpoint tool now with a complete working ledger. After saving, continue the active task.",
-		`window: ${windowId}; usage window: ${usageWindowId}`,
-		`cause: ${causes}; checkpoint: ${checkpointEntryId}`,
-		`range: ${fromEntryId}..${toEntryId}`,
-		`usage: ${usageText}/${usage.contextWindow}; model remaining: ${Math.max(0, usage.modelRemaining)}`,
-		`effective boundary: ${usage.boundaryTokens}; remaining: ${Math.max(0, usage.boundaryRemaining)}`,
-		"Optional sourceQuotes: exact source phrases; keep essential facts in ledger.",
+		"Automated maintenance request from the Ledger Context extension.",
+		"Call the checkpoint tool now with a complete ledger of the ongoing task: goal/status, applicable constraints and decisions, execution and verification evidence, and next action or wait condition.",
+		"Optional sourceQuotes: exact phrases from relevant task messages or ordinary execution evidence. Keep essential facts in ledger. Exclude this maintenance notice from task facts and sourceQuotes.",
+		'After the tool confirms "Checkpoint saved", continue the ongoing task.',
+		`Trigger: ${[...new Set(reasons.map((reason) => reason.kind === "stale-volume" ? "stale-volume (10% work interval)" : `${reason.level} budget pressure`))].join("; ")}.`,
 	].join("\n");
 }
 
@@ -3539,7 +3525,7 @@ function revalidateReminderMessages(messages: ContextMessage[], state: SessionSt
 			for (const reason of applicable) seen.add(reason.kind);
 			const level = applicable.some((reason) => reason.level === "urgent") ? "urgent" : "soft";
 			// Keep persisted provenance for source matching; only the request's notice text is refreshed.
-			return [{ ...message, content: reminderText(level, state.activeWindowId, usage, applicable, state.activeWindowId) }];
+			return [{ ...message, content: reminderText(level, applicable) }];
 		}).reverse();
 	} catch (error) {
 		notify(ctx, `Ledger Context reminders disabled: ${error instanceof Error ? error.message : String(error)}`, "error");
@@ -3616,7 +3602,7 @@ function deliverReminderReasons(
 	state.pendingReminderReasons = mergeReminderReasons(state.pendingReminderReasons, reasons);
 	const message = {
 		customType: REMINDER_MESSAGE_TYPE,
-		content: reminderText(level, windowId, usage, reasons, state.activeWindowId),
+		content: reminderText(level, reasons),
 		display: false as const,
 		details,
 	};
@@ -4185,11 +4171,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 			const projection = projectContextMessages(messages, pi, ctx, state);
 			if (projection.error) throw new Error(projection.error);
 			state.currentAgentRequest = { position: requestPositionForContext(entries), recoveryBasis: projection.recoveryBasis ?? null };
-			return { messages: projection.messages.map((message): ContextMessage =>
-				message.role === "custom" && message.customType === REMINDER_MESSAGE_TYPE
-					? { role: "system", content: contentText(message.content), timestamp: message.timestamp }
-					: message,
-			) };
+			return { messages: projection.messages };
 		} catch (error) {
 			notify(ctx, `Ledger Context recovery error: ${error instanceof Error ? error.message : String(error)}`, "error");
 			ctx.abort();

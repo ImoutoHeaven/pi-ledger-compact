@@ -1432,12 +1432,13 @@ test("long native run recovers twenty windows and reads its earliest operation",
 	}
 });
 
-test("tool-batch reminders reach the next same-run provider request", { timeout: TEST_TIMEOUT_MS }, async () => {
+test("tool-batch reminders survive forced system prompts and reach every provider", { timeout: TEST_TIMEOUT_MS }, async () => {
 	const previousSoft = process.env.LEDGER_CONTEXT_REMINDER_TOKENS;
 	const previousUrgent = process.env.LEDGER_CONTEXT_URGENT_TOKENS;
 	process.env.LEDGER_CONTEXT_REMINDER_TOKENS = "7000";
 	process.env.LEDGER_CONTEXT_URGENT_TOKENS = "6000";
 	const noopExtension = (pi: ExtensionAPI): void => {
+		pi.on("before_agent_start", (event) => ({ systemPrompt: `${event.systemPrompt}\n\nFORCED_PROMPT_SENTINEL` }));
 		pi.registerTool({
 			name: "noop",
 			label: "Noop",
@@ -1485,12 +1486,13 @@ test("tool-batch reminders reach the next same-run provider request", { timeout:
 		const reminderIndex = messages.findIndex(
 			(message, index) =>
 				index > resultIndex &&
-				message.role === "system" &&
+				message.role === "user" &&
 				JSON.stringify(message.content).includes("Call the checkpoint tool"),
 		);
 		assert.ok(assistantIndex >= 0);
 		assert.ok(resultIndex > assistantIndex);
 		assert.ok(reminderIndex > resultIndex, "the reminder must follow the complete tool batch");
+		assert.match(getCurrentSystemPrompt(messages), /FORCED_PROMPT_SENTINEL/);
 		for (const native of [true, false]) {
 			const model = { ...faux.getModel(), id: "inspection-only", provider: "openai", baseUrl: "http://127.0.0.1:1", reasoning: true,
 				compat: { supportsDeveloperRole: true, supportsMidConvoSystemMessages: native } };
@@ -1508,8 +1510,9 @@ test("tool-batch reminders reach the next same-run provider request", { timeout:
 				assert.ok(payload);
 				const instructionMessages = (payload.input ?? payload.messages).filter((message: any) => message.role === "system" || message.role === "developer");
 				const instructions = JSON.stringify([payload.system, ...instructionMessages]);
-				assert.match(instructions, /Call the checkpoint tool/);
-				assert.ok(!(payload.input ?? payload.messages).some((message: any) => message.role === "user" && JSON.stringify(message.content).includes("Call the checkpoint tool")));
+				assert.match(instructions, /FORCED_PROMPT_SENTINEL/);
+				assert.doesNotMatch(instructions, /Call the checkpoint tool/);
+				assert.ok((payload.input ?? payload.messages).some((message: any) => message.role === "user" && JSON.stringify(message.content).includes("Call the checkpoint tool")));
 			}
 		}
 	} finally {
@@ -1519,6 +1522,45 @@ test("tool-batch reminders reach the next same-run provider request", { timeout:
 		if (previousUrgent === undefined) delete process.env.LEDGER_CONTEXT_URGENT_TOKENS;
 		else process.env.LEDGER_CONTEXT_URGENT_TOKENS = previousUrgent;
 	}
+});
+
+test("maintenance reminders stay out of checkpoint and delta sources while preserving snapshot boundaries", async (t) => {
+	const ordinaryWork = (pi: ExtensionAPI) => pi.registerTool({ name: "ordinary_work", label: "Work", description: "Produce ordinary evidence.", parameters: Type.Object({}),
+		execute: async () => ({ content: [{ type: "text" as const, text: "ordinary evidence ".repeat(1000) }], details: {} }) });
+	const fixture = await createFixture(false, [ordinaryWork], 1, { contextWindow: 32_000, maxTokens: 512, reserveTokens: 0, compactionEnabled: false, extraToolNames: ["ordinary_work"] });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager: manager, faux, ledgerFaux } = fixture;
+	const task = "Preserve the original task constraint.";
+	let reminderId = "", quote = "", snapshotTip: string | null = null;
+	faux.setResponses([
+		fauxAssistantMessage(fauxToolCall("ordinary_work", {}), { stopReason: "toolUse" }),
+		(context) => {
+			const reminder = manager.getBranch().find(entry => entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE);
+			assert.ok(reminder?.type === "custom_message");
+			reminderId = reminder.id;
+			quote = String(reminder.content).split("\n")[0];
+			snapshotTip = manager.getLeafId();
+			assert.equal(snapshotTip, reminderId, "the maintenance entry may be the real request boundary");
+			assert.ok(context.messages.some(message => message.role === "user" && JSON.stringify(message.content).includes(quote)));
+			assert.match(String(reminder.content), /Exclude this maintenance notice from task facts and sourceQuotes/);
+			return fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Keep the original task constraint. Ordinary work completed.", sourceQuotes: [quote, task] }));
+		},
+		(context) => {
+			assert.ok(!context.messages.some(message => message.role === "user" && JSON.stringify(message.content).includes(quote)), "saving retires the volume reminder");
+			return fauxAssistantMessage("saved and continued");
+		},
+	]);
+	await session.prompt(task);
+	const checkpoint = checkpointEntries(manager.getBranch()).at(-1)!;
+	const data = checkpoint.data as { requestHistoryPosition: { entryId: string | null }; sourceReferences: Array<{ matchCount: number; matches: Array<{ entryId: string }> }> };
+	assert.equal(data.requestHistoryPosition.entryId, snapshotTip);
+	assert.deepEqual(data.sourceReferences.map(reference => reference.matchCount), [0, 1]);
+	assert.ok(data.sourceReferences.every(reference => reference.matches.every(match => match.entryId !== reminderId)));
+	ledgerFaux.setResponses([fauxAssistantMessage(`Ordinary work remains complete.\n<source-references>${JSON.stringify([{ entryId: reminderId }])}</source-references>`)]);
+	await session.compact();
+	const delta = generatedDelta(latestCompaction(manager.getBranch()));
+	assert.equal(delta.sourceReferences[0].matchCount, 0);
+	assert.deepEqual(delta.sourceReferences[0].matches, []);
 });
 
 test("budget reminders are bounded, deduplicated per window, and explicit about unknown usage", { timeout: TEST_TIMEOUT_MS }, async (t) => {
@@ -1617,7 +1659,7 @@ test("budget reminders are bounded, deduplicated per window, and explicit about 
 		assert.equal(latestDetails.usageKnown, false);
 		assert.ok(latestDetails.reasonKinds?.includes("budget"));
 		assert.equal(latestDetails.windowId === firstWindowId, false);
-		assert.match(String(latest.content), /bounded content estimate/);
+		assert.equal((latest.details as { usageKind: string }).usageKind, "bounded-content-estimate");
 
 		const reopened = await reopenFixture(fixture);
 		try {
@@ -1647,7 +1689,7 @@ test("budget reminders are bounded, deduplicated per window, and explicit about 
 			assert.equal(new Set(persistedBudgetKeys).size, persistedBudgetKeys.length);
 			assert.equal(reopenContexts.length, 2);
 			const currentWindowReminderMessages = reopenContexts.flatMap((context) => context.messages).filter(
-				(message) => message.role === "system" && JSON.stringify(message.content).includes(`window: ${latestDetails.windowId}`),
+				(message) => message.role === "user" && JSON.stringify(message.content).includes("Call the checkpoint tool"),
 			);
 			assert.ok(currentWindowReminderMessages.length >= 1);
 		} finally {
@@ -1939,7 +1981,7 @@ test("volume reminders follow ten-percent marks across jumps, reload, model chan
 		assert.equal(notices().length, 5, "saving resets the origin and tail changes do not change the interval");
 		const latest = notices().at(-1)!;
 		assert.equal(latest.type, "custom_message");
-		if (latest.type === "custom_message") assert.match(String(latest.content), /10%.*4000 tokens/);
+		if (latest.type === "custom_message") assert.match(JSON.stringify(latest.details), /10%.*4000 tokens/);
 	} finally {
 		session.dispose();
 		rmSync(root, { recursive: true, force: true });
@@ -2390,8 +2432,8 @@ test("known native boundary uses actual provider usage and lead times", { timeou
 			assert.equal(details.effectiveBoundaryTokens, 472_800);
 			assert.equal(details.nativeBoundaryMode, "native");
 			assert.equal(details.usageKnown, true);
-			assert.match(String(reminder.content), /effective boundary: 472800/);
-			assert.match(JSON.stringify(resumedContext.messages), /model remaining:/);
+			assert.match(String(reminder.content), /Call the checkpoint tool/);
+			assert.ok(resumedContext.messages.some(message => message.role === "user" && JSON.stringify(message.content).includes("Call the checkpoint tool")));
 		} finally {
 			rmSync(fixture.root, { recursive: true, force: true });
 		}
@@ -2658,9 +2700,10 @@ test("steering queued during native compaction is delivered once in order", { ti
 		assert.ok(resultIndex > assistantIndex);
 		assert.match(JSON.stringify(branchMessages[resultIndex].message), /large-tool-result/);
 		assert.match(JSON.stringify(reminderContext.messages), /Ledger Context urgent budget reminder/);
-		const refreshedNotice = reminderContext.messages.flatMap((message) => message.role === "system" && typeof message.content === "string" && message.content.startsWith("Ledger Context urgent budget reminder.") ? [message.content] : [])[0];
+		const refreshedNotice = reminderContext.messages.flatMap((message) => message.role === "user" && Array.isArray(message.content)
+			? message.content.flatMap((block) => block.type === "text" && block.text.startsWith("Ledger Context urgent budget reminder.") ? [block.text] : []) : [])[0];
 		assert.ok(refreshedNotice);
-		assert.ok(refreshedNotice.includes(`usage window: ${(compactions[0].details as LedgerCompactionDetails).windowId}`), "pressure that persists after compaction must be reported for the new window");
+		assert.match(refreshedNotice, /Automated maintenance request from the Ledger Context extension/);
 		assert.doesNotMatch(refreshedNotice, /stale-volume/);
 		const branchUserMessages = messageEntries(sessionManager.getBranch()).filter((entry) => entry.message.role === "user");
 		assert.equal(branchUserMessages.filter((entry) => JSON.stringify(entry.message).includes("change direction")).length, 1);
