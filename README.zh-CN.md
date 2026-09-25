@@ -1,6 +1,6 @@
 # pi Ledger Context 扩展
 
-Ledger Context 在 pi 会话日志中保存主 agent 的工作 checkpoint 和独立的累计 compaction delta，通过 pi 的公开 `ExtensionAPI` 和 SDK 为每次模型请求提供当前恢复基线。
+Ledger Context 在 pi 会话日志中保存主 agent 的 checkpoint 和独立的累计 compaction delta，通过公开 ExtensionAPI 和 SDK 为每次压缩保存固定的恢复摘要。
 
 ## 运行前提
 
@@ -21,7 +21,7 @@ pi install -l .
 
 - `checkpoint` 保存完整工作账本，并回报持久化范围和交接状态。
 - `history_search` 在选中的历史内容中查找字面文本，返回来源引用与匹配位置。
-- `history_read` 读取条目、原始内容块、单张图片、工具调用过程或邻近日志条目。
+- `history_read` 读取条目、原始内容块、单张图片、工具调用过程、邻近日志条目或一批条目/图片选择。
 - `history_list_items` 按条件浏览条目和 checkpoint 版本，返回有界预览。
 - `history_list_windows` 提供窗口导航、过滤统计、用户措辞和 ledger 摘录。
 - `get_context_remaining` 返回模型余量、有效边界余量、输出预留及用量来源。
@@ -30,17 +30,17 @@ pi install -l .
 
 使用 `checkpoint` 的 `ledger` 提交当前完整工作状态，可选的 `sourceQuotes` 提交从来源消息复制的原句，按恢复优先级排列并区分大小写。匹配将连续空白视为等价分隔符，并忽略引用首尾空白；文字、标点和词间边界保持字面含义。重要事实和约束直接写入 ledger。成功保存后替换后续压缩使用的基线及完整来源列表，省略 `sourceQuotes` 保存空列表；旧版本保留在历史中。回执标明条目、请求位置、大小、持久化范围，以及各原句的 `matched`、`ambiguous` 或 `unmatched` 定位结果。Pi 控制压缩时机。
 
-原句在保存时定位，范围为生成该 checkpoint 的请求快照内、当前分支的原始用户、助手和普通工具消息，并应用 context edit。生成的恢复记录和维护工具流量从匹配范围排除。每句记录匹配条目总数及按时间从旧到新保留的前四个候选，包括 ID、编辑来源和首次命中位置。有歧义或未命中的引用随有效 ledger 一起保存。LLM 判断哪些来源重要，插件执行匹配和有界渲染。
+原句在生成 checkpoint 的请求快照内定位，范围为当前分支的原始用户、助手和普通工具消息，并应用 context edit。每句记录匹配条目总数与按时间保留的前四个候选，包括 ID、编辑来源和首次命中位置。有歧义或未命中的引用随有效 ledger 保存。Agent 判断相关性，扩展提供字面定位信息。
 
 账本保持简短，记录目标和状态、约束和决策、已验证的结果及证据、下一步或等待条件、恢复引用，以及适用的可用技能或“无”。细节通过路径和条目 ID 引用，计划与已完成工作分别标明，敏感信息使用脱敏表示。
 
-Checkpoint 由主 agent 的 `checkpoint` 工具写入，其提示要求整理当前工作状态。压缩提示要求描述此后的变化：用户更正、决策、执行结果、验证和下一步的变化。生成器接收只读 checkpoint、作为摘要的上一份匹配 delta，以及有界的新证据。连续压缩更新累计 delta，保留 checkpoint 原文。尚无 checkpoint 时，delta 从分支起点开始。
+Checkpoint 由主 agent 的 checkpoint 工具写入。Delta 生成输入包含只读 checkpoint、上一份匹配的累计 delta，以及 Pi 当前窗口内选中证据的完整文字。新 checkpoint 以其生成请求位置建立新的 delta 基线；旧窗口 checkpoint 与匹配的累计 delta 接续。无 checkpoint 时，首份 delta 从分支起点开始，后续窗口继承上一份 delta 并使用本窗口证据。图片通过来源引用表示。输入超过模型请求容量时，明确记录 unavailable 或 stale 状态。
 
 恢复记录使用 schema version 6。会话内的恢复记录须通过该 schema 与分支来源校验；无效记录会使恢复过程明确报错并停止。
 
-Pi 的 `buildSessionProjection()` 为请求投影、保留尾部选择和 delta 自动取材提供有效消息；当前分支的 context edit 控制内容排除与替换。LLM 选择的来源围绕原句命中位置展开有界文本，重叠片段合并，并保留角色、来源 ID 和截断状态。已编辑来源使用当前正文并标明选择后的变化；已排除来源继续从恢复材料中排除。对仍保留的较早证据所作的新替换参与下一次 delta 取材；替换正文引用编辑记录，替换图片的来源引用也归属于该记录。原始条目、checkpoint 和 delta 记录继续作为历史及来源依据。
+Pi 的 buildSessionProjection() 提供当前窗口有效证据，包含原生保留尾部。Context edit 决定有效内容的排除与替换，对仍保留的较早证据所作的新替换参与下一次 delta 取材。替换文字和图片引用指向编辑记录。Recovery 保存来源定位信息，agent 通过历史工具读取正文。压缩采用 Pi preparation 提供的 firstKeptEntryId。
 
-Delta 生成器能看到输入材料的 entry ID，可在正文末尾另起一行，以 `<source-references>[{"entryId":"已提供的ID","quote":"可选来源原句"}]</source-references>` 收尾。插件将该块解析为独立的 `sourceReferences` 元数据。引用与 checkpoint、恢复摘录共用区分大小写的空白等价匹配规则，位置对应原始来源正文。每次生成替换完整的累计来源列表，省略引用块保存空列表。ID 仅在实际提供的来源中定位，包括当前替换编辑记录的 ID。引用块格式错误适用有界生成重试策略；未定位的选择器随有效 delta 正文保存。
+Delta 生成器可在末尾另起一行输出 `<source-references>[{"entryId":"已提供的ID","quote":"可选来源原句"}]</source-references>`。该块解析为独立 sourceReferences 元数据，与 checkpoint 共用引用匹配规则。每份新 delta 替换完整累计来源列表，省略时保存空列表。ID 在已提供的证据与继承的定位信息中解析，包含替换编辑记录。格式错误共享生成重试次数；未定位的选择器随有效 delta 正文保存。
 
 Context edit 控制后续取材中的来源正文。已有 checkpoint 和 delta 的文字保留当时的记录含义；已总结事实需要更正时，由主 agent 保存修订后的 checkpoint。
 
@@ -53,18 +53,17 @@ Context edit 控制后续取材中的来源正文。已有 checkpoint 和 delta 
 | `historyScope` | 已测量请求的历史选择区间：从 `afterEntryId` 之后，到包含 `throughEntryId` 为止；下界为 null 表示从分支起点开始。 |
 | `representation` | `rendered-text-with-image-references`：提供的文字包含图片引用；像素通过独立图像读取获取。 |
 | `fullRanges` | 本次 delta 请求完整提供了渲染正文的条目范围，包含首尾条目。 |
-| `partialEntries` | 原始渲染正文的前缀：来源条目 ID、正数 `providedChars` 和更大的 `totalChars`，单位为 UTF-16。 |
-| `projections` | `reference`、`checkpoint-ledger`、`delta-ledger`、`filtered-entry`、`source-excerpt` 或 `context-edit`，记录来源 ID 和已提供/总 UTF-16 长度；来源摘录可以从条目中部开始，`context-edit` 另以 `editEntryId` 定位所用替换记录。 |
-| `omittedRanges` | `historyScope` 内未选入有界输入的范围，包含首尾条目和条目数。 |
-| `excludedRanges` | 按 `maintenance`、`structural-metadata`、`context-omitted`（显式排除）或 `inactive-context`（位于 Pi 活动投影之外）排除的范围；已选择的历史来源及包含实质证据的历史工具结果仍可参与 delta 取材。 |
+| `projections` | `checkpoint-ledger`、`delta-ledger`、`filtered-entry` 或 `context-edit`，记录来源 ID 和已提供/总 UTF-16 长度；context-edit 记录所用 editEntryId。 |
+| `omittedRanges` | historyScope 内没有通过完整正文、投影或排除记录表示的条目范围，包含首尾条目。 |
+| `excludedRanges` | 按 maintenance、structural-metadata、context-omitted 或 inactive-context（位于 Pi 当前投影之外）排除的范围。包含实质证据的历史工具结果可参与取材。 |
 
-Delta 的 `scope` 表示累计目标区间，输入记录的 `historyScope` 表示本次考虑的新历史区间。已选择的历史来源可以位于该区间之前。旧 delta 正文记录为摘要投影，其原始来源继续保留各自早期的输入记录。任务相关性、理解和核验由 agent 在正常工作中结合证据判断。
+Delta 的 scope 表示累计目标区间，输入记录的 historyScope 表示本次考虑的新历史区间。Pi 原生保留的证据可能位于该区间之前。旧 delta 是摘要投影，其原始输入记录保留在来源条目中。这些记录描述已提供材料，agent 判断相关性与验证需求。
 
-生成输入显式提供基础 checkpoint 和上一份 delta。完整 compaction 包和输入清单保留在日志中，使连续生成的输入保持有界。混有维护工具调用的 assistant 消息使用过滤投影；普通证据保留自身的渲染内容，包括其中的引文。
+生成输入显式提供基础 checkpoint 与上一份 delta。原始证据来自当前 Pi 投影，合格消息完整渲染；混有维护调用的 assistant 消息记录为过滤投影。请求容量计入生成指令与输出预留，容量失败保留已保存状态。
 
-回执、列表和恢复视图展示简短的 `inputRecord` 来源信息。通过 `history_read` 读取 checkpoint 或承载 delta 的 compaction 条目，并跟随 `nextRead` 获取完整细节。生成的 delta 记录提供可选的来源浏览调用，定位未选入范围、部分原文和投影来源。Agent 根据当前任务选择证据。
+回执、列表和恢复视图展示简短 inputRecord 来源信息。通过 history_read 读取 checkpoint 或承载 delta 的 compaction，可查看完整记录与浏览调用；沿早期 delta 来源可追溯继承的证据。生成失败后缺失的历史仍可通过记录的范围及分支历史定位。
 
-每份恢复摘要使用所属 compaction 选定的 checkpoint 和 delta。后续 checkpoint 的调用与回执保留在工作历史中的原有位置；最新成功保存的 checkpoint 成为下一次压缩的基础。配置与来源正文稳定时，普通工作和 checkpoint 保存保持较早的恢复摘要不变。该摘要选定的来源摘录按显式分支编辑与来源预算渲染。持久化包保存近期尾部来源 ID 和可选的自定义指令。摘录提供 `history_read` 展开入口与省略统计。投影前根据当前分支核对恢复记录归属；`recoveryBasis` 记录该摘要实际提供的 checkpoint 和 delta。
+恢复摘要在所属 compaction 时生成并保存一次。普通工作、checkpoint、历史读取、来源编辑和配置变化保持该正文固定，下一次 compaction 使用最新成功保存的 checkpoint 与匹配 delta。当前分支校验摘要归属，recoveryBasis 标明保存摘要所代表的 checkpoint 与 delta。原始保留尾部由 Pi 提供。
 
 Delta 使用当前模型和宿主认证生成。暂时性错误和无效输出共享最多三次尝试，并使用可取消的退避等待；认证、请求格式和账户额度错误直接进入恢复流程。每次尝试等待响应或错误，期间可由用户取消。没有新增合格材料或 custom instructions 时，压缩复用匹配 delta 或记录 empty 状态。新 delta 随 pi compaction 条目提交后生效。
 
@@ -74,7 +73,7 @@ Delta 使用当前模型和宿主认证生成。暂时性错误和无效输出�
 
 ## 提醒与原生边界
 
-Ledger Context 从当前分支最新 agent checkpoint 的请求位置与最近一次已提交 compaction 中较晚的位置之后统计新增工作量；两者均无时从分支起点统计。保留历史和恢复材料位于新窗口的计量起点之前，checkpoint 的来源记录保持原样。工作量统计覆盖普通用户消息、助手工作和普通工具交互。请求容量同时包含 checkpoint、历史工具、容量查询和提醒等维护活动。体积提醒的间隔为当前模型窗口的 10%，向下取整且至少一个 token。每跨过一个新区间排队一条提醒；大型结果跨过多个区间时按最高位置提醒一次。已提醒的位置在所属窗口和 checkpoint 起点内跨重载保留；模型变化时重新计算间隔并保留已提醒进度。`LEDGER_CONTEXT_TAIL_TOKENS` 独立控制历史保留量。
+Ledger Context 从当前分支最新 agent checkpoint 的请求位置与最近一次已提交 compaction 中较晚的位置之后统计新增工作量；两者均无时从分支起点统计。保留历史和恢复材料位于新窗口的计量起点之前，checkpoint 的来源记录保持原样。工作量统计覆盖普通用户消息、助手工作和普通工具交互。请求容量同时包含 checkpoint、历史工具、容量查询和提醒等维护活动。体积提醒的间隔为当前模型窗口的 10%，向下取整且至少一个 token。每跨过一个新区间排队一条提醒；大型结果跨过多个区间时按最高位置提醒一次。已提醒的位置在所属窗口和 checkpoint 起点内跨重载保留；模型变化时重新计算间隔并保留已提醒进度。
 
 提醒是一次性的 checkpoint 请求，范围由产生时的窗口和 checkpoint 基线确定。每次投递将新触发的工作量与预算原因合并为一条通知。工具批次结束后，通过 pi 原生消息插入机制投递；运行结束后，待处理原因留到下一次正常用户请求，按当时的状态计算。紧急度升级在末尾追加新通知。已投递提醒保持原有正文和位置，原生压缩保留尾部中的提醒同样如此。正文中的范围使稍后抵达的旧窗口提醒能够被识别为已由该次压缩完成。
 
@@ -115,9 +114,9 @@ const ledgerExtension = createLedgerContext({
 
 条目列表和搜索结果包含 `items`、`totalMatches`、`returnedCount`、`snapshotThrough` 和 `nextCursor`。`order` 默认 `newest`，也支持 `oldest`。Version 4 游标绑定分支快照、工具、过滤条件、顺序和匹配选项。续页保持相同的选择参数，允许调整 `limit`、`maxChars` 和 `projection`；后续活动保持该快照稳定。`limit` 和 `maxChars` 是输出预算内的上限。`pageEnd` 表示 `complete`、`limit` 或 `output_budget`；预览的截断标记提供完整条目的读取方向。无效游标会说明如何续页，以及如何从当前查询重新开始。
 
-Checkpoint 结果包含前一个可解析版本的 ID、来源窗口、请求位置和快照内的 `active` 标记。预算缩小后，最新 checkpoint 保留身份，由 `fitsCurrentLedgerBudget` 报告能否容纳。恢复渲染按各自的 ledger 限额校验 checkpoint 和 delta 正文。`compaction_delta` 结果标明生成 delta 的 compaction 条目、基础 checkpoint、范围、输入记录和活动标记；复用或过期 delta 引用其原始条目。
+Checkpoint 结果包含前一个可解析版本的 ID、来源窗口、请求位置和快照内的 active 标记。fitsCurrentLedgerBudget 独立报告当前容量；新 compaction 摘要按限额校验完整 checkpoint 与 delta。compaction_delta 结果定位生成 delta 的原始条目，包含基线、范围和输入记录。复用或过期 delta 引用其原始条目。
 
-`history_list_windows` 接受共用过滤条件、顺序、条数和游标，包含初始窗口及条目数为零的已提交窗口。`entryCount` 和首尾条目 ID 描述原生窗口归属；`matchedEntryCount`、`kindCounts`、`failedToolResults`、`imageCount` 使用与条目列表相同的过滤条件。工具调用按调用数统计，其他种类按条目数统计。最新用户预览引用匹配的输入原文；checkpoint 数量、摘录和最新输入记录的来源信息独立于过滤条件，按原始来源窗口组织。预览截断标记区分完整措辞与摘录。续页保持 filter/order，可调整 `limit`；`returnedCount` 和 `pageEnd` 描述本页状态。成功返回的历史结果遵守 `LEDGER_CONTEXT_READ_TOKENS` 预算。
+`history_list_windows` 接受共用过滤条件、顺序、条数和游标，包含初始窗口及条目数为零的已提交窗口。`entryCount` 和首尾条目 ID 描述原生窗口归属；`matchedEntryCount`、`kindCounts`、`failedToolResults`、`imageCount` 使用与条目列表相同的过滤条件。工具调用按调用数统计，其他种类按条目数统计。最新用户预览引用匹配的输入原文；checkpoint 数量、摘录和最新输入记录的来源信息独立于过滤条件，按原始来源窗口组织。预览截断标记区分完整措辞与摘录。续页保持 filter/order，可调整 `limit`；`returnedCount` 和 `pageEnd` 描述本页状态。默认历史结果遵守 `LEDGER_CONTEXT_READ_TOKENS` 预算。
 
 窗口独立展示 `deltaStatus`、`deltaActive`、承载 delta 的 compaction ID、基础 checkpoint、预览和 `deltaInputRecord`。Checkpoint 数量统计主 agent 保存的版本；新 checkpoint 生效后，窗口已提交的 delta 状态继续作为历史信息保留。
 
@@ -138,13 +137,15 @@ history_read({ entryId: "result-id", view: "exchange" });
 
 列表和搜索结果中的工具调用配对元数据按输出预算截取。`omittedToolCalls` 表示该元数据省略的调用数量；通过条目 ID 调用 `history_read` 可读取完整调用详情。
 
+`truncate: false` 对选中的查询或读取取消预算裁剪，显式 length、maxChars 和 limit 仍定义请求范围。未指定文字长度或预览上限时，无裁剪模式返回完整选中文字。`history_read({ view: "many", items: [{ entryId: "a" }, { entryId: "b", offset: 100, length: 200 }], truncate: false })` 按顺序读取最多 100 项。Many 子项支持 entry 与 image，共用一次分支快照并逐项报告错误。默认 many 输出共用一个预算；复制包含快照的 nextRead 继续读取。已返回的工具结果在历史中保持固定。
+
 ### 图像读取
 
-使用 `history_read({ entryId, view: "image", contentIndex })` 加载 `pi://entry/<id>/content/<index>` 对应的原始图片。该视图接受条目 ID 和内容下标，成功时返回一个规范化 `ImageContent`、有界来源说明，以及来源条目、窗口、尺寸、MIME 类型和编码前后大小信息。
+使用 `history_read({ entryId, view: "image", contentIndex })` 加载 pi://entry/<id>/content/<index> 对应的图片。扩展校验所选内容块和 base64 载荷，返回来源字节、说明文字与来源元数据。
 
-图像读取需要支持图像输入的模型和有效图像字节。pi 的公开图像工具按当前模型 `inputLimits.images.resize` 与扩展 2000×2000 像素、4.5 MiB base64 上限中较严格的值规范化副本，同时采用模型的 JPEG 质量设置。来源信息描述交给 Pi 的规范化结果。图像无效、来源不可用、模型不支持图像或容量不足时，返回带来源引用的明确文本错误。
+Pi 在工具结果进入历史前，按自身自动缩放设置与当前模型图像配置处理图片。扩展记录来源元数据，Pi 负责输出尺寸、格式和 provider 编码。历史输出预算计入图片 token 估计。模型输入不支持、选择无效或输出容量不足时，错误明确携带来源。
 
-成功读取的图像以工具结果图片块进入会话。主 agent 请求保留 Pi 投影提供的图片和工具配对关系。Pi 负责 provider 的图片表示和主请求容量处理。扩展的图像限额应用于 `history_read` 结果的生成。
+成功图片以 Pi 处理后的工具结果块进入历史。后续主 agent 请求保持 Pi 投影提供的消息与工具配对。
 
 ## 配置与预算
 
@@ -156,21 +157,19 @@ history_read({ entryId: "result-id", view: "exchange" });
 | `LEDGER_CONTEXT_URGENT_TOKENS` | `max(1, min(默认柔性提醒提前量 − 1, floor(min(window × 0.10, 16384))))` | 紧急提醒在有效边界前的提前量；已用 token 触发值为 `B - 提前量` |
 | `LEDGER_CONTEXT_LEDGER_TOKENS` | `4096` | Agent checkpoint 的估计 token 上限 |
 | `LEDGER_CONTEXT_DELTA_TOKENS` | `2048` | 累计 compaction delta 的估计 token 上限 |
-| `LEDGER_CONTEXT_SOURCE_TOKENS` | `max(1, floor(window × 0.05))` | 来源摘录、定位状态与压缩 focus 共用的估计 token 上限 |
-| `LEDGER_CONTEXT_TAIL_TOKENS` | `max(1, floor(window × 0.05))` | 压缩时尾部选择与恢复引用的估计 token 上限 |
-| `LEDGER_CONTEXT_READ_TOKENS` | `2048` | 单次历史查询或读取的总估计输出上限；图像读取还包含来源元数据、说明文字和图像估计 |
+| `LEDGER_CONTEXT_READ_TOKENS` | `2048` | 单次历史查询/读取的默认总输出估计上限，包含图片估计；truncate: false 显式取消该次调用的裁剪 |
 | `LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS` | `max(1, floor(min(window × 0.10, 16384)))` | 容量报告、提醒及压缩恢复预算使用的预留空间 |
 
-Pi 管理主 agent 请求容量和 provider 编码。普通消息、工具调用参数、工具结果和图片保留 Pi 的投影内容。扩展限额作用于 checkpoint、生成的 delta、恢复材料和历史工具输出。图像读取遵守 `LEDGER_CONTEXT_READ_TOKENS` 总量限制。
+Pi 管理主请求容量、图片处理、provider 编码和原始尾部选择。扩展限额用于 checkpoint/delta 正文、新恢复摘要和默认历史工具输出。显式 truncate: false 完整返回请求范围，Pi/provider 的容量限制仍适用。
 
-Checkpoint 和 delta 正文各自最多包含 `65,536` 个 UTF-8 字节，各自最多接受 `8` 个来源选择器。原句上限为 `512` 个 UTF-16 代码单元，每个选择器最多保留 `4` 个匹配条目；每个命中的初始摘录窗口最多 `1024` 个代码单元，随后合并重叠范围并按总预算裁剪。历史搜索文本最多包含 `8,192` 个 UTF-8 字节，标识符最多包含 `1,024` 个 UTF-16 代码单元，每页历史查询最多返回 `100` 项。正文读取接受的最大长度为 `65,536` 个 UTF-16 代码单元。这些输入限制与输出预算共同生效。
+Checkpoint 和 delta 正文各允许 65,536 个 UTF-8 字节、最多 8 个来源选择器；原句上限为 512 个 UTF-16 单元，每个选择器保留最多 4 个候选。搜索文本允许 8,192 个 UTF-8 字节，标识符允许 1,024 个 UTF-16 单元，分页和 many 批次最多 100 项。显式正文偏移和长度采用安全整数。默认正文请求 65,536 个 UTF-16 单元，未指定长度的无裁剪读取返回全部剩余文字。
 
 pi 的上下文用量由提供方报告的用量与后续消息的估算量组成。提供方用量未知时，Ledger Context 估算有效投影中的对话与恢复材料，并将系统提示、活动工具定义和模型元数据各计一次。这些估算用于容量报告、提醒及压缩恢复预算，精度取决于模型的 token 计量方式。
 
 ## 恢复状态
 
 - Delta 状态为 `generated`、`reused`、`empty`、`stale` 或 `unavailable`。生成失败时保留 checkpoint 和早期匹配 delta，后续工作通过保留消息和来源引用恢复。
-- 恢复材料在各自配置的 ledger 限额内包含完整 checkpoint 和 delta 正文。限额不匹配时停止恢复渲染或压缩，并保留已保存的记录。
+- 新恢复摘要在配置限额内包含完整 checkpoint 与 delta。容量错误保留已保存记录和既有恢复正文。
 - 压缩正常取消和无效检查点输入保留上一有效窗口和检查点。
 - Pi 先准备压缩再调用扩展。可总结内容不足时返回 `Nothing to compact`，带自定义指令的手动 `/compact` 同样遵守此规则；checkpoint、delta 和窗口保持原样，checkpoint 保存仍可独立执行。
 - 持久会话日志写入失败时，当前运行及后续保存和切窗停止。使用新的公开 `SessionManager` 重新打开持久文件以继续持久恢复。
