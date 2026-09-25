@@ -208,9 +208,10 @@ test("agent checkpoint ownership survives cumulative deltas and updates the next
 			(context) => {
 				const recovery = context.messages.flatMap((message) => message.role === "user" && Array.isArray(message.content) ? message.content.filter((block) => block.type === "text").map((block) => block.text) : []).find((text) => text.includes("# Ledger Context Recovery"))!;
 				assert.ok(recovery);
-				assert.match(recovery, /checkpoint-two-sentinel/);
-				assert.doesNotMatch(recovery, /delta-two-sentinel/);
-				assert.doesNotMatch(recovery, /checkpoint-sentinel/);
+				assert.doesNotMatch(recovery, /checkpoint-two-sentinel/);
+				assert.match(recovery, /delta-two-sentinel/);
+				assert.match(recovery, /checkpoint-sentinel/);
+				assert.match(JSON.stringify(context.messages), /checkpoint-two-sentinel/);
 				return fauxAssistantMessage("Using the new working state.");
 			},
 		]);
@@ -221,6 +222,315 @@ test("agent checkpoint ownership survives cumulative deltas and updates the next
 		session.dispose();
 		rmSync(root, { recursive: true, force: true });
 	}
+});
+
+test("ordinary work and checkpoints after compaction preserve the previous provider input prefix", { timeout: TEST_TIMEOUT_MS }, async (t) => {
+	const fixture = await createFixture(false, [], 1, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager, faux, ledgerFaux } = fixture;
+	faux.setResponses([
+		fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Work only in staging; next verify the result.", sourceQuotes: ["Work only in staging"] })),
+		fauxAssistantMessage("Checkpoint recorded."),
+	]);
+	await session.prompt("Work only in staging. " + "seed ".repeat(800));
+	ledgerFaux.setResponses([fauxAssistantMessage("No subsequent changes to the saved state.")]);
+	await session.compact();
+	const compaction = structuredClone(latestCompaction(sessionManager.getBranch()));
+	const contexts: Context[] = [];
+	for (let index = 0; index < 3; index++) {
+		faux.setResponses([(context) => { contexts.push(structuredClone(context)); return fauxAssistantMessage("Continue ordinary work."); }]);
+		await session.prompt(`Continue ordinary work ${index}`);
+	}
+	for (let index = 1; index <= 2; index++) {
+		faux.setResponses([
+			(context) => { contexts.push(structuredClone(context)); return fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: `Staging verified; prepare task ${index}.` })); },
+			(context) => { contexts.push(structuredClone(context)); return fauxAssistantMessage("New checkpoint saved."); },
+		]);
+		await session.prompt("Save the updated working state.");
+	}
+	const inputs: unknown[][] = [];
+	for (const context of contexts) {
+		const model = { ...faux.getModel(), id: "inspection-only", provider: "openai", baseUrl: "http://127.0.0.1:1", api: "openai-responses" as const,
+			compat: { supportsDeveloperRole: true, supportsMidConvoSystemMessages: true } };
+		const result = await streamResponses(model, normalizeContext(context), {
+			apiKey: "inspection-only", maxTokens: 64,
+			onPayload: (payload) => {
+				inputs.push(structuredClone((payload as { input: unknown[] }).input));
+				throw new Error("payload captured before network");
+			},
+		}).result();
+		assert.match(result.errorMessage ?? "", /payload captured before network/);
+	}
+	assert.equal(inputs.length, 7);
+	assert.deepEqual(latestCompaction(sessionManager.getBranch()), compaction);
+	const checkpoints = checkpointEntries(sessionManager.getBranch());
+	assert.equal(checkpoints.length, 3);
+	assert.deepEqual((checkpoints.at(-1)!.data as any).inputCoverage.recoveryBasis, { checkpointEntryId: checkpoints[0].id, deltaCompactionEntryId: compaction.id });
+	assert.equal(sessionManager.getBranch().filter((entry) => entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE).length, 0);
+	for (let index = 1; index < inputs.length; index++) {
+		assert.deepEqual(inputs[index].slice(0, inputs[index - 1].length), inputs[index - 1], "ordinary work must append to the existing provider input");
+	}
+	ledgerFaux.setResponses([(context) => {
+		assert.match(JSON.stringify(context.messages), /Staging verified; prepare task 2/);
+		return fauxAssistantMessage("Continue from the latest saved state.");
+	}]);
+	await session.compact();
+	assert.equal(generatedDelta(latestCompaction(sessionManager.getBranch())).baseCheckpointEntryId, checkpoints.at(-1)!.id);
+});
+
+test("checkpoint-free recovery keeps its prefix when the first checkpoints are saved", { timeout: TEST_TIMEOUT_MS }, async (t) => {
+	const fixture = await createFixture(false, [], 1, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager, faux, ledgerFaux } = fixture;
+	faux.setResponses([fauxAssistantMessage("Initial evidence recorded.")]);
+	await session.prompt("Preserve the original task and its evidence.");
+	ledgerFaux.setResponses([fauxAssistantMessage("Initial task state; continue verification.")]);
+	await session.compact();
+	const compaction = structuredClone(latestCompaction(sessionManager.getBranch()));
+	assert.equal((compaction.details as LedgerCompactionDetails).checkpointEntryId, null);
+	const contexts: Context[] = [];
+	faux.setResponses([
+		(context) => { contexts.push(structuredClone(context)); return fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "First saved working state." })); },
+		(context) => { contexts.push(structuredClone(context)); return fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Second saved working state." })); },
+		(context) => { contexts.push(structuredClone(context)); return fauxAssistantMessage("Saved and continued."); },
+	]);
+	await session.prompt("Save the current working state.");
+	assert.equal(contexts.length, 3);
+	await assertAppendOnlyRequests(contexts, faux);
+	assert.deepEqual(latestCompaction(sessionManager.getBranch()), compaction);
+	const checkpoints = checkpointEntries(sessionManager.getBranch());
+	assert.equal(checkpoints.length, 2);
+	assert.deepEqual((checkpoints[1].data as any).inputCoverage.recoveryBasis, { checkpointEntryId: null, deltaCompactionEntryId: compaction.id });
+});
+
+test("main requests preserve tool arguments, results and images regardless of ledger display budgets", { timeout: TEST_TIMEOUT_MS }, async (t) => {
+	const previousTail = process.env.LEDGER_CONTEXT_TAIL_TOKENS;
+	const previousReserve = process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS;
+	process.env.LEDGER_CONTEXT_TAIL_TOKENS = "64";
+	process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS = "120000";
+	t.after(() => {
+		if (previousTail === undefined) delete process.env.LEDGER_CONTEXT_TAIL_TOKENS; else process.env.LEDGER_CONTEXT_TAIL_TOKENS = previousTail;
+		if (previousReserve === undefined) delete process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS; else process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS = previousReserve;
+	});
+	const payload = "ordinary-tool-evidence:" + "x".repeat(4000);
+	const ordinaryTool = (pi: ExtensionAPI) => pi.registerTool({ name: "ordinary_payload", label: "Payload", description: "Return the supplied payload.",
+		parameters: Type.Object({ payload: Type.String() }), execute: async (_id, params) => ({ content: [{ type: "text" as const, text: params.payload }], details: {} }) });
+	const fixture = await createFixture(false, [ordinaryTool], 1, { compactionEnabled: false, extraToolNames: ["ordinary_payload"] });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager, faux } = fixture;
+	const source = sessionManager.appendMessage({ role: "user", content: [{ type: "image", mimeType: "image/png", data: RED_2X2_PNG }], timestamp: Date.now() });
+	const contexts: Context[] = [];
+	faux.setResponses([
+		fauxAssistantMessage([
+			fauxToolCall("ordinary_payload", { payload }, { id: "unchanged-payload" }),
+			fauxToolCall("history_read", { entryId: source, view: "image", contentIndex: 0 }, { id: "unchanged-image" }),
+		]),
+		(context) => { contexts.push(structuredClone(context)); return fauxAssistantMessage("Evidence received."); },
+	]);
+	await session.prompt("Read the evidence.");
+	faux.setResponses([(context) => { contexts.push(structuredClone(context)); return fauxAssistantMessage("Continued."); }]);
+	await session.prompt("Continue ordinary work.");
+	assert.equal(contexts.length, 2);
+	const inputs: unknown[][] = [];
+	for (const context of contexts) {
+		const call = context.messages.flatMap((message) => message.role === "assistant" ? message.content : []).find((block) => block.type === "toolCall" && block.id === "unchanged-payload");
+		assert.ok(call?.type === "toolCall");
+		assert.equal(String(call.arguments.payload).length, payload.length);
+		const result = context.messages.find((message) => message.role === "toolResult" && message.toolCallId === "unchanged-payload");
+		assert.ok(result?.role === "toolResult" && result.content.some((block) => block.type === "text" && block.text === payload));
+		const image = context.messages.find((message) => message.role === "toolResult" && message.toolCallId === "unchanged-image");
+		assert.ok(image?.role === "toolResult" && image.content.some((block) => block.type === "image"));
+		const model = { ...faux.getModel(), id: "inspection-only", provider: "openai", baseUrl: "http://127.0.0.1:1", api: "openai-responses" as const };
+		const encoded = await streamResponses(model, normalizeContext(context), { apiKey: "inspection-only", maxTokens: 64,
+			onPayload: (value) => { inputs.push(structuredClone((value as { input: unknown[] }).input)); throw new Error("payload captured before network"); } }).result();
+		assert.match(encoded.errorMessage ?? "", /payload captured before network/);
+	}
+	assert.deepEqual(inputs[1].slice(0, inputs[0].length), inputs[0]);
+});
+
+test("source quotes share case-sensitive whitespace matching in checkpoints, deltas and recovery", { timeout: TEST_TIMEOUT_MS }, async (t) => {
+	const fixture = await createFixture(false, [], 1, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager, faux, ledgerFaux } = fixture;
+	const phrase = "alpha\t beta\r\n  gamma. [x](1)+?";
+	const quote = "alpha beta gamma. [x](1)+?";
+	const source = sessionManager.appendMessage({ role: "user", content: "p".repeat(4000) + phrase + "z".repeat(4000), timestamp: Date.now() });
+	const duplicate = sessionManager.appendMessage({ role: "user", content: quote, timestamp: Date.now() });
+	faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Preserve the quoted evidence.",
+		sourceQuotes: [quote, "Alpha beta gamma. [x](1)+?", "alpha betagamma. [x](1)+?", "alpha beta gamma! [x](1)+?"] })), fauxAssistantMessage("Saved.")]);
+	await session.prompt("Save current working state.");
+	const checkpoint = checkpointEntries(sessionManager.getBranch()).at(-1)!;
+	const references = (checkpoint.data as any).sourceReferences;
+	assert.deepEqual(references.map((reference: any) => reference.matchCount), [2, 0, 0, 0]);
+	assert.deepEqual(references[0].matches, [{ entryId: source, offset: 4000 }, { entryId: duplicate, offset: 0 }]);
+	ledgerFaux.setResponses([fauxAssistantMessage("Preserve the evidence.\n<source-references>" + JSON.stringify([{ entryId: source, quote }]) + "</source-references>")]);
+	await session.compact();
+	const compaction = latestCompaction(sessionManager.getBranch());
+	assert.deepEqual(generatedDelta(compaction).sourceReferences[0].matches, [{ entryId: source, offset: 4000 }]);
+	assert.ok(compaction.summary.includes(phrase));
+	assert.doesNotMatch(compaction.summary, /source edited since selection/);
+	await session.reload();
+	assert.deepEqual((checkpointEntries(sessionManager.getBranch()).at(-1)!.data as any).sourceReferences, references);
+	faux.setResponses([(context) => {
+		assert.ok(context.messages.some((message) => message.role === "user" && Array.isArray(message.content) && message.content.some((block) => block.type === "text" && block.text.includes(phrase))));
+		return fauxAssistantMessage("Recovered.");
+	}]);
+	await session.prompt("Continue.");
+});
+
+async function assertAppendOnlyRequests(contexts: Context[], faux: ReturnType<typeof fauxProvider>): Promise<void> {
+	let previous: { input: unknown[]; tools?: unknown; instructions?: unknown } | undefined;
+	for (const context of contexts) {
+		let payload: typeof previous;
+		const model = { ...faux.getModel(), id: "inspection-only", provider: "openai", baseUrl: "http://127.0.0.1:1", api: "openai-responses" as const,
+			compat: { supportsDeveloperRole: true, supportsMidConvoSystemMessages: true, supportsAdditionalTools: true } };
+		const response = await streamResponses(model, normalizeContext(context), { apiKey: "inspection-only", maxTokens: 64,
+			onPayload: (value) => { payload = structuredClone(value) as typeof previous; throw new Error("payload captured before network"); } }).result();
+		assert.match(response.errorMessage ?? "", /payload captured before network/);
+		assert.ok(payload);
+		if (previous) {
+			assert.deepEqual(payload.tools, previous.tools, "historical tool declarations must retain their position");
+			assert.equal(payload.instructions, previous.instructions);
+			assert.deepEqual(payload.input.slice(0, previous.input.length), previous.input, "later work must preserve every previously sent input item");
+		}
+		previous = payload;
+	}
+}
+
+test("volume reminders preserve request prefixes through checkpoints, compactions and new runs", { timeout: 15000 }, async (t) => {
+	const work = (pi: ExtensionAPI) => pi.registerTool({ name: "append_only_work", label: "Work", description: "Return ordinary evidence.", parameters: Type.Object({}),
+		execute: async () => ({ content: [{ type: "text" as const, text: "ordinary evidence " + "x".repeat(9000) }], details: {} }) });
+	const fixture = await createFixture(true, [work], 1, { contextWindow: 20000, compactionEnabled: false, extraToolNames: ["append_only_work", "history_list_items"] });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager: manager, faux, ledgerFaux } = fixture;
+	session.setActiveToolsByName(session.getActiveToolNames().filter((name) => name !== "history_list_items"));
+	const windows: Context[][] = [[]];
+	const capture = (context: Context) => windows.at(-1)!.push(structuredClone(context));
+	faux.setResponses([(context) => { capture(context); return fauxAssistantMessage("Source recorded."); }]);
+	await session.prompt("append-only source evidence", { images: [{ type: "image", mimeType: "image/png", data: RED_2X2_PNG }] });
+	const source = manager.getBranch().find((entry) => entry.type === "message" && entry.message.role === "user")!.id;
+	for (let stage = 0; stage < 3; stage++) {
+		const save = (label: string) => fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: `Stage ${stage}: ${label}; continue the task.`, sourceQuotes: ["append-only source evidence"] }));
+		faux.setResponses([
+			(context) => { capture(context); return fauxAssistantMessage(fauxToolCall("append_only_work", {})); },
+			(context) => { capture(context); return save("first save"); },
+			(context) => { capture(context); return fauxAssistantMessage(fauxToolCall("history_read", { entryId: source, view: "image", contentIndex: 1 })); },
+			(context) => { capture(context); return save("second save"); },
+			(context) => { capture(context); return fauxAssistantMessage("Stage complete."); },
+		]);
+		await session.prompt(`Run stage ${stage}.`);
+		if (stage === 0) session.setActiveToolsByName([...session.getActiveToolNames(), "history_list_items"]);
+		if (stage === 1) await session.reload();
+		faux.setResponses([(context) => { capture(context); return fauxAssistantMessage("Next run complete."); }]);
+		await session.prompt("Continue in the next normal run.");
+		await assertAppendOnlyRequests(windows.at(-1)!, faux);
+		if (stage < 2) {
+			ledgerFaux.setResponses([fauxAssistantMessage("The stage completed after its checkpoint.")]);
+			await session.compact();
+			windows.push([]);
+		}
+	}
+	assert.equal(checkpointEntries(manager.getBranch()).length, 6);
+	const notices = manager.getBranch().filter((entry) => entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE);
+	assert.equal(notices.length, 3, "each window can request another checkpoint after new work");
+	for (const [index, notice] of notices.entries()) {
+		assert.ok(notice.type === "custom_message" && typeof notice.content === "string");
+		assert.ok(windows[index].at(-1)!.messages.some((message) => message.role === "user" && Array.isArray(message.content) && message.content.some((block) => block.type === "text" && block.text === notice.content)));
+	}
+	const receipts = messageEntries(manager.getBranch()).filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "checkpoint");
+	assert.equal(receipts.length, 6);
+	assert.ok(receipts.every((entry) => /reminders:.*complete/.test(toolResultText(entry))));
+});
+
+test("budget escalation and checkpoint receipts append without rewriting reminders or tool declarations", { timeout: TEST_TIMEOUT_MS }, async (t) => {
+	let usedTokens = 1000;
+	const work = (pi: ExtensionAPI) => pi.registerTool({ name: "append_only_pressure", label: "Pressure", description: "Record more ordinary work.", parameters: Type.Object({}),
+		execute: async () => { usedTokens = 16500; return { content: [{ type: "text" as const, text: "New evidence." }], details: {} }; } });
+	const fixture = await createFixture(true, [work], 1, { contextWindow: 20000, compactionEnabled: false, extraToolNames: ["append_only_pressure", "history_list_items"] });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager: manager, faux } = fixture;
+	session.getContextUsage = () => ({ tokens: usedTokens, contextWindow: 20000, percent: usedTokens / 200 });
+	session.setActiveToolsByName(session.getActiveToolNames().filter((name) => name !== "history_list_items"));
+	faux.setResponses([fauxAssistantMessage("Initialized.")]);
+	await session.prompt("Initialize.");
+	const contexts: Context[] = [];
+	const capture = (context: Context) => contexts.push(structuredClone(context));
+	usedTokens = 14500;
+	faux.setResponses([
+		(context) => { capture(context); return fauxAssistantMessage(fauxToolCall("append_only_pressure", {})); },
+		(context) => { capture(context); return fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "" }, { id: "failed-reminder-save" })); },
+		(context) => { capture(context); return fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Current evidence saved." }, { id: "successful-reminder-save" })); },
+		(context) => { capture(context); return fauxAssistantMessage("Saved."); },
+	]);
+	await session.prompt("Continue under budget pressure.");
+	await session.reload();
+	session.setActiveToolsByName([...session.getActiveToolNames(), "history_list_items"]);
+	faux.setResponses([(context) => { capture(context); return fauxAssistantMessage("Continued."); }]);
+	await session.prompt("Continue in the next run.");
+	await assertAppendOnlyRequests(contexts, faux);
+	const notices = manager.getBranch().filter((entry) => entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE);
+	assert.equal(notices.length, 2);
+	assert.deepEqual(notices.map((entry) => entry.type === "custom_message" ? (entry.details as { level: string }).level : null), ["soft", "urgent"]);
+	for (const notice of notices) {
+		assert.ok(notice.type === "custom_message" && typeof notice.content === "string");
+		assert.ok(contexts.at(-1)!.messages.some((message) => message.role === "user" && Array.isArray(message.content) && message.content.some((block) => block.type === "text" && block.text === notice.content)));
+	}
+	const failed = messageEntries(manager.getBranch()).find((entry) => entry.message.role === "toolResult" && entry.message.toolCallId === "failed-reminder-save")!;
+	const saved = messageEntries(manager.getBranch()).find((entry) => entry.message.role === "toolResult" && entry.message.toolCallId === "successful-reminder-save")!;
+	assert.doesNotMatch(toolResultText(failed), /reminders:.*complete/);
+	assert.match(toolResultText(saved), /reminders:.*complete/);
+	assert.equal(checkpointEntries(manager.getBranch()).length, 1);
+	assert.equal(contexts.at(-1)!.messages.filter((message) => message.role === "system").length, 2);
+});
+
+test("retained budget reminders keep their original scope through compaction and renewed pressure", { timeout: TEST_TIMEOUT_MS }, async (t) => {
+	const previousTail = process.env.LEDGER_CONTEXT_TAIL_TOKENS;
+	process.env.LEDGER_CONTEXT_TAIL_TOKENS = "4096";
+	t.after(() => { if (previousTail === undefined) delete process.env.LEDGER_CONTEXT_TAIL_TOKENS; else process.env.LEDGER_CONTEXT_TAIL_TOKENS = previousTail; });
+	const fixture = await createFixture(false, [], 1, { contextWindow: 20000, compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager: manager, faux, ledgerFaux } = fixture;
+	const realUsage = session.getContextUsage.bind(session);
+	let usedTokens = 1000;
+	session.getContextUsage = () => ({ tokens: usedTokens, contextWindow: 20000, percent: usedTokens / 200 });
+	faux.setResponses([fauxAssistantMessage("Initial evidence recorded.")]);
+	await session.prompt("Original work " + "x".repeat(20000));
+	usedTokens = 14500;
+	faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Initial work saved." })), fauxAssistantMessage("Saved.")]);
+	await session.prompt("Save the initial working state.");
+	const branch = manager.getBranch();
+	const start = branch.findIndex((entry) => entry.type === "message" && entry.message.role === "user" && JSON.stringify(entry.message.content).includes("Save the initial working state."));
+	const keepRecentTokens = branch.slice(start).flatMap(sessionEntryToContextMessages).reduce((sum, message) => sum + estimateTokens(message), 0);
+	const nativeSettings = fixture.settingsManager.getCompactionSettings(faux.getModel());
+	fixture.settingsManager.getCompactionSettings = () => ({ ...nativeSettings, keepRecentTokens });
+	usedTokens = 1000;
+	ledgerFaux.setResponses([fauxAssistantMessage("Initial work saved; continue with subsequent work.")]);
+	await session.compact();
+	session.getContextUsage = realUsage;
+	const retained = manager.buildSessionProjection().messages.find((message) => message.role === "custom" && message.customType === REMINDER_MESSAGE_TYPE);
+	assert.ok(retained?.role === "custom" && typeof retained.content === "string");
+	const noticeContent = retained.content;
+	const oldScope = (retained.details as { windowId: string }).windowId;
+	const contexts: Context[] = [];
+	for (const prompt of ["Continue with ample room.", "New input " + "u".repeat(56000)]) {
+		faux.setResponses([(context) => { contexts.push(structuredClone(context)); return fauxAssistantMessage("Continued."); }]);
+		await session.prompt(prompt);
+	}
+	assert.equal(manager.getBranch().filter((entry) => entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE).length, 1);
+	usedTokens = 16500;
+	session.getContextUsage = () => ({ tokens: usedTokens, contextWindow: 20000, percent: usedTokens / 200 });
+	faux.setResponses([(context) => { contexts.push(structuredClone(context)); return fauxAssistantMessage("New scope received."); }]);
+	await session.prompt("Continue under renewed pressure.");
+	await assertAppendOnlyRequests(contexts, faux);
+	for (const context of contexts) assert.ok(context.messages.some((message) => message.role === "user" && Array.isArray(message.content) && message.content.some((block) => block.type === "text" && block.text === noticeContent)));
+	const notices = manager.getBranch().filter((entry) => entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE);
+	assert.equal(notices.length, 2);
+	const currentWindow = (latestCompaction(manager.getBranch()).details as LedgerCompactionDetails).windowId;
+	assert.notEqual(oldScope, currentWindow);
+	assert.ok(notices[1].type === "custom_message");
+	assert.equal((notices[1].details as { windowId: string }).windowId, currentWindow);
+	assert.ok(String(notices[0].type === "custom_message" && notices[0].content).includes(oldScope));
+	assert.ok(String(notices[1].content).includes(currentWindow));
 });
 
 function use4kRecoveryBudgets(t: TestContext): void {
@@ -694,8 +1004,9 @@ test("runtime lifecycle restores forked, switched, tree, and model state", { tim
 		]);
 		const callsBeforeCapacity = faux.state.callCount;
 		await runtime.session.prompt("trigger conservative small model capacity");
-		assert.equal(faux.state.callCount, callsBeforeCapacity);
-		assert.equal(capacityProviderCalled ? capacityProviderAborted : true, true);
+		assert.equal(faux.state.callCount, callsBeforeCapacity + 1);
+		assert.equal(capacityProviderCalled, true);
+		assert.equal(capacityProviderAborted, false);
 		await runtime.session.navigateTree(mainCompaction.id, { summarize: false });
 		let smallModelContext: Context | undefined;
 		faux.setResponses([
@@ -1248,9 +1559,9 @@ test("long native run recovers twenty windows and reads its earliest operation",
 		},
 	};
 	const fixture = await createFixture(true, [], 1_750, {
-		contextWindow: 6_000,
+		contextWindow: 8_000,
 		maxTokens: 128,
-		reserveTokens: 2_500,
+		reserveTokens: 4_500,
 		compactionEnabled: true,
 		extraToolNames: ["long_operation"],
 		customTools: [operationTool],
@@ -1269,8 +1580,6 @@ test("long native run recovers twenty windows and reads its earliest operation",
 	let historyReadContext: Context | undefined;
 	let finalContext: Context | undefined;
 	let extraContext: Context | undefined;
-	const budgetViolations: string[] = [];
-	let maxRequestBudget = 0;
 	const unsubscribe = session.subscribe((event) => {
 		if (event.type === "agent_start") agentStarts++;
 		if (event.type === "compaction_start") {
@@ -1285,11 +1594,8 @@ test("long native run recovers twenty windows and reads its earliest operation",
 	const wrapResponse = (response: (context: Context) => ReturnType<typeof fauxAssistantMessage>): ((context: Context) => ReturnType<typeof fauxAssistantMessage>) => {
 		return (context) => {
 			providerContexts.push(context);
-			const budget = conservativeContextTokens(context, session, 256);
 			const model = session.model;
 			assert.ok(model);
-			maxRequestBudget = Math.max(maxRequestBudget, budget);
-			if (budget > model.contextWindow) budgetViolations.push(`${budget}/${model.contextWindow}`);
 			const transcriptTokens = convertToLlm(context.messages).reduce((total, message) => total + estimateTokens(message), 0);
 			assert.ok(transcriptTokens + 256 <= model.contextWindow, "the full provider transcript and output reserve must fit");
 			assert.ok(getCurrentSystemPrompt(context.messages).length > 0);
@@ -1351,8 +1657,6 @@ test("long native run recovers twenty windows and reads its earliest operation",
 		// 1 checkpoint + 20 operation batches + history search/read + final response + one queued reminder turn.
 		assert.equal(faux.state.callCount, operationIds.length / 2 + 5);
 		assert.equal(providerContexts.length, faux.state.callCount);
-		assert.deepEqual(budgetViolations, []);
-		assert.ok(maxRequestBudget > 0);
 		assert.ok(extraContext);
 		assert.ok(providerContexts.some((context) => /Ledger Context urgent budget reminder/.test(JSON.stringify(context.messages))), "urgent reminder must reach a provider request before later compactions can replace it with a reference");
 		assert.equal(faux.getPendingResponseCount(), 0);
@@ -1531,22 +1835,23 @@ test("maintenance reminders stay out of checkpoint and delta sources while prese
 	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
 	const { session, sessionManager: manager, faux, ledgerFaux } = fixture;
 	const task = "Preserve the original task constraint.";
-	let reminderId = "", quote = "", snapshotTip: string | null = null;
+	let reminderId = "", reminderContent = "", quote = "", snapshotTip: string | null = null;
 	faux.setResponses([
 		fauxAssistantMessage(fauxToolCall("ordinary_work", {}), { stopReason: "toolUse" }),
 		(context) => {
 			const reminder = manager.getBranch().find(entry => entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE);
 			assert.ok(reminder?.type === "custom_message");
 			reminderId = reminder.id;
-			quote = String(reminder.content).split("\n")[0];
+			reminderContent = String(reminder.content);
+			quote = reminderContent.split("\n")[0];
 			snapshotTip = manager.getLeafId();
 			assert.equal(snapshotTip, reminderId, "the maintenance entry may be the real request boundary");
 			assert.ok(context.messages.some(message => message.role === "user" && JSON.stringify(message.content).includes(quote)));
-			assert.match(String(reminder.content), /Exclude this maintenance notice from task facts and sourceQuotes/);
+			assert.match(reminderContent, /Exclude this notice from task facts and sourceQuotes/);
 			return fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Keep the original task constraint. Ordinary work completed.", sourceQuotes: [quote, task] }));
 		},
 		(context) => {
-			assert.ok(!context.messages.some(message => message.role === "user" && JSON.stringify(message.content).includes(quote)), "saving retires the volume reminder");
+			assert.ok(context.messages.some(message => message.role === "user" && Array.isArray(message.content) && message.content.some(block => block.type === "text" && block.text === reminderContent)), "saving preserves the historical reminder");
 			return fauxAssistantMessage("saved and continued");
 		},
 	]);
@@ -1659,7 +1964,7 @@ test("budget reminders are bounded, deduplicated per window, and explicit about 
 		assert.equal(latestDetails.usageKnown, false);
 		assert.ok(latestDetails.reasonKinds?.includes("budget"));
 		assert.equal(latestDetails.windowId === firstWindowId, false);
-		assert.equal((latest.details as { usageKind: string }).usageKind, "bounded-content-estimate");
+		assert.equal((latest.details as { usageKind: string }).usageKind, "projected-content-estimate");
 
 		const reopened = await reopenFixture(fixture);
 		try {
@@ -1746,8 +2051,9 @@ test("saturated unknown usage still persists a settled urgent reminder", { timeo
 		};
 		assert.ok(reminders.some((entry) => (entry.details as { level: string; usageKnown: boolean }).level === "urgent" && (entry.details as { usageKnown: boolean }).usageKnown === false));
 		assert.ok(unknownContext);
-		assert.equal(details.estimatedTokens, conservativeContextTokens(unknownContext, session, 0));
-		assert.equal(details.remainingTokens, details.contextWindow - details.estimatedTokens);
+		assert.ok(details.estimatedTokens >= conservativeContextTokens(unknownContext, session, 0));
+		assert.ok(details.estimatedTokens > details.contextWindow);
+		assert.equal(details.remainingTokens, 0);
 		assert.equal(details.effectiveBoundaryRemaining, 0);
 		assert.equal(details.usageKnown, false);
 	} finally {
@@ -2700,11 +3006,11 @@ test("steering queued during native compaction is delivered once in order", { ti
 		assert.ok(resultIndex > assistantIndex);
 		assert.match(JSON.stringify(branchMessages[resultIndex].message), /large-tool-result/);
 		assert.match(JSON.stringify(reminderContext.messages), /Ledger Context urgent budget reminder/);
-		const refreshedNotice = reminderContext.messages.flatMap((message) => message.role === "user" && Array.isArray(message.content)
+		const deliveredNotice = reminderContext.messages.flatMap((message) => message.role === "user" && Array.isArray(message.content)
 			? message.content.flatMap((block) => block.type === "text" && block.text.startsWith("Ledger Context urgent budget reminder.") ? [block.text] : []) : [])[0];
-		assert.ok(refreshedNotice);
-		assert.match(refreshedNotice, /Automated maintenance request from the Ledger Context extension/);
-		assert.doesNotMatch(refreshedNotice, /stale-volume/);
+		assert.ok(deliveredNotice);
+		assert.match(deliveredNotice, /Automated maintenance request; one checkpoint per scope/);
+		assert.match(deliveredNotice, /Scope: window=/);
 		const branchUserMessages = messageEntries(sessionManager.getBranch()).filter((entry) => entry.message.role === "user");
 		assert.equal(branchUserMessages.filter((entry) => JSON.stringify(entry.message).includes("change direction")).length, 1);
 		assert.equal(branchUserMessages.filter((entry) => JSON.stringify(entry.message).includes("follow up direction")).length, 1);
@@ -2719,6 +3025,7 @@ test("steering queued during native compaction is delivered once in order", { ti
 				entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE,
 		);
 		assert.ok(reminders.length >= 1);
+		assert.ok(reminders.some((entry) => entry.content === deliveredNotice), "delivery preserves the recorded scope and trigger text");
 		assert.equal(new Set(reminders.map((entry) => (entry.details as { reminderKey: string }).reminderKey)).size, reminders.length);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
@@ -3857,60 +4164,6 @@ test("history_search renders only bodies in the selected scope", { timeout: TEST
 	}
 });
 
-test("clipped older entries do not consume the latest short user reference", { timeout: TEST_TIMEOUT_MS }, async () => {
-	const previousTailLimit = process.env.LEDGER_CONTEXT_TAIL_TOKENS;
-	const previousReserve = process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS;
-	process.env.LEDGER_CONTEXT_TAIL_TOKENS = "64";
-	process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS = "30000";
-	const { root, faux, session, sessionManager } = await createFixture(false, [], 64, {
-		contextWindow: 32_000,
-		maxTokens: 256,
-		reserveTokens: 0,
-		compactionEnabled: false,
-	});
-	try {
-		const fixed = conservativeContextTokens({ messages: [], systemPrompt: session.systemPrompt }, session, 0);
-		process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS = String(32_000 - fixed - 512);
-		faux.setResponses([fauxAssistantMessage("reference allocation seed"), fauxAssistantMessage("old reference entry recorded")]);
-		await session.prompt("reference allocation seed");
-		await session.prompt(`old-reference-entry:${"o".repeat(8_000)}`);
-		const oldEntry = sessionManager.getBranch().find(
-			(entry) => entry.type === "message" && entry.message.role === "user" && JSON.stringify(entry.message.content).includes("old-reference-entry:"),
-		);
-		assert.ok(oldEntry);
-		let resumedContext: Context | undefined;
-		const latestText = "short-latest-user-sentinel";
-		faux.setResponses([(context) => {
-			resumedContext = context;
-			return fauxAssistantMessage("reference allocation complete");
-		}]);
-		await session.prompt(latestText);
-		assert.ok(resumedContext);
-		const capturedContext = resumedContext;
-		const model = session.model;
-		assert.ok(model);
-		const latestEntry = sessionManager.getBranch().find(
-			(entry) => entry.type === "message" && entry.message.role === "user" && JSON.stringify(entry.message.content).includes(latestText),
-		);
-		assert.ok(latestEntry);
-		const latestMessage = capturedContext.messages.find(
-			(message) => message.role === "user" && JSON.stringify(message.content).includes(latestText),
-		);
-		assert.ok(latestMessage);
-		const latestContent = JSON.stringify(latestMessage.content);
-		assert.match(latestContent, new RegExp(latestText));
-		assert.match(latestContent, new RegExp(`pi://entry/${latestEntry.id}`));
-		assert.match(JSON.stringify(capturedContext.messages), new RegExp(`old-reference-entry.*pi://entry/${oldEntry.id}`));
-		assert.ok(conservativeContextTokens(capturedContext, session, Number(process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS)) <= model.contextWindow);
-	} finally {
-		rmSync(root, { recursive: true, force: true });
-		if (previousTailLimit === undefined) delete process.env.LEDGER_CONTEXT_TAIL_TOKENS;
-		else process.env.LEDGER_CONTEXT_TAIL_TOKENS = previousTailLimit;
-		if (previousReserve === undefined) delete process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS;
-		else process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS = previousReserve;
-	}
-});
-
 test("history_read contentIndex returns one normalized image at its original content index", { timeout: 10_000 }, async () => {
 	const fixture = await createFixture(true);
 	try {
@@ -4153,7 +4406,7 @@ test("history_read image errors remain explicit and source-bearing", { timeout: 
 	}
 });
 
-test("history_read image results use the global budget with complete mixed tool protocol", { timeout: 15_000 }, async (t) => {
+test("history_read image results preserve every image and the complete mixed tool protocol", { timeout: 15_000 }, async (t) => {
 	use4kRecoveryBudgets(t);
 	const previousReserve = process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS;
 	process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS = "512";
@@ -4210,68 +4463,14 @@ test("history_read image results use the global budget with complete mixed tool 
 			return result;
 		});
 		const imageResults = resultMessages.filter((message) => blocks(message).some((block) => block.type === "image"));
-		assert.equal(imageResults.length, 1, "the global budget should admit one image and retain an explicit error for the other");
-		if (imageResults.length === 1) {
-			const omitted = resultMessages.find((message) => !blocks(message).some((block) => block.type === "image") && message.toolCallId !== "mixed-large-call");
-			assert.ok(omitted);
-			assert.equal(omitted.isError, true);
-			assert.match(JSON.stringify(omitted.content), /pi:\/\/entry\/.*\/content\/0/);
-		}
+		assert.equal(imageResults.length, 2);
+		assert.ok(resultMessages.every((message) => message.isError === false));
 		const largeResultMessage = resultMessages.find((message) => message.toolCallId === "mixed-large-call");
 		assert.ok(largeResultMessage);
 		const sourceResult = messageEntries(sessionManager.getBranch()).find((entry) => entry.message.role === "toolResult" && entry.message.toolCallId === "mixed-large-call");
 		assert.ok(sourceResult);
 		assert.match(toolResultText(sourceResult), /mixed-large-result/);
 		assert.ok(JSON.stringify(largeResultMessage.content).includes("mixed-large-result") || JSON.stringify(largeResultMessage.content).includes(`pi://entry/${sourceResult.id}`));
-	} finally {
-		rmSync(fixture.root, { recursive: true, force: true });
-		if (previousReserve === undefined) delete process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS;
-		else process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS = previousReserve;
-	}
-});
-
-test("history_read image capacity aborts when the mandatory minimum cannot fit", { timeout: 15_000 }, async () => {
-	const previousReserve = process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS;
-	process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS = "1";
-	let contextSignalAborted = false;
-	const observeContext = (pi: ExtensionAPI): void => {
-		pi.on("context", (_event, ctx) => {
-			contextSignalAborted = ctx.signal?.aborted ?? false;
-		});
-	};
-	const fixture = await createFixture(false, [observeContext], 4_096, {
-		contextWindow: 1_536,
-		maxTokens: 32,
-		reserveTokens: 0,
-		compactionEnabled: false,
-	});
-	try {
-		const { faux, session, sessionManager } = fixture;
-		const fixedTokens = conservativeContextTokens({ messages: [], systemPrompt: session.systemPrompt }, session, 1);
-		await session.setModel({ ...faux.getModel(), contextWindow: fixedTokens + 128 });
-		const sourceEntryId = sessionManager.appendMessage({
-			role: "user",
-			content: [{ type: "image", mimeType: "image/png", data: RED_2X2_PNG }],
-			timestamp: Date.now(),
-		});
-		let providerCalls = 0;
-		faux.setResponses([
-			(context) => {
-				providerCalls++;
-				return fauxAssistantMessage(
-					Array.from({ length: 5 }, (_value, index) => fauxToolCall("history_read", { entryId: sourceEntryId, contentIndex: 0, view: "image" }, { id: "capacity-image-call-" + index })),
-					{ stopReason: "toolUse" },
-				);
-			},
-			(context) => {
-				providerCalls++;
-				return fauxAssistantMessage("unexpected image capacity continuation");
-			},
-		]);
-		await session.prompt("exercise the image minimum capacity");
-		assert.equal(providerCalls, 1, "the provider must stop before a request whose image error minimum cannot fit");
-		assert.equal(contextSignalAborted, true);
-		assert.equal(session.isStreaming, false);
 	} finally {
 		rmSync(fixture.root, { recursive: true, force: true });
 		if (previousReserve === undefined) delete process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS;
@@ -4499,7 +4698,7 @@ test("history_read nextOffset reconstructs the complete rendered entry", { timeo
 });
 
 test("compaction without an agent checkpoint accumulates deltas and preserves the last delta on failure", { timeout: TEST_TIMEOUT_MS }, async () => {
-	const { root, faux, ledgerFaux, session, sessionManager } = await createFixture(true, [], 1, { contextWindow: 16_000, maxTokens: 512, reserveTokens: 0 });
+	const { root, faux, ledgerFaux, session, sessionManager } = await createFixture(true, [], 1, { contextWindow: 16_000, maxTokens: 512, reserveTokens: 0, compactionEnabled: false });
 	try {
 		faux.setResponses([fauxAssistantMessage("Verified result: operation completed once."), fauxAssistantMessage("Next: inspect the result.")]);
 		await session.prompt("Goal: preserve the approved operation.");
@@ -4561,14 +4760,7 @@ test("compaction without an agent checkpoint accumulates deltas and preserves th
 	}
 });
 
-for (const mode of [undefined, "native", "user-message"]) test(`Responses tool images use ${mode ?? "native by default"} without changing source payloads`, { timeout: TEST_TIMEOUT_MS }, async (t) => {
-	const previousMode = process.env.LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES;
-	t.after(() => {
-		if (previousMode === undefined) delete process.env.LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES;
-		else process.env.LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES = previousMode;
-	});
-	if (mode === undefined) delete process.env.LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES;
-	else process.env.LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES = mode;
+test("tool images retain Pi's native provider payload", { timeout: TEST_TIMEOUT_MS }, async () => {
 	const { root, faux, session, sessionManager } = await createFixture(false);
 	try {
 		const image = { type: "input_image", image_url: `data:image/png;base64,${RED_2X2_PNG}`, detail: "auto" };
@@ -4583,23 +4775,7 @@ for (const mode of [undefined, "native", "user-message"]) test(`Responses tool i
 		faux.setResponses([async (_context, options, _state, model) => {
 			const rewritten = await options?.onPayload?.(payload, model);
 			assert.deepEqual(payload, original);
-			if (mode !== "user-message") {
-				assert.deepEqual(rewritten ?? payload, original, "native mode preserves Pi's outgoing payload");
-				return fauxAssistantMessage("wire verified");
-			}
-			assert.ok(rewritten && typeof rewritten === "object" && "input" in rewritten && Array.isArray(rewritten.input));
-			assert.deepEqual(rewritten.input.slice(0, 3).map((item) => item.call_id), ["first", "second", "third"]);
-			assert.deepEqual(rewritten.input[0].output, [{ type: "input_text", text: "evidence" }]);
-			assert.equal(rewritten.input[1].output, "plain result");
-			assert.equal(typeof rewritten.input[2].output, "string");
-			assert.deepEqual(rewritten.input.slice(3, 5).map((item) => item.role), ["user", "user"]);
-			assert.deepEqual(rewritten.input[3].content.slice(1), [image, image]);
-			assert.deepEqual(rewritten.input[4].content.slice(1), [image]);
-			assert.match(rewritten.input[3].content[0].text, /tool call first;/);
-			assert.match(rewritten.input[4].content[0].text, /tool call third;/);
-			assert.deepEqual(rewritten.input.at(-1), payload.input.at(-1));
-			const repeated = await options?.onPayload?.(rewritten, model);
-			assert.deepEqual(repeated ?? rewritten, rewritten, "normalization is idempotent");
+			assert.deepEqual(rewritten ?? payload, original);
 			return fauxAssistantMessage("wire verified");
 		}]);
 		await session.prompt("Verify the outgoing payload.");
@@ -4615,30 +4791,6 @@ for (const mode of [undefined, "native", "user-message"]) test(`Responses tool i
 	} finally {
 		session.dispose();
 		rmSync(root, { recursive: true, force: true });
-	}
-});
-
-test("Responses tool image mode reports invalid configuration when loading the extension", { timeout: TEST_TIMEOUT_MS }, async (t) => {
-	const previousMode = process.env.LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES;
-	t.after(() => {
-		if (previousMode === undefined) delete process.env.LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES;
-		else process.env.LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES = previousMode;
-	});
-	const root = mkdtempSync(join(tmpdir(), "pi-ledger-image-mode-"));
-	t.after(() => rmSync(root, { recursive: true, force: true }));
-	const resourceLoader = new DefaultResourceLoader({
-		cwd: root,
-		agentDir: root,
-		noExtensions: true,
-		extensionFactories: [createLedgerContext()],
-	});
-	for (const mode of ["", "user-mesage", "1"]) {
-		process.env.LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES = mode;
-		await resourceLoader.reload();
-		const loaded = resourceLoader.getExtensions();
-		assert.equal(loaded.extensions.length, 0);
-		assert.equal(loaded.errors.length, 1);
-		assert.match(loaded.errors[0].error, /LEDGER_CONTEXT_RESPONSES_TOOL_IMAGES must be native or user-message/);
 	}
 });
 
@@ -4923,7 +5075,7 @@ test("compaction tail budget applies to the complete retained suffix", { timeout
 	}
 });
 
-test("shrinking the retained tail budget drops oldest optional units", { timeout: TEST_TIMEOUT_MS }, async () => {
+test("shrinking recovery display budgets preserves Pi's retained messages", { timeout: TEST_TIMEOUT_MS }, async () => {
 	const previousTailLimit = process.env.LEDGER_CONTEXT_TAIL_TOKENS;
 	process.env.LEDGER_CONTEXT_TAIL_TOKENS = "4096";
 	const { root, faux, session, sessionManager } = await createFixture(true, [], 1_000, {
@@ -4954,102 +5106,12 @@ test("shrinking the retained tail budget drops oldest optional units", { timeout
 				/shrink-retained-\d/.test(JSON.stringify(message.content)) &&
 				!/Ledger Context Recovery/.test(JSON.stringify(message.content)),
 		);
-		const retainedTokens = retainedMessages.reduce((total, message) => total + estimateTokens(message as never), 0);
-		assert.ok(retainedTokens <= 64, `retained provider suffix uses ${retainedTokens} tokens`);
-		assert.ok(retainedMessages.length < retainedIds.length);
+		assert.equal(retainedMessages.length, retainedIds.length);
 		assert.ok(retainedMessages.some((message) => JSON.stringify(message.content).includes(`shrink-retained-${retainedIds.length - 1}`)));
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 		if (previousTailLimit === undefined) delete process.env.LEDGER_CONTEXT_TAIL_TOKENS;
 		else process.env.LEDGER_CONTEXT_TAIL_TOKENS = previousTailLimit;
-	}
-});
-
-test("global recovery pressure drops optional retained units before the latest request", { timeout: TEST_TIMEOUT_MS }, async () => {
-	const previousTailLimit = process.env.LEDGER_CONTEXT_TAIL_TOKENS;
-	const previousReserve = process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS;
-	process.env.LEDGER_CONTEXT_TAIL_TOKENS = "2048";
-	const { root, faux, session, sessionManager } = await createFixture(true, [], 1_000, {
-		contextWindow: 8_192,
-		maxTokens: 512,
-		reserveTokens: 0,
-		compactionEnabled: false,
-	});
-	try {
-		const prefixId = sessionManager.appendMessage({ role: "user", content: `global-retained-prefix:${"p".repeat(8_000)}`, timestamp: Date.now() });
-		const retainedIds = Array.from({ length: 24 }, (_, index) =>
-			sessionManager.appendMessage({ role: "user", content: `global-retained-${index}:${"r".repeat(120)}`, timestamp: Date.now() }),
-		);
-		const retainedRawTokens = retainedIds.reduce((total, id) => {
-			const entry = sessionManager.getEntry(id);
-			assert.ok(entry && entry.type === "message");
-			return total + estimateTokens(entry.message as never);
-		}, 0);
-		assert.ok(retainedRawTokens <= 2_048, `retained entries must fit the configured tail budget (${retainedRawTokens} tokens)`);
-		const windowId = `window:${sessionManager.getSessionId()}:global-pressure`;
-		const compactionId = sessionManager.appendCompaction(
-			"# Ledger Context Recovery\n<active-ledger>global-pressure</active-ledger>",
-			retainedIds[0],
-			8_000,
-			{
-				schemaVersion: 6,
-				kind: "ledger-context",
-				windowId,
-				sourceWindowId: `window:${sessionManager.getSessionId()}:initial`,
-				checkpointEntryId: null,
-					sourceBranchTip: retainedIds.at(-1),
-				firstKeptEntryId: retainedIds[0],
-					snapshotPosition: { entryId: retainedIds.at(-1), branchDepth: sessionManager.getBranch().length },
-					delta: { status: "empty" },
-					recoveryContext: { tailEntryIds: [] },
-			},
-			true,
-		);
-		const compaction = sessionManager.getEntry(compactionId);
-		assert.ok(compaction && compaction.type === "compaction");
-		await session.reload();
-		session.refreshContext();
-		let measuredContext: Context | undefined;
-		faux.setResponses([(context) => { measuredContext = context; return fauxAssistantMessage("measured"); }]);
-		await session.prompt("measure recovery projection");
-		assert.ok(measuredContext);
-		const summaryCost = conservativeContextTokens(
-			{ messages: measuredContext.messages.filter((message) => message.role === "user" && JSON.stringify(message.content).includes("# Ledger Context Recovery")), systemPrompt: session.systemPrompt } as Context,
-			session,
-			0,
-		);
-		const globalNonSummaryBudget = 128;
-		const model = session.model;
-		assert.ok(model);
-		const outputReserve = model.contextWindow - summaryCost - globalNonSummaryBudget;
-		assert.ok(outputReserve > 0);
-		process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS = String(outputReserve);
-		let resumedContext: Context | undefined;
-		faux.setResponses([(context) => {
-			resumedContext = context;
-			return fauxAssistantMessage("global pressure resumed");
-		}]);
-		await session.prompt("global-pressure-latest-request");
-		assert.ok(resumedContext);
-		const capturedContext = resumedContext;
-		const resumedModel = session.model;
-		assert.ok(resumedModel);
-		const retainedMessages = capturedContext.messages.filter(
-			(message) => message.role === "user" && /global-retained-\d/.test(JSON.stringify(message.content)) && !/Ledger Context Recovery/.test(JSON.stringify(message.content)),
-		);
-		assert.ok(retainedMessages.length < retainedIds.length);
-		const latestUserMessage = capturedContext.messages.find(
-			(message) => message.role === "user" && JSON.stringify(message.content).includes("global-pressure-latest-request"),
-		);
-		assert.ok(latestUserMessage);
-		assert.match(JSON.stringify(latestUserMessage.content), /global-pressure-latest-request/);
-		assert.ok(conservativeContextTokens(capturedContext, session, outputReserve) <= resumedModel.contextWindow);
-	} finally {
-		rmSync(root, { recursive: true, force: true });
-		if (previousTailLimit === undefined) delete process.env.LEDGER_CONTEXT_TAIL_TOKENS;
-		else process.env.LEDGER_CONTEXT_TAIL_TOKENS = previousTailLimit;
-		if (previousReserve === undefined) delete process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS;
-		else process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS = previousReserve;
 	}
 });
 
@@ -5161,9 +5223,8 @@ test("native same-run compaction retains a persisted steering correction", { tim
 		const correctionUserText = typeof correctionUserMessage.content === "string"
 			? correctionUserMessage.content
 			: correctionUserMessage.content.map((block) => ("text" in block ? block.text : "")).join("\n");
-		assert.match(correctionUserText, new RegExp(correctionText));
-		assert.match(correctionUserText, new RegExp(`pi://entry/${correctionEntry.id}`));
-		assert.ok(conservativeContextTokens(resumedContext, session, 256) <= 8_192);
+		assert.equal(correctionUserText, correctionText);
+		assert.ok(resumedContext.messages.some((message) => message.role === "toolResult" && message.toolCallId === "same-run-second-call" && message.content.some((block) => block.type === "text" && block.text === `same-run-second-tool-result:${"x".repeat(12_000)}`)));
 		assert.ok(prefixId);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
@@ -5546,109 +5607,6 @@ test("small source budget preserves compaction focus while recent messages retai
 	}
 });
 
-test("near-capacity context keeps the latest correction when the summary fits", { timeout: TEST_TIMEOUT_MS }, async () => {
-	const previousTaskLimit = process.env.LEDGER_CONTEXT_SOURCE_TOKENS;
-	const previousTailLimit = process.env.LEDGER_CONTEXT_TAIL_TOKENS;
-	const previousReserve = process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS;
-	const tailBudget = 128;
-	process.env.LEDGER_CONTEXT_SOURCE_TOKENS = "64";
-	process.env.LEDGER_CONTEXT_TAIL_TOKENS = String(tailBudget);
-	process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS = "256";
-	const { root, faux, session, sessionManager } = await createFixture(true, [], 64, {
-		contextWindow: 8_000,
-		maxTokens: 256,
-		reserveTokens: 0,
-		compactionEnabled: false,
-	});
-	try {
-		faux.setResponses([fauxAssistantMessage("near-capacity prefix")]);
-		await session.prompt("seed near-capacity summary");
-		sessionManager.appendMessage({
-			role: "user",
-			content: `near-capacity-old:${"o".repeat(6_000)}`,
-			timestamp: Date.now(),
-		});
-		await session.compact();
-		const compaction = sessionManager.getBranch().filter((entry) => entry.type === "compaction").at(-1);
-		assert.ok(compaction);
-		const summaryTokens = convertToLlm(sessionEntryToContextMessages(compaction)).reduce((sum, message) => sum + estimateTokens(message), 0);
-		const fixedTokens = conservativeContextTokens({ messages: [], systemPrompt: session.systemPrompt }, session, 256);
-		await session.setModel({ ...faux.getModel(), contextWindow: fixedTokens + summaryTokens + 600 });
-		for (let index = 0; index < 18; index++) {
-			sessionManager.appendMessage({
-				role: "user",
-				content: `near-capacity-active-${index}:${"a".repeat(120)}`,
-				timestamp: Date.now(),
-			});
-		}
-		let resumedContext: Context | undefined;
-		const correction = `latest-near-capacity-correction-sentinel:${"c".repeat(1_200)}`;
-		faux.setResponses([
-			(context) => {
-				resumedContext = context;
-				return fauxAssistantMessage("near-capacity response");
-			},
-		]);
-		await session.prompt(correction);
-		assert.ok(resumedContext);
-		const capturedContext = resumedContext;
-		const model = session.model;
-		assert.ok(model);
-		const correctionEntry = sessionManager
-			.getBranch()
-			.find(
-				(entry) =>
-					entry.type === "message" &&
-					entry.message.role === "user" &&
-					JSON.stringify(entry.message.content).includes(correction),
-			);
-		assert.ok(correctionEntry);
-		const latestUserMessage = capturedContext.messages.find(
-			(message) => message.role === "user" && JSON.stringify(message.content).includes("latest-near-capacity-correction-sentinel"),
-		);
-		assert.ok(latestUserMessage);
-		const latestUserText = typeof latestUserMessage.content === "string"
-			? latestUserMessage.content
-			: latestUserMessage.content.map((block) => ("text" in block ? block.text : "")).join("\n");
-		const visiblePrefix = latestUserText.split("\n[truncated; complete entry:")[0];
-		assert.ok(visiblePrefix.length > 0 && correction.startsWith(visiblePrefix));
-		const latestUserIndex = capturedContext.messages.findIndex((message) =>
-			message.role === "user" && JSON.stringify(message.content).includes("latest-near-capacity-correction-sentinel"),
-		);
-		const reference = `\n[truncated; complete entry: pi://entry/${correctionEntry.id}]`;
-		const fitsWitness = (prefixLength: number): boolean => {
-			const witnessText = `${correction.slice(0, prefixLength)}${reference}`;
-			const witnessMessages = capturedContext.messages.map((message, index) =>
-				index === latestUserIndex ? { ...message, content: [{ type: "text" as const, text: witnessText }] } : message,
-			);
-			const witnessMessage = witnessMessages[latestUserIndex];
-			return estimateTokens(witnessMessage as never) <= tailBudget && conservativeContextTokens({ ...capturedContext, messages: witnessMessages }, session, 256) <= model.contextWindow;
-		};
-		let low = 1;
-		let high = correction.length;
-		let witnessPrefixLength = 1;
-		while (low <= high) {
-			const middle = Math.floor((low + high) / 2);
-			if (fitsWitness(middle)) {
-				witnessPrefixLength = middle;
-				low = middle + 1;
-			} else {
-				high = middle - 1;
-			}
-		}
-		assert.ok(visiblePrefix.length >= witnessPrefixLength);
-		assert.match(latestUserText, new RegExp(`pi://entry/${correctionEntry.id}`));
-	} finally {
-		rmSync(root, { recursive: true, force: true });
-		if (previousTaskLimit === undefined) delete process.env.LEDGER_CONTEXT_SOURCE_TOKENS;
-		else process.env.LEDGER_CONTEXT_SOURCE_TOKENS = previousTaskLimit;
-		if (previousTailLimit === undefined) delete process.env.LEDGER_CONTEXT_TAIL_TOKENS;
-		else process.env.LEDGER_CONTEXT_TAIL_TOKENS = previousTailLimit;
-		if (previousReserve === undefined) delete process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS;
-		else process.env.LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS = previousReserve;
-	}
-});
-
 test("tail marker write failure cancels compaction and blocks another attempt", { timeout: TEST_TIMEOUT_MS }, async () => {
 	const previousTailLimit = process.env.LEDGER_CONTEXT_TAIL_TOKENS;
 	process.env.LEDGER_CONTEXT_TAIL_TOKENS = "64";
@@ -5685,7 +5643,7 @@ test("tail marker write failure cancels compaction and blocks another attempt", 
 	}
 });
 
-test("context display bounds large multimodal tool units while preserving protocol fields", { timeout: TEST_TIMEOUT_MS }, async (t) => {
+test("main context preserves large multimodal tool units and protocol fields", { timeout: TEST_TIMEOUT_MS }, async (t) => {
 	use4kRecoveryBudgets(t);
 	const payload = `structured-payload-sentinel:${"p".repeat(40_000)}`;
 	const toolText = `large-tool-text-sentinel:${"t".repeat(40_000)}`;
@@ -5757,7 +5715,7 @@ test("context display bounds large multimodal tool units while preserving protoc
 		if (!toolCallBlock || toolCallBlock.type !== "toolCall") throw new Error("missing tool call block");
 		assert.equal(typeof toolCallBlock.name, "string");
 		assert.equal(typeof toolCallBlock.arguments, "object");
-		assert.ok(JSON.stringify(toolCallBlock.arguments).length < JSON.stringify({ payload }).length);
+		assert.deepEqual(toolCallBlock.arguments, { payload });
 		const thinkingBlock = toolCall.content.find((block) => block.type === "thinking");
 		assert.deepEqual(thinkingBlock, signedThinking);
 		const signedTextBlock = toolCall.content.find((block) => block.type === "text" && block.textSignature === signedText.textSignature);
@@ -5766,48 +5724,9 @@ test("context display bounds large multimodal tool units while preserving protoc
 		assert.deepEqual(signedToolCallBlock, signedToolCall);
 		assert.match(JSON.stringify(messages), /structured-payload-sentinel/);
 		assert.match(JSON.stringify(messages), /large-tool-text-sentinel/);
-		assert.doesNotMatch(JSON.stringify(messages), /aGVsbG8=/);
-		assert.match(JSON.stringify(messages), /image payload omitted/);
-		assert.match(JSON.stringify(messages), /complete entry: pi:\/\/entry\//);
-		assert.ok(messages.reduce((total, message) => total + estimateTokens(message as never), 0) <= 32_000);
-	} finally {
-		rmSync(root, { recursive: true, force: true });
-	}
-});
-
-test("context capacity failure aborts the active provider request", { timeout: TEST_TIMEOUT_MS }, async () => {
-	let contextSignalAborted = false;
-	const observesAbort = (pi: ExtensionAPI): void => {
-		pi.on("context", (_event, ctx) => {
-			contextSignalAborted = ctx.signal?.aborted ?? false;
-		});
-	};
-	const { root, faux, session } = await createFixture(false, [observesAbort], 500, {
-		contextWindow: 64,
-		maxTokens: 32,
-		reserveTokens: 0,
-		compactionEnabled: false,
-	});
-	try {
-		let providerCalled = false;
-		let providerSignalAborted = false;
-		let agentEnded = false;
-		session.subscribe((event) => {
-			if (event.type === "agent_end") agentEnded = true;
-		});
-		faux.setResponses([
-			(_context, options) => {
-				providerCalled = true;
-				providerSignalAborted = options?.signal?.aborted ?? false;
-				return fauxAssistantMessage("capacity response");
-			},
-		]);
-		await session.prompt("trigger a capacity failure");
-
-		assert.equal(contextSignalAborted, true);
-		assert.equal(providerCalled ? providerSignalAborted : agentEnded, true);
-		assert.equal(agentEnded, true);
-		assert.equal(session.isStreaming, false);
+		assert.match(JSON.stringify(messages), /aGVsbG8=/);
+		assert.doesNotMatch(JSON.stringify(messages), /image payload omitted/);
+		assert.ok(messages.some((message) => message.role === "toolResult" && message.content.some((block) => block.type === "text" && block.text === toolText)));
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -5964,7 +5883,7 @@ test("history navigation handles estimated and unavailable capacity and bounded 
 	const context = { sessionManager: fixture.sessionManager, model: fixture.faux.getModel(), getContextUsage: () => undefined, getSystemPrompt: () => "" };
 	const estimated = await budget.execute("estimate", {}, undefined, undefined, context as never);
 	const details = estimated.details as { usageKind: string; usedTokens: number; nativeCompactionMode: string; effectiveBoundaryTokens: number };
-	assert.equal(details.usageKind, "bounded-content-estimate");
+	assert.equal(details.usageKind, "projected-content-estimate");
 	assert.ok(details.usedTokens > 0);
 	assert.equal(details.nativeCompactionMode, "unknown");
 	assert.equal(details.effectiveBoundaryTokens, 115_200);
@@ -6671,7 +6590,7 @@ test("committed compaction restarts volume reminders beyond retained history acr
 	assert.equal(JSON.stringify(checkpoint.data), original);
 });
 
-test("queued volume and budget reminders are rechecked after native compaction before provider delivery", async (t) => {
+test("queued reminders preserve their issuing scope when delivered after native compaction", async (t) => {
 	const soft = process.env.LEDGER_CONTEXT_REMINDER_TOKENS;
 	const urgent = process.env.LEDGER_CONTEXT_URGENT_TOKENS;
 	process.env.LEDGER_CONTEXT_REMINDER_TOKENS = "100";
@@ -6698,7 +6617,10 @@ test("queued volume and budget reminders are rechecked after native compaction b
 	const notice = entries.find((entry) => entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE && entry.parentId === compact.id);
 	assert.ok(notice && notice.type === "custom_message", "reproduce a pre-compaction notice persisted after the compaction entry");
 	assert.notEqual((notice.details as { usageWindowId: string }).usageWindowId, (compact.details as LedgerCompactionDetails).windowId);
-	assert.doesNotMatch(JSON.stringify(request.messages), /Ledger Context (stale-volume|soft budget|urgent budget) reminder/);
+	assert.ok(request.messages.some((message) => message.role === "user" && Array.isArray(message.content) && message.content.some((block) => block.type === "text" && block.text === notice.content)));
+	assert.ok(String(notice.content).includes((notice.details as { windowId: string }).windowId));
+	assert.match(String(notice.content), /once if this scope is current/);
+	assert.match(String(notice.content), /successful checkpoint or compaction closes this request/);
 	assert.equal(checkpointEntries(entries).at(-1)?.id, checkpoint.id);
 });
 
@@ -6815,7 +6737,7 @@ test("text-only history views exclude image metadata from context replacements",
 	}
 });
 
-test("edited request references survive clipping, latest edits, reload and branch navigation", async (t) => {
+test("Pi context edits retain complete source text across reload and branch navigation", async (t) => {
 	const tail = process.env.LEDGER_CONTEXT_TAIL_TOKENS;
 	process.env.LEDGER_CONTEXT_TAIL_TOKENS = "128";
 	t.after(() => { if (tail === undefined) delete process.env.LEDGER_CONTEXT_TAIL_TOKENS; else process.env.LEDGER_CONTEXT_TAIL_TOKENS = tail; });
@@ -6834,7 +6756,7 @@ test("edited request references survive clipping, latest edits, reload and branc
 	}]);
 	await session.prompt("continue after replacement");
 	assert.match(request, /latest-edit/);
-	assert.match(request, new RegExp(`pi://entry/${source}`));
+	assert.ok(request.includes("latest-edit " + "z".repeat(4000)));
 	assert.doesNotMatch(request, /original-anchor|first-edit/);
 	await session.navigateTree(originalLeaf, { summarize: false });
 	request = "";
@@ -6923,13 +6845,10 @@ test("canonical context edits govern delta, task recovery and source mapping whi
 	assert.doesNotMatch(request, /omitted-user-sentinel|original-user-sentinel|abandoned-assistant-sentinel/);
 });
 
-test("capacity failures are reported and extension handlers have no unexpected errors", () => {
-	assert.equal(extensionErrors.length, 4);
+test("ledger capacity failures are reported and extension handlers have no unexpected errors", () => {
+	assert.equal(extensionErrors.length, 1);
 	for (const [index, pattern] of [
-		/the active compaction summary uses \d+ tokens, above the \d+-token recovery budget/,
 		/stored checkpoint cannot fit the current budget: ledger exceeds 4096 estimated tokens/,
-		/mandatory context requires \d+ tokens, above the 128-token recovery budget/,
-		/fixed context uses \d+ tokens, output reserve uses 6, and the 64-token window cannot fit recovery metadata/,
 	].entries()) {
 		assert.equal(extensionErrors[index].event, "context");
 		assert.match(extensionErrors[index].error, pattern);
