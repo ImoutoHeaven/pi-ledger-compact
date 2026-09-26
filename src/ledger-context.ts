@@ -28,6 +28,7 @@ export const REMINDER_HANDOFF_ENTRY_TYPE = "ledger-context/reminder-handoff";
 export const DEFAULT_SOFT_REMINDER_TOKEN_LIMIT = 32_768;
 export const DEFAULT_URGENT_REMINDER_TOKEN_LIMIT = 16_384;
 export const MAX_HISTORY_SEARCH_QUERY_LENGTH = 8_192;
+export const MAX_HISTORY_SEARCH_QUERIES = 32;
 export const MAX_HISTORY_IDENTIFIER_LENGTH = 1_024;
 export const MAX_HISTORY_PAGE_SIZE = 100;
 export const MAX_HISTORY_READ_LENGTH = 65_536;
@@ -81,7 +82,8 @@ const historyListItemsParameters = Type.Object(historyItemFields, { additionalPr
 const historyListWindowsParameters = Type.Object({ ...historyPageFields, filter: Type.Optional(historyFilterSchema) }, { additionalProperties: false });
 const historySearchParameters = Type.Object({
 	...historyItemFields,
-	query: Type.String({ minLength: 1, description: "Literal text, ignoring case by default; at most 8192 UTF-8 bytes." }),
+	query: Type.Optional(Type.String({ minLength: 1, description: "One literal query; supply exactly one of query or queries." })),
+	queries: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: MAX_HISTORY_SEARCH_QUERIES, description: "OR literals sharing filters, snapshot and output budget; at most 8192 UTF-8 bytes total. Result matchedQueryIndexes use zero-based positions in this list." })),
 	caseSensitive: Type.Optional(Type.Boolean({ description: "Match letter case exactly; defaults to false." })),
 }, { additionalProperties: false });
 const historyReadItemParameters = Type.Object({
@@ -416,7 +418,6 @@ interface SessionState {
 	delta?: StoredDelta;
 	currentAgentRequest?: { position: RequestHistoryPosition; recoveryBasis: RecoveryBasis | null };
 	recoveryError?: string;
-	lastCompactionEntryId?: string;
 	persistenceUncertain?: string;
 	deliveredReminderKeys: Set<string>;
 	queuedReminderKeys: Set<string>;
@@ -1192,7 +1193,7 @@ function historyValidationError(message: string): Error {
 function historyContinuation(tool: HistoryPageTool): string {
 	if (tool === "history_read") return "Copy nextCursor with the same entryId/view/contentIndex/before/after/order; limit/projection may change.";
 	if (tool === "history_list_windows") return "Copy nextCursor with the same filter/order; limit may change.";
-	return `Copy nextCursor with the same ${tool === "history_search" ? "query/filter/order/caseSensitive" : "filter/order"}; limit/maxChars/projection may change.`;
+	return `Copy nextCursor with the same ${tool === "history_search" ? "query/queries/filter/order/caseSensitive" : "filter/order"}; limit/maxChars/projection may change.`;
 }
 
 function historyCursorError(message: string, tool: HistoryPageTool = "history_search"): Error {
@@ -1744,7 +1745,7 @@ function historyItemMetadata(entry: SessionEntry, checkpoints: Map<string, Check
 }
 
 function historyItemsResult(
-	params: HistoryListItemsParameters & { query?: string; caseSensitive?: boolean },
+	params: HistoryListItemsParameters & { query?: string; queries?: string[]; caseSensitive?: boolean },
 	ctx: ExtensionContext,
 	toolCallId?: string,
 	tool: HistoryPageTool = "history_search",
@@ -1754,13 +1755,19 @@ function historyItemsResult(
 	details: Record<string, unknown>;
 } {
 	const listing = tool !== "history_search";
-	historyObject(params, ["filter", "projection", "maxChars", "cursor", "limit", "order", "truncate", ...(!listing ? ["query", "caseSensitive"] : [])], tool);
-	if (!params || (!listing && (typeof params.query !== "string" || params.query.length === 0))) {
-		throw historyValidationError("query must be a non-empty literal string");
+	historyObject(params, ["filter", "projection", "maxChars", "cursor", "limit", "order", "truncate", ...(!listing ? ["query", "queries", "caseSensitive"] : [])], tool);
+	if (!listing && (params.query === undefined) === (params.queries === undefined)) {
+		throw historyValidationError("provide exactly one of query or queries");
 	}
-	const query = listing ? null : params.query!;
-	if (query !== null && (query.length > MAX_HISTORY_SEARCH_QUERY_LENGTH || utf8Bytes(query) > MAX_HISTORY_SEARCH_QUERY_LENGTH)) {
-		throw historyValidationError(`query exceeds ${MAX_HISTORY_SEARCH_QUERY_LENGTH} bytes`);
+	if (params.query !== undefined && typeof params.query !== "string") throw historyValidationError("query must be a literal string");
+	if (params.queries !== undefined && (!Array.isArray(params.queries) || params.queries.length === 0 || params.queries.length > MAX_HISTORY_SEARCH_QUERIES)) {
+		throw historyValidationError(`queries must contain 1..${MAX_HISTORY_SEARCH_QUERIES} literal strings`);
+	}
+	const query = listing ? null : params.query ?? params.queries!;
+	const queries = query === null ? [] : Array.isArray(query) ? query : [query];
+	if (queries.some(term => typeof term !== "string" || term.length === 0)) throw historyValidationError("query strings must be non-empty");
+	if (queries.some(term => term.length > MAX_HISTORY_SEARCH_QUERY_LENGTH) || queries.reduce((bytes, term) => bytes + utf8Bytes(term), 0) > MAX_HISTORY_SEARCH_QUERY_LENGTH) {
+		throw historyValidationError(`query text exceeds ${MAX_HISTORY_SEARCH_QUERY_LENGTH} UTF-8 bytes in total`);
 	}
 	const filter = normalizedHistoryFilter(params.filter);
 	const projection = historyProjection(params.projection);
@@ -1771,9 +1778,9 @@ function historyItemsResult(
 		throw historyValidationError("caseSensitive must be a boolean");
 	}
 	const caseSensitive = params.caseSensitive ?? false;
-	const literalPattern = (query ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-	const insensitiveQuery = new RegExp(literalPattern, "iu");
-	const searchHeading = listing ? "History items" : `History search: ${JSON.stringify(params.truncate === false ? query! : displayedHistoryQuery(query!))} (${caseSensitive ? "case-sensitive" : "case-insensitive"} literal)`;
+	const insensitiveQueries = queries.map(term => new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "iu"));
+	const displayedQueries = queries.map(term => params.truncate === false ? term : displayedHistoryQuery(term));
+	const searchHeading = listing ? "History items" : `History search: ${safeJson(Array.isArray(query) ? displayedQueries : displayedQueries[0])} (${caseSensitive ? "case-sensitive" : "case-insensitive"} literal${Array.isArray(query) ? "; OR" : ""})`;
 	const branchEntries = ctx.sessionManager.getBranch();
 	const filterKey = historyFilterKey({ tool, query, filter, order, caseSensitive, selection: selection ? { entryId: selection.entryId, view: selection.view, contentIndex: selection.contentIndex, before: selection.before ?? 2, after: selection.after ?? 2 } : undefined });
 	const snapshot = historyPageSnapshot(params, branchEntries, toolCallId, filterKey, tool);
@@ -1795,7 +1802,7 @@ function historyItemsResult(
 
 	const tokenLimit = historyReadTokenLimit(params.truncate);
 	const limit = params.limit ?? 20;
-	const candidates: Array<{ view: HistoryEntryView; index: number; parts: HistoryPart[]; text: string; matchOffset: number; match?: { kind: HistoryKind; contentIndex?: number; offset: number; spansBlocks?: boolean } }> = [];
+	const candidates: Array<{ view: HistoryEntryView; index: number; parts: HistoryPart[]; text: string; matchedQueryIndexes: number[]; matchOffset: number; match?: { kind: HistoryKind; contentIndex?: number; offset: number; spansBlocks?: boolean } }> = [];
 	let totalMatches = 0;
 	for (let index = Math.min(snapshotEndIndex, branchEntries.length - 1); index >= 0; index--) {
 		const entry = branchEntries[index];
@@ -1808,7 +1815,9 @@ function historyItemsResult(
 		if (related?.callEntryId === entry.id) parts = parts.filter((part) => part.kind === "tool_call" && related.callIds.has(part.toolCallId ?? ""));
 		if (parts.length === 0) continue;
 		const text = listing && (projection === "references" || projection === "images") ? "" : historyPartText(parts, "all");
-		const matchOffset = listing ? 0 : caseSensitive ? text.indexOf(query!) : text.search(insensitiveQuery);
+		const offsets = queries.map((term, index) => caseSensitive ? text.indexOf(term) : text.search(insensitiveQueries[index]));
+		const matchedQueryIndexes = offsets.flatMap((offset, index) => offset >= 0 ? [index] : []);
+		const matchOffset = listing ? 0 : offsets[matchedQueryIndexes[0]] ?? -1;
 		if (matchOffset < 0) continue;
 		totalMatches++;
 		if (afterIndex !== undefined && (order === "newest" ? index >= afterIndex : index <= afterIndex)) continue;
@@ -1816,7 +1825,7 @@ function historyItemsResult(
 		let match: { kind: HistoryKind; contentIndex?: number; offset: number; spansBlocks?: boolean } | undefined;
 		if (!listing) for (const part of parts) {
 			const size = part.text("all").length;
-			if (offset <= size) { match = { kind: part.kind, contentIndex: part.contentIndex, offset, ...(offset + query!.length > size ? { spansBlocks: true } : {}) }; break; }
+			if (offset <= size) { match = { kind: part.kind, contentIndex: part.contentIndex, offset, ...(offset + queries[matchedQueryIndexes[0]].length > size ? { spansBlocks: true } : {}) }; break; }
 			offset -= size + 1;
 		}
 		candidates.push({
@@ -1824,6 +1833,7 @@ function historyItemsResult(
 			index,
 			parts,
 			text,
+			matchedQueryIndexes,
 			matchOffset,
 			match,
 		});
@@ -1844,7 +1854,7 @@ function historyItemsResult(
 	const metadataTokens = estimatedOutputTokens(metadataOutput);
 	if (metadataTokens > tokenLimit) throw historyCapacityError(tool, tokenLimit, metadataTokens);
 	for (let candidateIndex = 0; candidateIndex < Math.min(candidates.length, limit); candidateIndex++) {
-		const { view, text, matchOffset, match, parts } = candidates[candidateIndex];
+		const { view, text, matchedQueryIndexes, matchOffset, match, parts } = candidates[candidateIndex];
 		if (text === undefined) continue;
 		const potentialNextCursor = candidateIndex + 1 < candidates.length
 			? encodeHistoryCursor(view.entry.id, snapshotThrough, filterKey)
@@ -1855,7 +1865,7 @@ function historyItemsResult(
 		const payloads = projection === "images" || projection === "all" ? view.payloads : [];
 		const toolCallCount = Array.isArray(metadata.toolCalls) ? metadata.toolCalls.length : 0;
 		const displayText = (projection === "text" ? historyPartText(parts, "text") : text) || "(no text)";
-		const displayOffset = listing ? 0 : Math.max(0, caseSensitive ? displayText.indexOf(query!) : displayText.search(insensitiveQuery));
+		const displayOffset = listing ? 0 : Math.max(0, caseSensitive ? displayText.indexOf(queries[matchedQueryIndexes[0]]) : displayText.search(insensitiveQueries[matchedQueryIndexes[0]]));
 		let snippetLength = Math.min(displayText.length, maxChars);
 		let selectedSnippet: string | undefined;
 		let candidateTokens = metadataTokens;
@@ -1868,6 +1878,7 @@ function historyItemsResult(
 				`executionStatus: ${view.executionStatus}`,
 				`kinds: ${kinds.join(",")}; hasImage: ${view.payloads.length > 0}`,
 				...(match ? [`match: ${safeJson(match)}`] : []),
+				...(Array.isArray(query) ? [`matchedQueryIndexes: ${safeJson(matchedQueryIndexes)}`] : []),
 				...Object.entries(metadata).map(([key, value]) => `${key}: ${safeJson(value)}`),
 				payloadSummary(payloads),
 				...(includeText ? ["snippet:"] : []),
@@ -1914,6 +1925,7 @@ function historyItemsResult(
 			windowId: view.windowId,
 			executionStatus: view.executionStatus,
 			...(listing ? {} : { matchOffset, match }),
+			...(Array.isArray(query) ? { matchedQueryIndexes } : {}),
 			...(includeText ? { snippet: selectedSnippet, truncated: selectedSnippet.length < displayText.length } : {}),
 			payloads,
 		});
@@ -1936,7 +1948,7 @@ function historyItemsResult(
 		content: [{ type: "text", text: output }],
 		details: {
 			schemaVersion: LEDGER_SCHEMA_VERSION,
-			...(listing ? {} : { query }),
+			...(listing ? {} : Array.isArray(query) ? { queries } : { query }),
 			filter,
 			projection,
 			order,
@@ -2376,7 +2388,6 @@ function invalidateUncertainState(state: SessionState, ctx: ExtensionContext, re
 	state.delta = undefined;
 	state.currentAgentRequest = undefined;
 	state.activeWindowId = initialWindowId(ctx);
-	state.lastCompactionEntryId = undefined;
 	state.deliveredReminderKeys.clear();
 	state.queuedReminderKeys.clear();
 	state.pendingReminderReasons = [];
@@ -2499,7 +2510,6 @@ function hydrateState(state: SessionState, entries: SessionEntry[], ctx: Extensi
 		}
 		const latestWindow = latestLedgerCompaction(entries);
 		state.activeWindowId = latestWindow && isLedgerCompactionDetails(latestWindow.details) ? latestWindow.details.windowId : initialWindowId(ctx);
-		state.lastCompactionEntryId = latestWindow?.id;
 		if (restoreReminders) {
 			restoreReminderState(state, entries);
 			restoreReminderHandoff(state, entries);
@@ -3260,10 +3270,10 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 	pi.registerTool({
 		name: "history_search",
 		label: "History Search",
-		description: "Search selected history parts by literal substring; ignores case by default. Shared filter supports kinds, exclusions, tools, statuses, window IDs, exclusive entry ranges, and image presence. Returns one item per source entry.",
-		promptSnippet: "search current-branch history with a literal query",
+		description: "Search history with one query or OR queries, ignoring case by default. All queries share filters, snapshot and output budget. Returns each source entry once; matchedQueryIndexes identifies matching queries. match and matchOffset describe the first matching query in list order.",
+		promptSnippet: "search current-branch history with literal queries",
 		promptGuidelines: [
-			"Filter fields combine with AND, arrays with OR; exclusions win. Maintenance tool traffic is excluded unless includeMaintenance=true. Projection controls output independently of matching; images are searched as metadata. Read single-block matches with contentIndex/offset/length; read entryId for spansBlocks. Continue with nextCursor and the same query/filter/order/caseSensitive; limit/maxChars/projection may change. limit and maxChars are ceilings; pageEnd reports complete, limit or output_budget.",
+			"Supply exactly one of query or queries (1..32 nonempty literals, 8192 UTF-8 bytes total). Filter fields combine with AND, arrays with OR; exclusions win. Maintenance traffic defaults off. Projection is independent of matching; images match as metadata. Read the first matching query with contentIndex/offset/length, or entryId for spansBlocks. Continue with nextCursor and the same query or ordered queries, filter/order/caseSensitive; limit/maxChars/projection/truncate may change. pageEnd reports complete, limit or output_budget.",
 		],
 		parameters: historySearchParameters,
 		executionMode: "sequential",

@@ -110,9 +110,9 @@ const ledgerExtension = createLedgerContext({
 | `hasImage` | 按原始图像块是否存在筛选条目。 |
 | `includeMaintenance` | 包含 checkpoint、历史查询、容量查询工具的调用与结果，默认 false；保存的 checkpoint 记录独立参与筛选。 |
 
-`history_list_items` 和 `history_search` 每个原始 entry 返回一项，标明选中的 `kinds`、执行状态和来源 ID。搜索要求非空字面 `query`，默认忽略大小写，`caseSensitive: true` 启用精确大小写。匹配与返回内容独立：`projection` 默认 `all`，返回文字预览和图像引用；`text` 返回选中内容中的文字，保留带图条目的文字；`images` 返回图像引用；`references` 返回条目元数据。`maxChars` 控制每条预览的上限，默认 256 个 UTF-16 代码单元。搜索报告匹配内容的原始 `contentIndex` 和所选渲染文本内的偏移；图片通过文字元数据参与匹配。
+`history_list_items` 和 `history_search` 每个原始 entry 返回一项，标明选中的 `kinds`、执行状态和来源 ID。搜索使用非空字面 `query` 或有序 `queries` 数组，两者恰选一个。多个关键词按 OR 匹配，共用过滤条件、快照和输出预算。每个条目只返回一次，`matchedQueryIndexes` 以从零开始的数组位置标明全部命中词；`match`、`matchOffset` 和 snippet 位置采用数组顺序中首个命中的关键词。默认忽略大小写，`caseSensitive: true` 启用精确大小写。匹配与返回内容独立：`projection` 默认 `all`，返回文字预览和图像引用；`text` 返回选中内容中的文字，保留带图条目的文字；`images` 返回图像引用；`references` 返回条目元数据。`maxChars` 控制每条预览的上限，默认 256 个 UTF-16 代码单元。搜索报告匹配内容的原始 `contentIndex` 和所选渲染文本内的偏移；图片通过文字元数据参与匹配。
 
-条目列表和搜索结果包含 `items`、`totalMatches`、`returnedCount`、`snapshotThrough` 和 `nextCursor`。`order` 默认 `newest`，也支持 `oldest`。Version 4 游标绑定分支快照、工具、过滤条件、顺序和匹配选项。续页保持相同的选择参数，允许调整 `limit`、`maxChars` 和 `projection`；后续活动保持该快照稳定。`limit` 和 `maxChars` 是输出预算内的上限。`pageEnd` 表示 `complete`、`limit` 或 `output_budget`；预览的截断标记提供完整条目的读取方向。无效游标会说明如何续页，以及如何从当前查询重新开始。
+条目列表和搜索结果包含 `items`、`totalMatches`、`returnedCount`、`snapshotThrough` 和 `nextCursor`。`order` 默认 `newest`，也支持 `oldest`。Version 4 游标绑定分支快照、工具、过滤条件、顺序和匹配选项。续页保持相同的 query 或有序 queries、过滤条件、顺序和大小写模式，允许调整 `limit`、`maxChars`、`projection` 和 `truncate`；后续活动保持该快照稳定。`limit` 和 `maxChars` 是输出预算内的上限。`pageEnd` 表示 `complete`、`limit` 或 `output_budget`；预览的截断标记提供完整条目的读取方向。无效游标会说明如何续页，以及如何从当前查询重新开始。
 
 Checkpoint 结果包含前一个可解析版本的 ID、来源窗口、请求位置和快照内的 active 标记。fitsCurrentLedgerBudget 独立报告当前容量；新 compaction 摘要按限额校验完整 checkpoint 与 delta。compaction_delta 结果定位生成 delta 的原始条目，包含基线、范围和输入记录。复用或过期 delta 引用其原始条目。
 
@@ -122,6 +122,7 @@ Checkpoint 结果包含前一个可解析版本的 ID、来源窗口、请求位
 
 ```ts
 history_search({ query: "timeout", filter: { kinds: ["tool_result"], toolNames: ["bash"], statuses: ["failed"] }, projection: "text" });
+history_search({ queries: ["timeout", "verification failed"], filter: { kinds: ["tool_result"] }, projection: "text" });
 history_list_items({ filter: { kinds: ["checkpoint"] }, limit: 5 });
 history_list_items({ filter: { kinds: ["compaction_delta"] }, limit: 5 });
 history_read({ entryId: "result-id", view: "exchange" });
@@ -162,7 +163,7 @@ Pi 在工具结果进入历史前，按自身自动缩放设置与当前模型�
 
 Pi 管理主请求容量、图片处理、provider 编码和原始尾部选择。扩展限额用于 checkpoint/delta 正文、新恢复摘要和默认历史工具输出。显式 truncate: false 完整返回请求范围，Pi/provider 的容量限制仍适用。
 
-Checkpoint 和 delta 正文各允许 65,536 个 UTF-8 字节、最多 8 个来源选择器；原句上限为 512 个 UTF-16 单元，每个选择器保留最多 4 个候选。搜索文本允许 8,192 个 UTF-8 字节，标识符允许 1,024 个 UTF-16 单元，分页和 many 批次最多 100 项。显式正文偏移和长度采用安全整数。默认正文请求 65,536 个 UTF-16 单元，未指定长度的无裁剪读取返回全部剩余文字。
+Checkpoint 和 delta 正文各允许 65,536 个 UTF-8 字节、最多 8 个来源选择器；原句上限为 512 个 UTF-16 单元，每个选择器保留最多 4 个候选。搜索接受最多 32 个字面关键词，合计最多 8,192 个 UTF-8 字节，标识符允许 1,024 个 UTF-16 单元，分页和 many 批次最多 100 项。显式正文偏移和长度采用安全整数。默认正文请求 65,536 个 UTF-16 单元，未指定长度的无裁剪读取返回全部剩余文字。
 
 pi 的上下文用量由提供方报告的用量与后续消息的估算量组成。提供方用量未知时，Ledger Context 估算有效投影中的对话与恢复材料，并将系统提示、活动工具定义和模型元数据各计一次。这些估算用于容量报告、提醒及压缩恢复预算，精度取决于模型的 token 计量方式。
 

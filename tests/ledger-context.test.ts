@@ -6355,6 +6355,123 @@ test("many image reads use Pi's model profile and preserve subsequent provider p
 	assert.equal(JSON.stringify(result), saved);
 });
 
+type MultiSearchPage = {
+	queries: string[];
+	items: Array<{ entryId: string; matchedQueryIndexes: number[]; matchOffset: number; match: { contentIndex?: number; offset: number; spansBlocks?: boolean }; snippet?: string; truncated?: boolean }>;
+	totalMatches: number;
+	nextCursor: string | null;
+	snapshotThrough: string;
+};
+
+test("multi-query search unions literal matches and reports query indexes once per entry", async (t) => {
+	const fixture = await createFixture(false, [], 1, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const manager = fixture.sessionManager;
+	const firstText = "前缀 🐱 [A+B]. first";
+	const first = manager.appendMessage({ role: "user", content: [{ type: "text", text: firstText }], timestamp: Date.now() });
+	const second = manager.appendMessage({ role: "user", content: "second FAILURE", timestamp: Date.now() });
+	const both = manager.appendMessage({ role: "user", content: "[a+b]. and failure", timestamp: Date.now() });
+	manager.appendMessage({ role: "user", content: "AABx is not a regex match", timestamp: Date.now() });
+	manager.appendMessage(fauxAssistantMessage("[A+B]. failure excluded by kind"));
+	const queries = ["[A+B].", "failure"];
+	const params = { queries, filter: { kinds: ["user_input"] }, order: "oldest" };
+	const result = await inspectHistory(fixture, "history_search", params);
+	const page = result.details as MultiSearchPage;
+	assert.deepEqual(page.queries, queries);
+	assert.equal(page.totalMatches, 3);
+	assert.deepEqual(page.items.map(item => [item.entryId, item.matchedQueryIndexes]), [[first, [0]], [second, [1]], [both, [0, 1]]]);
+	assert.match(JSON.stringify(result.content), /matchedQueryIndexes/);
+	assert.equal(page.items[0].matchOffset, firstText.indexOf(queries[0]));
+	const match = page.items[0].match;
+	const read = await inspectHistory(fixture, "history_read", { entryId: first, contentIndex: match.contentIndex, offset: match.offset, length: queries[0].length });
+	assert.equal((read.details as { text: string }).text, queries[0]);
+	const strict = await inspectHistory(fixture, "history_search", { ...params, caseSensitive: true });
+	assert.deepEqual((strict.details as MultiSearchPage).items.map(item => [item.entryId, item.matchedQueryIndexes]), [[first, [0]], [both, [1]]]);
+	const duplicate = await inspectHistory(fixture, "history_search", { ...params, queries: ["failure", "failure"] });
+	assert.equal((duplicate.details as MultiSearchPage).totalMatches, 2);
+	assert.ok((duplicate.details as MultiSearchPage).items.every(item => item.matchedQueryIndexes.join() === "0,1"));
+});
+
+test("multi-query pagination binds all queries and preserves its snapshot across compaction", async (t) => {
+	const fixture = await createFixture(false, [], 1, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { sessionManager: manager, session, ledgerFaux } = fixture;
+	const ids = ["red", "blue", "red blue"].map(content => manager.appendMessage({ role: "user", content, timestamp: Date.now() }));
+	manager.appendMessage(fauxAssistantMessage("retained tail"));
+	const params = { queries: ["red", "blue"], filter: { kinds: ["user_input"] }, order: "oldest", limit: 1 };
+	const first = (await inspectHistory(fixture, "history_search", params)).details as MultiSearchPage;
+	assert.equal(first.items[0].entryId, ids[0]);
+	assert.ok(first.nextCursor);
+	manager.appendMessage({ role: "user", content: "late red blue", timestamp: Date.now() });
+	manager.appendMessage(fauxAssistantMessage("another retained tail"));
+	ledgerFaux.setResponses([fauxAssistantMessage("Saved colors and later work.")]);
+	await session.compact();
+	const rest = (await inspectHistory(fixture, "history_search", { ...params, cursor: first.nextCursor, limit: 100, projection: "references", truncate: false })).details as MultiSearchPage;
+	assert.equal(rest.snapshotThrough, first.snapshotThrough);
+	assert.equal(rest.totalMatches, 3);
+	assert.deepEqual(rest.items.map(item => item.entryId), ids.slice(1));
+	assert.deepEqual(rest.items[1].matchedQueryIndexes, [0, 1]);
+	for (const changed of [{ queries: ["red"] }, { queries: ["blue", "red"] }, { queries: ["red", "green"] }, { caseSensitive: true }, { filter: { kinds: ["assistant_text"] } }]) {
+		await assert.rejects(inspectHistory(fixture, "history_search", { ...params, ...changed, cursor: first.nextCursor }), /history_cursor_invalid/);
+	}
+	manager.branch(ids[0]);
+	await assert.rejects(inspectHistory(fixture, "history_search", { ...params, cursor: first.nextCursor }), /history_cursor_invalid/);
+});
+
+test("multi-query search shares output protection, supports exact output and validates the input set", async (t) => {
+	const previous = process.env.LEDGER_CONTEXT_READ_TOKENS;
+	process.env.LEDGER_CONTEXT_READ_TOKENS = "900";
+	t.after(() => { if (previous === undefined) delete process.env.LEDGER_CONTEXT_READ_TOKENS; else process.env.LEDGER_CONTEXT_READ_TOKENS = previous; });
+	const fixture = await createFixture(false, [], 1, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const bodies = Array.from({ length: 5 }, (_, index) => `${index} red blue ` + "x".repeat(6000));
+	const ids = bodies.map(content => fixture.sessionManager.appendMessage({ role: "user", content, timestamp: Date.now() }));
+	const params = { queries: ["red", "blue"], order: "oldest", limit: 100 };
+	const seen: string[] = [];
+	let cursor: string | null = null;
+	do {
+		const result = await inspectHistory(fixture, "history_search", { ...params, ...(cursor ? { cursor } : {}) });
+		assert.ok(textTokenEstimate(result.content.map(block => block.type === "text" ? block.text : "").join("\n")) <= 900);
+		const page = result.details as MultiSearchPage;
+		assert.equal(page.totalMatches, 5);
+		assert.ok(page.items.every(item => item.truncated && item.matchedQueryIndexes.join() === "0,1"));
+		seen.push(...page.items.map(item => item.entryId));
+		assert.ok(seen.length <= 5);
+		cursor = page.nextCursor;
+	} while (cursor);
+	assert.deepEqual(seen, ids);
+	const exact = (await inspectHistory(fixture, "history_search", { ...params, truncate: false })).details as MultiSearchPage;
+	assert.deepEqual(exact.items.map(item => item.snippet), bodies);
+	assert.ok(exact.items.every(item => item.truncated === false));
+	for (const invalid of [{}, { query: "red", queries: ["blue"] }, { queries: [] }, { queries: "red" }, { queries: [""] }, { queries: [1] }, { queries: Array(33).fill("red") }, { queries: ["é".repeat(2100), "é".repeat(2100)] }]) {
+		await assert.rejects(inspectHistory(fixture, "history_search", invalid), /history validation failed/);
+	}
+});
+
+test("multi-query tool results preserve recovery and provider prefixes across later checkpoints", async (t) => {
+	const fixture = await createFixture(false, [], 1, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager: manager, faux, ledgerFaux } = fixture;
+	faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Retain the two anchors." })), fauxAssistantMessage("saved")]);
+	await session.prompt("red anchor and blue anchor " + "evidence ".repeat(100));
+	ledgerFaux.setResponses([fauxAssistantMessage("No new changes.")]);
+	await session.compact();
+	const recovery = structuredClone(latestCompaction(manager.getBranch()));
+	const contexts: Context[] = [];
+	faux.setResponses([
+		(context) => { contexts.push(structuredClone(context)); return fauxAssistantMessage(fauxToolCall("history_search", { queries: ["red anchor", "blue anchor"], filter: { kinds: ["user_input"] } })); },
+		(context) => { contexts.push(structuredClone(context)); return fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Both sources verified." })); },
+		(context) => { contexts.push(structuredClone(context)); return fauxAssistantMessage("continued"); },
+	]);
+	await session.prompt("Find the original evidence and save the result.");
+	const result = messageEntries(manager.getBranch()).find(entry => entry.message.role === "toolResult" && entry.message.toolName === "history_search");
+	assert.ok(result && result.message.role === "toolResult");
+	assert.equal(result.message.isError, false);
+	assert.deepEqual((result.message.details as MultiSearchPage).items.map(item => item.matchedQueryIndexes), [[0, 1]]);
+	await assertAppendOnlyRequests(contexts, faux);
+	assert.deepEqual(latestCompaction(manager.getBranch()), recovery);
+});
+
 test("extension handlers have no unexpected errors", () => {
 	assert.deepEqual(extensionErrors, []);
 });
