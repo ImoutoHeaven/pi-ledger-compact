@@ -34,7 +34,7 @@ Quotes resolve at save time against original user, assistant and ordinary tool m
 
 Keep the ledger brief: goal and status, constraints and decisions, verified results and evidence, next step or wait condition, recovery references, and useful available skills or “none.” Use paths and entry IDs for detail, distinguish plans from completed work, and redact secrets.
 
-Only the main agent's `checkpoint` tool writes checkpoints. Delta generation receives the checkpoint as read-only background, the previous matching cumulative delta, and complete selected text from Pi's current window. A new checkpoint starts a fresh delta baseline at its generating request position. An older checkpoint stays paired with its cumulative delta. Without a checkpoint, the first delta starts at the branch beginning; later windows inherit the preceding delta and use the current window's evidence. Images are represented by source references. Input exceeding the model request capacity produces an explicit unavailable/stale result.
+Only the main agent's `checkpoint` tool writes checkpoints. Delta generation receives the checkpoint as read-only background, the previous matching cumulative delta, and selected text from Pi's current window. A new checkpoint starts a fresh delta baseline at its generating request position. An older checkpoint stays paired with its cumulative delta. Without a checkpoint, the first delta starts at the branch beginning; later windows inherit the preceding delta and use the current window's evidence. Images are represented by source references. Oversized input leaves Pi's verbatim retained tail to the next delta, then truncates long tool results with read references; input that still exceeds the model request capacity produces an explicit unavailable/stale result.
 
 Recovery records use schema version 6. Each session's recovery records must satisfy this schema and its branch provenance checks. Invalid records stop resume with an explicit error.
 
@@ -53,13 +53,13 @@ Each `inputCoverage` is an immutable input record. Agent checkpoints use `measur
 | `historyScope` | Measured requests: the historical selection interval, after `afterEntryId` exclusively through `throughEntryId` inclusively. A null lower bound starts at the branch beginning. |
 | `representation` | `rendered-text-with-image-references`: supplied text includes image references; pixels require a separate image read. |
 | `fullRanges` | Inclusive ranges whose complete rendered entry text was supplied to this delta request. |
-| `projections` | `checkpoint-ledger`, `delta-ledger`, `filtered-entry`, or `context-edit`, with source IDs and supplied/total UTF-16 lengths. `context-edit` records the applied `editEntryId`. |
+| `projections` | `checkpoint-ledger`, `delta-ledger`, `filtered-entry`, `truncated-entry`, or `context-edit`, with source IDs and supplied/total UTF-16 lengths. `context-edit` records the applied `editEntryId`. |
 | `omittedRanges` | Inclusive ranges within `historyScope` supplied through neither direct text nor a recorded projection/exclusion. |
 | `excludedRanges` | Inclusive ranges excluded as `maintenance`, `structural-metadata`, `context-omitted`, or `inactive-context` outside Pi's current projection. Substantive history-tool results remain eligible evidence. |
 
 The delta's `scope` is its cumulative target interval. Its input record's `historyScope` describes newly considered history. Native retained evidence may precede this interval. Earlier delta text is a summary projection whose original input record remains available. These records describe supplied material; the agent judges relevance and verification.
 
-Generation supplies the base checkpoint and previous delta explicitly. Raw evidence comes from the current Pi projection, with eligible messages rendered in full. Mixed assistant entries containing maintenance calls use recorded filtered projections. Input accounting includes the generation instructions and output allowance. Capacity failures preserve saved state.
+Generation supplies the base checkpoint and previous delta explicitly. Raw evidence comes from the current Pi projection, with eligible messages rendered in full within request capacity. Mixed assistant entries containing maintenance calls use recorded filtered projections, and shortened tool results use truncated projections. Input accounting includes the generation instructions and output allowance. Capacity failures preserve saved state.
 
 Receipts, listings and recovery views show compact `inputRecord` provenance. Read the checkpoint or delta-owning compaction with `history_read` for full records and browse calls. Follow earlier delta owners to inspect inherited evidence. Missing history after a failed generation remains discoverable through the recorded ranges and branch history.
 

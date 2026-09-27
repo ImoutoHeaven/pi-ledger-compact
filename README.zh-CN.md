@@ -34,7 +34,7 @@ pi install -l .
 
 账本保持简短，记录目标和状态、约束和决策、已验证的结果及证据、下一步或等待条件、恢复引用，以及适用的可用技能或“无”。细节通过路径和条目 ID 引用，计划与已完成工作分别标明，敏感信息使用脱敏表示。
 
-Checkpoint 由主 agent 的 checkpoint 工具写入。Delta 生成输入包含只读 checkpoint、上一份匹配的累计 delta，以及 Pi 当前窗口内选中证据的完整文字。新 checkpoint 以其生成请求位置建立新的 delta 基线；旧窗口 checkpoint 与匹配的累计 delta 接续。无 checkpoint 时，首份 delta 从分支起点开始，后续窗口继承上一份 delta 并使用本窗口证据。图片通过来源引用表示。输入超过模型请求容量时，明确记录 unavailable 或 stale 状态。
+Checkpoint 由主 agent 的 checkpoint 工具写入。Delta 生成输入包含只读 checkpoint、上一份匹配的累计 delta，以及 Pi 当前窗口内选中证据的文字。新 checkpoint 以其生成请求位置建立新的 delta 基线；旧窗口 checkpoint 与匹配的累计 delta 接续。无 checkpoint 时，首份 delta 从分支起点开始，后续窗口继承上一份 delta 并使用本窗口证据。图片通过来源引用表示。输入过大时，Pi 原样保留的尾部交给下一份 delta，随后截断较长的工具结果并附读取引用；仍超过模型请求容量时，明确记录 unavailable 或 stale 状态。
 
 恢复记录使用 schema version 6。会话内的恢复记录须通过该 schema 与分支来源校验；无效记录会使恢复过程明确报错并停止。
 
@@ -53,13 +53,13 @@ Context edit 控制后续取材中的来源正文。已有 checkpoint 和 delta 
 | `historyScope` | 已测量请求的历史选择区间：从 `afterEntryId` 之后，到包含 `throughEntryId` 为止；下界为 null 表示从分支起点开始。 |
 | `representation` | `rendered-text-with-image-references`：提供的文字包含图片引用；像素通过独立图像读取获取。 |
 | `fullRanges` | 本次 delta 请求完整提供了渲染正文的条目范围，包含首尾条目。 |
-| `projections` | `checkpoint-ledger`、`delta-ledger`、`filtered-entry` 或 `context-edit`，记录来源 ID 和已提供/总 UTF-16 长度；context-edit 记录所用 editEntryId。 |
+| `projections` | `checkpoint-ledger`、`delta-ledger`、`filtered-entry`、`truncated-entry` 或 `context-edit`，记录来源 ID 和已提供/总 UTF-16 长度；context-edit 记录所用 editEntryId。 |
 | `omittedRanges` | historyScope 内没有通过完整正文、投影或排除记录表示的条目范围，包含首尾条目。 |
 | `excludedRanges` | 按 maintenance、structural-metadata、context-omitted 或 inactive-context（位于 Pi 当前投影之外）排除的范围。包含实质证据的历史工具结果可参与取材。 |
 
 Delta 的 scope 表示累计目标区间，输入记录的 historyScope 表示本次考虑的新历史区间。Pi 原生保留的证据可能位于该区间之前。旧 delta 是摘要投影，其原始输入记录保留在来源条目中。这些记录描述已提供材料，agent 判断相关性与验证需求。
 
-生成输入显式提供基础 checkpoint 与上一份 delta。原始证据来自当前 Pi 投影，合格消息完整渲染；混有维护调用的 assistant 消息记录为过滤投影。请求容量计入生成指令与输出预留，容量失败保留已保存状态。
+生成输入显式提供基础 checkpoint 与上一份 delta。原始证据来自当前 Pi 投影，合格消息在请求容量内完整渲染；混有维护调用的 assistant 消息记录为过滤投影，截断的工具结果记录为截断投影。请求容量计入生成指令与输出预留，容量失败保留已保存状态。
 
 回执、列表和恢复视图展示简短 inputRecord 来源信息。通过 history_read 读取 checkpoint 或承载 delta 的 compaction，可查看完整记录与浏览调用；沿早期 delta 来源可追溯继承的证据。生成失败后缺失的历史仍可通过记录的范围及分支历史定位。
 

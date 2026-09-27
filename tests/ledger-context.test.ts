@@ -5833,6 +5833,89 @@ test("delta selection distinguishes maintenance, filtered messages and recovered
 	assert.ok(coverage.fullRanges.some((range) => entries.findIndex((entry) => entry.id === range.fromEntryId) <= evidenceIndex && entries.findIndex((entry) => entry.id === range.toEntryId) >= evidenceIndex));
 });
 
+test("oversized windows summarize history before Pi's retained tail with truncated tool results", async (t) => {
+	const fixture = await createFixture(false, [], 64, { contextWindow: 16_000, maxTokens: 1_024, compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager: manager, ledgerFaux } = fixture;
+	manager.appendMessage({ role: "user", content: "Inspect the build log.", timestamp: Date.now() });
+	manager.appendMessage(fauxAssistantMessage(fauxToolCall("bash", { command: "make" }, { id: "large-call" })));
+	const large = manager.appendMessage({ role: "toolResult", toolName: "bash", toolCallId: "large-call", isError: false, content: [{ type: "text", text: "build log line ".repeat(6_000) }], timestamp: Date.now() });
+	const observed = manager.appendMessage(fauxAssistantMessage("The build failed at link time."));
+	manager.appendMessage({ role: "user", content: "TAIL-MARKER " + "tail request ".repeat(40), timestamp: Date.now() });
+	ledgerFaux.setResponses([(context) => {
+		const text = JSON.stringify(context.messages);
+		assert.match(text, /more characters; read pi:\/\/entry\//);
+		assert.doesNotMatch(text, /TAIL-MARKER/);
+		return fauxAssistantMessage("Build failed at link time.");
+	}]);
+	await session.compact();
+	const first = latestCompaction(manager.getBranch());
+	const record = generatedDelta(first);
+	const branch = manager.getBranch();
+	assert.equal(record.scope.throughEntryId, branch[branch.findIndex((entry) => entry.id === first.firstKeptEntryId) - 1].id);
+	assert.equal(record.scope.throughEntryId, observed);
+	const truncated = record.inputCoverage.projections.find((part) => part.entryId === large);
+	assert.equal(truncated?.kind, "truncated-entry");
+	assert.ok(truncated.providedChars < truncated.totalChars);
+
+	manager.appendMessage(fauxAssistantMessage("Handled the tail request."));
+	manager.appendMessage({ role: "user", content: "next request ".repeat(40), timestamp: Date.now() });
+	ledgerFaux.setResponses([(context) => {
+		assert.match(JSON.stringify(context.messages), /TAIL-MARKER/);
+		return fauxAssistantMessage("Tail request handled.");
+	}]);
+	await session.compact();
+	const second = generatedDelta(latestCompaction(manager.getBranch()));
+	assert.equal(second.inputCoverage.historyScope.afterEntryId, observed);
+	assert.equal(ledgerFaux.state.callCount, 2);
+});
+
+test("oversized windows apply tail context edits to earlier delta evidence", async (t) => {
+	const fixture = await createFixture(false, [], 64, { contextWindow: 16_000, maxTokens: 1_024, compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager: manager, ledgerFaux } = fixture;
+	const original = manager.appendMessage({ role: "user", content: "ORIGINAL-SENTINEL", timestamp: Date.now() });
+	manager.appendMessage(fauxAssistantMessage(fauxToolCall("bash", { command: "make" }, { id: "large-call" })));
+	manager.appendMessage({ role: "toolResult", toolName: "bash", toolCallId: "large-call", isError: false, content: [{ type: "text", text: "build log line ".repeat(6_000) }], timestamp: Date.now() });
+	manager.appendMessage(fauxAssistantMessage("Observed link failure."));
+	manager.appendMessage({ role: "user", content: "tail request ".repeat(40), timestamp: Date.now() });
+	manager.appendContextEdit(original, { content: "REPLACEMENT-SENTINEL" });
+	ledgerFaux.setResponses([(context) => {
+		const text = JSON.stringify(context.messages);
+		assert.doesNotMatch(text, /ORIGINAL-SENTINEL/);
+		assert.match(text, /REPLACEMENT-SENTINEL/);
+		return fauxAssistantMessage("Link failed.");
+	}]);
+	await session.compact();
+	generatedDelta(latestCompaction(manager.getBranch()));
+});
+
+test("oversized windows keep an inherited delta owner when Pi's tail starts inside the previous tail", async (t) => {
+	const fixture = await createFixture(false, [], 20_000, { contextWindow: 32_000, maxTokens: 1_024, compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager: manager, ledgerFaux } = fixture;
+	manager.appendMessage({ role: "user", content: "Inspect the old log.", timestamp: Date.now() });
+	manager.appendMessage(fauxAssistantMessage(fauxToolCall("bash", { command: "make" }, { id: "old-call" })));
+	manager.appendMessage({ role: "toolResult", toolName: "bash", toolCallId: "old-call", isError: false, content: [{ type: "text", text: "old log ".repeat(15_000) }], timestamp: Date.now() });
+	manager.appendMessage(fauxAssistantMessage("Old observed result."));
+	for (let index = 0; index < 3; index++) manager.appendMessage({ role: "user", content: `TAIL-${index} ` + "x".repeat(28_000), timestamp: Date.now() });
+	ledgerFaux.setResponses([fauxAssistantMessage("Old log summarized."), fauxAssistantMessage("Tail and new log summarized.")]);
+	await session.compact();
+	const first = latestCompaction(manager.getBranch());
+	generatedDelta(first);
+	manager.appendMessage({ role: "user", content: "Check the new log.", timestamp: Date.now() });
+	manager.appendMessage(fauxAssistantMessage(fauxToolCall("bash", { command: "check" }, { id: "new-call" })));
+	manager.appendMessage({ role: "toolResult", toolName: "bash", toolCallId: "new-call", isError: false, content: [{ type: "text", text: "new log ".repeat(7_500) }], timestamp: Date.now() });
+	manager.appendMessage(fauxAssistantMessage("New log observed."));
+	await session.compact();
+	const second = latestCompaction(manager.getBranch());
+	const branch = manager.getBranch();
+	assert.ok(branch.findIndex((entry) => entry.id === second.firstKeptEntryId) < branch.findIndex((entry) => entry.id === first.id), "Pi's tail starts inside the previous retained tail");
+	const record = generatedDelta(second);
+	assert.equal(record.inputCoverage.baseDeltaCompactionEntryId, first.id);
+	assert.ok(record.inputCoverage.projections.some((part) => part.kind === "truncated-entry"));
+});
+
 test("older schemas and corrupt recovery sources stop resume instead of falling back", async (t) => {
 	for (const source of ["older-schema", "missing-source", "wrong-kind"] as const) {
 		const fixture = await createFixture(false, [], 64, { compactionEnabled: false });
