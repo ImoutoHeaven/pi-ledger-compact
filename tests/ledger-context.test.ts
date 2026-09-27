@@ -84,6 +84,12 @@ test("checkpoint source quotes resolve snapshot evidence without blocking saves 
 	assert.deepEqual((checkpointEntries(manager.getBranch()).at(-1)!.data as any).sourceReferences, []);
 });
 
+/** Parses the recovery summary's later-events range. */
+function laterEvents(summary: string): { fromEntryId: string | null; toEntryId: string | null } {
+	const match = /Events after the saved state: entries (\S+) to (\S+)\./.exec(summary);
+	return { fromEntryId: match?.[1] ?? null, toEntryId: match?.[2] ?? null };
+}
+
 function generatedDelta(entry: Extract<SessionEntry, { type: "compaction" }>) {
 	const details = entry.details as LedgerCompactionDetails;
 	assert.equal(details.schemaVersion, 6);
@@ -417,7 +423,7 @@ test("volume reminders preserve request prefixes through checkpoints, compaction
 	}
 	const receipts = messageEntries(manager.getBranch()).filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "checkpoint");
 	assert.equal(receipts.length, 6);
-	assert.ok(receipts.every((entry) => /reminders:.*complete/.test(toolResultText(entry))));
+	assert.ok(receipts.every((entry) => /Checkpoint saved\./.test(toolResultText(entry))));
 });
 
 test("budget escalation and checkpoint receipts append without rewriting reminders or tool declarations", { timeout: TEST_TIMEOUT_MS }, async (t) => {
@@ -455,8 +461,8 @@ test("budget escalation and checkpoint receipts append without rewriting reminde
 	}
 	const failed = messageEntries(manager.getBranch()).find((entry) => entry.message.role === "toolResult" && entry.message.toolCallId === "failed-reminder-save")!;
 	const saved = messageEntries(manager.getBranch()).find((entry) => entry.message.role === "toolResult" && entry.message.toolCallId === "successful-reminder-save")!;
-	assert.doesNotMatch(toolResultText(failed), /reminders:.*complete/);
-	assert.match(toolResultText(saved), /reminders:.*complete/);
+	assert.doesNotMatch(toolResultText(failed), /Checkpoint saved\./);
+	assert.match(toolResultText(saved), /Checkpoint saved\./);
 	assert.equal(checkpointEntries(manager.getBranch()).length, 1);
 	assert.equal(contexts.at(-1)!.messages.filter((message) => message.role === "system").length, 2);
 });
@@ -828,7 +834,7 @@ test("packed package installs and loads through the public pi package manager", 
 		const checkpointTool = session.getAllTools().find((tool) => tool.name === "checkpoint");
 		assert.ok(checkpointTool);
 		const checkpointGuidance = JSON.stringify(checkpointTool.promptGuidelines);
-		for (const phrase of ["important decisions", "current working state", "goal/status", "constraints and decisions", "verification evidence", "next step/wait", "recovery references", "skills (or none)", "complete baseline", "subsequent delta", "plans from facts", "redact secrets"]) {
+		for (const phrase of ["important decisions", "complete current working state", "goal and status", "constraints and decisions", "verified, with evidence", "next step", "where to find evidence", "skills (or none)", "replaces the previous checkpoint", "compaction delta", "plans apart from finished work", "redact secrets"]) {
 			assert.ok(checkpointGuidance.includes(phrase), `checkpoint guidance must include ${phrase}`);
 		}
 		let historySearchResult: Extract<SessionEntry, { type: "message" }> | undefined;
@@ -1214,8 +1220,8 @@ test("checkpoint and manual compaction use the public SDK seam", { timeout: TEST
 		);
 		assert.ok(toolReceipt);
 		const toolReceiptMessage = toolReceipt.message as { content: unknown; details?: unknown };
-		assert.match(JSON.stringify(toolReceiptMessage.content), /persistent session log/);
-		assert.match(JSON.stringify(toolReceiptMessage.content), /active recovery baseline; pi controls compaction/);
+		assert.match(JSON.stringify(toolReceiptMessage.content), /Stored in: the session file/);
+		assert.match(JSON.stringify(toolReceiptMessage.content), /now your recovery baseline/);
 		assert.equal((toolReceiptMessage.details as { checkpointEntryId: string }).checkpointEntryId, checkpoint.id);
 		assert.equal((toolReceiptMessage.details as { windowId: string }).windowId, checkpointData.sourceWindowId);
 		assert.equal(faux.state.callCount, 2);
@@ -1246,10 +1252,8 @@ test("checkpoint and manual compaction use the public SDK seam", { timeout: TEST
 		assert.equal(provenance.lastUserEntryId, userEntryId);
 		assert.equal(provenance.lastAssistantEntryId, lastAssistant.id);
 		assert.match(compaction.summary, /preserve the task across compaction/);
-		assert.match(compaction.summary, /previousCheckpointEntryId: \(none\)/);
-		assert.match(compaction.summary, new RegExp(`"requestHistoryPosition":\\{"entryId":"${userEntryId}"`));
 		assert.match(compaction.summary, /Continue the ledger integration task/);
-		const pending = JSON.parse(compaction.summary.match(/^eventsAfterDeltaInput: (.+)$/m)![1]);
+		const pending = laterEvents(compaction.summary);
 		assert.equal(pending.fromEntryId, messageEntries(branch).find((entry) => entry.message.role === "assistant" && entry.message.content.some((block) => block.type === "toolCall"))!.id);
 		assert.equal(pending.toEntryId, lastAssistant.id);
 		assert.equal(faux.state.callCount, 2, "manual compaction must not call the working agent");
@@ -1273,7 +1277,7 @@ test("checkpoint and manual compaction use the public SDK seam", { timeout: TEST
 		await session.prompt("Resume after compaction");
 		assert.equal(faux.state.callCount, 3, "the two work requests plus the resumed request must be the only provider calls");
 		assert.match(resumedRequest, /# Ledger Context Recovery/);
-		assert.match(resumedRequest, /windowId: window:/);
+		assert.match(resumedRequest, /## Checkpoint \(pi:\/\/entry\//);
 		assert.match(resumedRequest, /Continue the ledger integration task/);
 		assert.match(resumedRequest, /preserve the task across compaction/);
 		assert.ok(resumedContext);
@@ -1355,10 +1359,8 @@ test("recovery provenance preserves prior checkpoint and direct recovery IDs", {
 		assert.ok(details.snapshotPosition.branchDepth > (secondCheckpoint.data as { requestHistoryPosition: { branchDepth: number } }).requestHistoryPosition.branchDepth);
 		assert.equal(details.lastUserEntryId, secondUser.id);
 		assert.equal(details.lastAssistantEntryId, secondAnswer.id);
-		assert.match(compaction.summary, new RegExp(`previousCheckpointEntryId: ${firstCheckpoint.id}`));
-		assert.match(compaction.summary, new RegExp(`lastUserEntryId: ${secondUser.id}`));
-		assert.match(compaction.summary, new RegExp(`lastAssistantEntryId: ${secondAnswer.id}`));
-		assert.match(compaction.summary, /Read known entry IDs with history_read/);
+		assert.match(compaction.summary, new RegExp(`## Checkpoint \\(pi://entry/${secondCheckpoint.id}\\)`));
+		assert.match(compaction.summary, /Read evidence with history_read/);
 
 		faux.setResponses([
 			fauxAssistantMessage(fauxToolCall("history_read", { entryId: firstCheckpoint.id, offset: 0, length: 256 })),
@@ -1395,8 +1397,7 @@ test("recovery provenance preserves prior checkpoint and direct recovery IDs", {
 			await reopened.session.prompt("resume provenance after reload");
 			assert.ok(resumedContext);
 			const providerText = JSON.stringify(resumedContext.messages);
-			assert.match(providerText, new RegExp(`previousCheckpointEntryId: ${firstCheckpoint.id}`));
-			assert.match(providerText, new RegExp(`lastAssistantEntryId: ${secondAnswer.id}`));
+			assert.match(providerText, new RegExp(`## Checkpoint \\(pi://entry/${secondCheckpoint.id}\\)`));
 		} finally {
 			reopened.session.dispose();
 		}
@@ -1438,7 +1439,7 @@ test("native threshold compacts before the next request in the same run", { time
 		ledgerFaux.setResponses([
 			fauxAssistantMessage("native-generated-ledger: Large operations returned; verify evidence before repeating. Skills: none."),
 			(context) => {
-				assert.match(JSON.stringify(context.messages), /Previous cumulative delta.*native-generated-ledger/);
+				assert.match(JSON.stringify(context.messages), /## Previous delta.*native-generated-ledger/);
 				return fauxAssistantMessage("native-refreshed-ledger: Same-run work completed. Skills: none.");
 			},
 		]);
@@ -1620,7 +1621,7 @@ test("long native run recovers twenty windows and reads its earliest operation",
 		assert.equal(faux.state.callCount, operationIds.length / 2 + 5);
 		assert.equal(providerContexts.length, faux.state.callCount);
 		assert.ok(extraContext);
-		assert.ok(providerContexts.some((context) => /Ledger Context urgent budget reminder/.test(JSON.stringify(context.messages))), "urgent reminder must reach a provider request before later compactions can replace it with a reference");
+		assert.ok(providerContexts.some((context) => /Ledger Context reminder \(urgent\)/.test(JSON.stringify(context.messages))), "urgent reminder must reach a provider request before later compactions can replace it with a reference");
 		assert.equal(faux.getPendingResponseCount(), 0);
 		assert.equal(session.getLastAssistantText(), "long-run reminder acknowledgement");
 		assert.equal(sessionManager.getBranch().filter((entry) => entry.type === "compaction").length, compactionReasons.length);
@@ -1809,7 +1810,7 @@ test("maintenance reminders stay out of checkpoint and delta sources while prese
 			snapshotTip = manager.getLeafId();
 			assert.equal(snapshotTip, reminderId, "the maintenance entry may be the real request boundary");
 			assert.ok(context.messages.some(message => message.role === "user" && JSON.stringify(message.content).includes(quote)));
-			assert.match(reminderContent, /Exclude this notice from task facts and sourceQuotes/);
+			assert.match(reminderContent, /Leave the notice itself out of the ledger and sourceQuotes/);
 			return fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Keep the original task constraint. Ordinary work completed.", sourceQuotes: [quote, task] }));
 		},
 		(context) => {
@@ -1877,8 +1878,8 @@ test("budget reminders are bounded, deduplicated per window, and explicit about 
 			},
 		]);
 		await session.prompt("deliver the urgent reminder");
-		assert.ok(providerContexts.some((context) => /Ledger Context soft budget reminder/.test(JSON.stringify(context.messages))));
-		assert.ok(providerContexts.some((context) => /Ledger Context urgent budget reminder/.test(JSON.stringify(context.messages))));
+		assert.ok(providerContexts.some((context) => /Ledger Context reminder: the context is filling up/.test(JSON.stringify(context.messages))));
+		assert.ok(providerContexts.some((context) => /Ledger Context reminder \(urgent\)/.test(JSON.stringify(context.messages))));
 
 		const reminders = sessionManager.getBranch().filter(
 			(entry): entry is Extract<SessionEntry, { type: "custom_message" }> =>
@@ -1910,7 +1911,7 @@ test("budget reminders are bounded, deduplicated per window, and explicit about 
 			},
 		]);
 		await session.prompt("deliver the new window reminder");
-		assert.match(JSON.stringify(providerContexts.at(-1)?.messages), /Ledger Context urgent budget reminder/);
+		assert.match(JSON.stringify(providerContexts.at(-1)?.messages), /Ledger Context reminder \(urgent\)/);
 
 		const afterCompaction = sessionManager.getBranch().filter(
 			(entry): entry is Extract<SessionEntry, { type: "custom_message" }> =>
@@ -2316,7 +2317,7 @@ test("ordinary thinking volume includes mixed work and excludes maintenance-only
 		assert.equal(details.toEntryId, ordinaryResultId);
 		assert.ok(details.reasonDetails?.some((reason) => reason.fromEntryId === details.fromEntryId && reason.toEntryId === ordinaryResultId));
 		assert.equal(details.fromEntryId === maintenanceAssistantId, false);
-		assert.match(String(staleReminder.content), /stale-volume/);
+		assert.match(String(staleReminder.content), /much work has happened since your last checkpoint/);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 		if (previousSoft === undefined) delete process.env.LEDGER_CONTEXT_REMINDER_TOKENS;
@@ -2382,7 +2383,7 @@ test("short prompts stay silent and deferred volume reminders reach the next nor
 		faux.setResponses([(context) => { nextContext = context; return fauxAssistantMessage("continued"); }]);
 		await session.prompt("Continue after the evidence.");
 		assert.ok(nextContext);
-		assert.match(JSON.stringify(nextContext.messages), /stale-volume/);
+		assert.match(JSON.stringify(nextContext.messages), /much work has happened since your last checkpoint/);
 		const notices = sessionManager.getBranch().filter((entry) => entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE);
 		assert.equal(notices.length, 1);
 		assert.equal(sessionManager.getBranch().filter((entry) => entry.type === "custom" && entry.customType === "ledger-context/external-run").length, 0);
@@ -2943,12 +2944,12 @@ test("steering queued during native compaction is delivered once in order", { ti
 		assert.ok(assistantIndex >= 0);
 		assert.ok(resultIndex > assistantIndex);
 		assert.match(JSON.stringify(branchMessages[resultIndex].message), /large-tool-result/);
-		assert.match(JSON.stringify(reminderContext.messages), /Ledger Context urgent budget reminder/);
+		assert.match(JSON.stringify(reminderContext.messages), /Ledger Context reminder \(urgent\)/);
 		const deliveredNotice = reminderContext.messages.flatMap((message) => message.role === "user" && Array.isArray(message.content)
-			? message.content.flatMap((block) => block.type === "text" && block.text.startsWith("Ledger Context urgent budget reminder.") ? [block.text] : []) : [])[0];
+			? message.content.flatMap((block) => block.type === "text" && block.text.startsWith("Ledger Context reminder (urgent):") ? [block.text] : []) : [])[0];
 		assert.ok(deliveredNotice);
-		assert.match(deliveredNotice, /Automated maintenance request; one checkpoint per scope/);
-		assert.match(deliveredNotice, /Scope: window=/);
+		assert.match(deliveredNotice, /Call the checkpoint tool once now/);
+		assert.match(deliveredNotice, /This notice is for window /);
 		const branchUserMessages = messageEntries(sessionManager.getBranch()).filter((entry) => entry.message.role === "user");
 		assert.equal(branchUserMessages.filter((entry) => JSON.stringify(entry.message).includes("change direction")).length, 1);
 		assert.equal(branchUserMessages.filter((entry) => JSON.stringify(entry.message).includes("follow up direction")).length, 1);
@@ -2996,7 +2997,7 @@ test("rejects invalid checkpoint input while retaining the previous version", { 
 		);
 		assert.ok(firstReceipt);
 		const firstReceiptMessage = firstReceipt.message as { content: unknown; details?: unknown };
-		assert.match(JSON.stringify(firstReceiptMessage.content), /current process memory only/);
+		assert.match(JSON.stringify(firstReceiptMessage.content), /process memory only \(in-memory session\)/);
 		assert.equal((firstReceiptMessage.details as { checkpointEntryId: string }).checkpointEntryId, checkpoints[0].id);
 		const oversizedReceipt = messageEntries(sessionManager.getBranch())
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "checkpoint")
@@ -3131,7 +3132,7 @@ test("normal compaction cancellation leaves the branch and provider state unchan
 	const { root, faux, session, sessionManager } = await createFixture(true, [cancelCompaction]);
 	try {
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Goal: cancellation keeps the previous window." })),
+			fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Goal: cancellation keeps the previous window. " + "detail ".repeat(60) })),
 			fauxAssistantMessage("checkpoint saved"),
 		]);
 		await session.prompt("Prepare a cancellable compaction");
@@ -3655,7 +3656,7 @@ test("history_search ignores case by default, preserves literal offsets and bind
 		assert.equal(first.details.caseSensitive, false);
 		assert.deepEqual(first.details.items.map((hit) => hit.entryId), [ids[2]]);
 		assert.ok(first.details.nextCursor);
-		assert.match(first.text, /case-insensitive literal/);
+		assert.match(first.text, /\(case-insensitive\)/);
 		sessionManager.appendMessage({ role: "user", content: "late TIMEOUT", timestamp: Date.now() });
 		const next = await search({ query: "timeout", caseSensitive: false, limit: 1, cursor: first.details.nextCursor });
 		assert.deepEqual(next.details.items.map((hit) => hit.entryId), [ids[1]]);
@@ -3665,7 +3666,7 @@ test("history_search ignores case by default, preserves literal offsets and bind
 		const strict = await search({ query: "Timeout", caseSensitive: true });
 		assert.equal(strict.details.caseSensitive, true);
 		assert.deepEqual(strict.details.items.map((hit) => hit.entryId), [ids[0]]);
-		assert.match(strict.text, /case-sensitive literal/);
+		assert.match(strict.text, /\(case-sensitive\)/);
 		const literal = await search({ query: "[A+B]." });
 		assert.deepEqual(literal.details.items.map((hit) => hit.entryId), [...ids].reverse());
 		assert.equal((await search({ query: ".*" })).details.items.length, 0);
@@ -3934,7 +3935,7 @@ test("history_search keeps a window-filtered cursor stable across a later compac
 		assert.ok(mismatched);
 		assert.equal((mismatched.message as { isError: boolean }).isError, true);
 		assert.match(JSON.stringify((mismatched.message as { content: unknown }).content), /history_cursor_invalid/);
-		assert.match(JSON.stringify((mismatched.message as { content: unknown }).content), /Rerun history_search/);
+		assert.match(JSON.stringify((mismatched.message as { content: unknown }).content), /call history_search without cursor to start over/);
 
 		const assertInvalidCursor = async (parameters: JsonObject, prompt: string): Promise<void> => {
 			faux.setResponses([
@@ -3950,9 +3951,7 @@ test("history_search keeps a window-filtered cursor stable across a later compac
 			const text = toolResultText(result);
 			const prefix = "history_cursor_invalid: ";
 			assert.ok(text.startsWith(prefix));
-			const details = JSON.parse(text.slice(prefix.length)) as { code: string; restart: string };
-			assert.equal(details.code, "history_cursor_invalid");
-			assert.match(details.restart, /Rerun history_search/);
+			assert.match(text, /call history_search without cursor to start over/);
 		};
 
 		await assertInvalidCursor(
@@ -4647,7 +4646,7 @@ test("compaction without an agent checkpoint accumulates deltas and preserves th
 		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 0);
 		assert.equal(generatedDelta(checkpoint).ledger, ledger);
 		assert.equal((checkpoint.details as LedgerCompactionDetails).checkpointEntryId, null);
-		assert.match(checkpoint.summary, /^inputRecordDetails: checkpoint=none; delta=this compaction entry$/m);
+		assert.match(checkpoint.summary, /^## Changes after the checkpoint\n.*operation completed once/m);
 		assert.match(latestCompaction(sessionManager.getBranch()).summary, /operation completed once/);
 		const reopened = SessionManager.open(sessionManager.getSessionFile()!);
 		assert.equal(latestCompaction(reopened.getBranch()).id, checkpoint.id);
@@ -4658,7 +4657,7 @@ test("compaction without an agent checkpoint accumulates deltas and preserves th
 		faux.setResponses([fauxAssistantMessage("Verified: final result is now complete.")]);
 		await session.prompt("Continue after the generated checkpoint.");
 		ledgerFaux.setResponses([(context) => {
-			assert.match(JSON.stringify(context.messages), /Previous cumulative delta.*operation completed once/);
+			assert.match(JSON.stringify(context.messages), /## Previous delta.*operation completed once/);
 			assert.match(JSON.stringify(context.messages), /final result is now complete/);
 			assert.match(JSON.stringify(context.messages), /Preserve the final result/);
 			return fauxAssistantMessage("Verified: final result complete. Preserve the original constraints.");
@@ -4847,7 +4846,7 @@ test("failed delta updates expose chronological ranges without changing the chec
 		};
 		assert.equal(details.checkpointEntryId, null);
 		assert.equal(details.snapshotPosition.entryId, branchBeforeCompaction.at(-1)!.id);
-		const range = JSON.parse(compaction.summary.match(/^eventsAfterDeltaInput: (.+)$/m)![1]);
+		const range = laterEvents(compaction.summary);
 		assert.equal(range.fromEntryId, branchBeforeCompaction[0].id);
 		assert.equal(range.toEntryId, branchBeforeCompaction.at(-1)!.id);
 		assert.equal(details.sourceBranchTip, branchBeforeCompaction.at(-1)!.id);
@@ -4882,8 +4881,8 @@ test("failed delta updates expose chronological ranges without changing the chec
 			checkpointEntryId: string | null;
 		};
 		assert.equal(details.checkpointEntryId, checkpoint.id);
-		const range = JSON.parse(compaction.summary.match(/^eventsAfterDeltaInput: (.+)$/m)![1]);
-		assert.match(compaction.summary, new RegExp(`^inputRecordDetails: checkpoint=pi://entry/${checkpoint.id}; delta=none$`, "m"));
+		const range = laterEvents(compaction.summary);
+		assert.match(compaction.summary, new RegExp(`^## Checkpoint \\(pi://entry/${checkpoint.id}\\)$`, "m"));
 		assert.equal(range.fromEntryId, expectedFrom);
 		assert.equal(range.toEntryId, expectedTo);
 	} finally {
@@ -5505,10 +5504,8 @@ test("history window listing shrinks optional previews before rejecting mandator
 	const read = () => tool.execute("preview-capacity", {}, undefined, undefined, { sessionManager: fixture.sessionManager } as never);
 	const full = await read();
 	const fullText = full.content.map((block) => block.type === "text" ? block.text : "").join("\n");
-	const bare = JSON.parse(fullText);
-	bare.windows[0].checkpointPreview = "";
-	bare.windows[0].checkpointPreviewTruncated = true;
-	const bareTokens = textTokenEstimate(JSON.stringify(bare, null, 2));
+	assert.ok(fullText.includes("A".repeat(256)));
+	const bareTokens = textTokenEstimate(fullText.replace("A".repeat(256), " [excerpt]"));
 	const tokenLimit = Math.floor((bareTokens + textTokenEstimate(fullText)) / 2);
 	const previous = process.env.LEDGER_CONTEXT_READ_TOKENS;
 	try {
@@ -5522,8 +5519,8 @@ test("history window listing shrinks optional previews before rejecting mandator
 		assert.ok(window.checkpointPreview.length > 0 && window.checkpointPreview.length < 256);
 		process.env.LEDGER_CONTEXT_READ_TOKENS = "1";
 		await assert.rejects(read, (error: Error) => {
-			const data = JSON.parse(error.message.slice("history_output_capacity: ".length));
-			assert.equal(data.metadataTokens, bareTokens);
+			assert.ok(error.message.startsWith("history_output_capacity: "));
+			assert.equal(Number(/needs about (\d+) tokens/.exec(error.message)?.[1]), bareTokens);
 			return true;
 		});
 	} finally {
@@ -5742,7 +5739,7 @@ test("history read explains view conflicts and supplies exact bounded continuati
 	assert.equal(details.length, 20);
 	const second = await inspectHistory(fixture, "history_read", details.nextRead);
 	assert.equal((second.details as { offset: number }).offset, 20);
-	assert.match(JSON.stringify(first.content), /nextRead/);
+	assert.match(JSON.stringify(first.content), /More text: call history_read with/);
 });
 
 
@@ -5844,7 +5841,7 @@ test("oversized windows summarize history before Pi's retained tail with truncat
 	manager.appendMessage({ role: "user", content: "TAIL-MARKER " + "tail request ".repeat(40), timestamp: Date.now() });
 	ledgerFaux.setResponses([(context) => {
 		const text = JSON.stringify(context.messages);
-		assert.match(text, /more characters; read pi:\/\/entry\//);
+		assert.match(text, /\[\.\.\. \d+ more characters\]/);
 		assert.doesNotMatch(text, /TAIL-MARKER/);
 		return fauxAssistantMessage("Build failed at link time.");
 	}]);
@@ -5999,7 +5996,7 @@ test("committed compaction restarts volume reminders beyond retained history acr
 	const notices = () => manager.getBranch().filter((entry) => entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE);
 	for (const reload of [false, true]) {
 		if (reload) await session.reload();
-		faux.setResponses([(context) => { assert.doesNotMatch(JSON.stringify(context.messages), /Ledger Context stale-volume reminder/); return fauxAssistantMessage("Ready."); }]);
+		faux.setResponses([(context) => { assert.doesNotMatch(JSON.stringify(context.messages), /much work has happened since your last checkpoint/); return fauxAssistantMessage("Ready."); }]);
 		await session.prompt("Resume.");
 		assert.equal(notices().length, 0, "retained pre-compaction work must not trigger a new volume reminder");
 	}
@@ -6048,8 +6045,8 @@ test("queued reminders preserve their issuing scope when delivered after native 
 	const retained = manager.buildSessionProjection().entries.some(entry => entry.sourceEntry.id === notice.id && entry.messages.length > 0);
 	assert.equal(request.messages.some((message) => message.role === "user" && Array.isArray(message.content) && message.content.some((block) => block.type === "text" && block.text === notice.content)), retained);
 	assert.ok(String(notice.content).includes((notice.details as { windowId: string }).windowId));
-	assert.match(String(notice.content), /once if this scope is current/);
-	assert.match(String(notice.content), /successful checkpoint or compaction closes this request/);
+	assert.match(String(notice.content), /Call the checkpoint tool once now/);
+	assert.match(String(notice.content), /any later checkpoint or compaction fulfils it/);
 	assert.equal(checkpointEntries(entries).at(-1)?.id, checkpoint.id);
 });
 
@@ -6221,7 +6218,7 @@ test("history image provenance describes the model-normalized result persisted b
 	const details = result.message.details as { sourceDecodedBytes: number };
 	assert.equal(details.sourceDecodedBytes, Buffer.from(RED_2X2_PNG, "base64").length);
 	assert.equal("normalizedEncodedBytes" in details, false);
-	assert.match(toolResultText(result), /Pi processes this image/);
+	assert.match(toolResultText(result), /^Image pi:\/\/entry\/.+ \(image\/png, \d+ bytes\)\./);
 	assert.ok(result.message.content.length >= 2);
 
 });
@@ -6463,7 +6460,7 @@ test("multi-query search unions literal matches and reports query indexes once p
 	assert.deepEqual(page.queries, queries);
 	assert.equal(page.totalMatches, 3);
 	assert.deepEqual(page.items.map(item => [item.entryId, item.matchedQueryIndexes]), [[first, [0]], [second, [1]], [both, [0, 1]]]);
-	assert.match(JSON.stringify(result.content), /matchedQueryIndexes/);
+	assert.match(JSON.stringify(result.content), /matched query indexes: 0, 1/);
 	assert.equal(page.items[0].matchOffset, firstText.indexOf(queries[0]));
 	const match = page.items[0].match;
 	const read = await inspectHistory(fixture, "history_read", { entryId: first, contentIndex: match.contentIndex, offset: match.offset, length: queries[0].length });
@@ -6553,6 +6550,36 @@ test("multi-query tool results preserve recovery and provider prefixes across la
 	assert.deepEqual((result.message.details as MultiSearchPage).items.map(item => item.matchedQueryIndexes), [[0, 1]]);
 	await assertAppendOnlyRequests(contexts, faux);
 	assert.deepEqual(latestCompaction(manager.getBranch()), recovery);
+});
+
+test("complete history outputs fit a budget equal to their own size", async (t) => {
+	const fixture = await createFixture(false, [], 64, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const id = fixture.sessionManager.appendMessage({ role: "user", content: "short entry", timestamp: Date.now() });
+	const previous = process.env.LEDGER_CONTEXT_READ_TOKENS;
+	t.after(() => { if (previous === undefined) delete process.env.LEDGER_CONTEXT_READ_TOKENS; else process.env.LEDGER_CONTEXT_READ_TOKENS = previous; });
+	for (const [tool, params] of [["history_read", { entryId: id }], ["history_search", { query: "absent phrase" }]] as const) {
+		delete process.env.LEDGER_CONTEXT_READ_TOKENS;
+		const full = await inspectHistory(fixture, tool, params);
+		process.env.LEDGER_CONTEXT_READ_TOKENS = String(textTokenEstimate((full.content as Array<{ text: string }>)[0].text));
+		const bounded = await inspectHistory(fixture, tool, params);
+		assert.deepEqual(bounded.content, full.content);
+	}
+});
+
+test("tool prompt text names its tool and stays within the static budget", async (t) => {
+	const fixture = await createFixture(false, [], 64, { compactionEnabled: false, extraToolNames: ["history_list_items", "history_list_windows", "get_context_remaining"] });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const names = ["checkpoint", "history_read", "history_search", "history_list_items", "history_list_windows", "get_context_remaining"];
+	const tools = fixture.session.getAllTools().filter((tool) => names.includes(tool.name));
+	assert.equal(tools.length, names.length);
+	let chars = 0;
+	for (const tool of tools) {
+		// Pi merges every tool's guidelines into one system-prompt list, so each must name its tool.
+		for (const guideline of tool.promptGuidelines ?? []) assert.ok(guideline.startsWith(`${tool.name}: `), guideline);
+		chars += tool.description.length + (tool.promptGuidelines ?? []).join("").length + JSON.stringify(tool.parameters).length;
+	}
+	assert.ok(chars <= 14_000, `static tool prompt text grew to ${chars} characters`);
 });
 
 test("extension handlers have no unexpected errors", () => {
