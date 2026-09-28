@@ -65,7 +65,9 @@ Delta 的 scope 表示累计目标区间，输入记录的 historyScope 表示�
 
 恢复摘要在所属 compaction 时生成并保存一次。普通工作、checkpoint、历史读取、来源编辑和配置变化保持该正文固定，下一次 compaction 使用最新成功保存的 checkpoint 与匹配 delta。当前分支校验摘要归属，recoveryBasis 标明保存摘要所代表的 checkpoint 与 delta。原始保留尾部由 Pi 提供。
 
-Delta 使用当前模型和宿主认证生成。暂时性错误和无效输出共享最多三次尝试，并使用可取消的退避等待；认证、请求格式和账户额度错误直接进入恢复流程。每次尝试等待响应或错误，期间可由用户取消。没有新增合格材料或 custom instructions 时，压缩复用匹配 delta 或记录 empty 状态。新 delta 随 pi compaction 条目提交后生效。
+Delta 通过公开的 `modelRegistry.streamSimple()` 使用当前完整模型、宿主认证和主 agent 的推理级别。Pi 应用模型的 provider 兼容设置、采样参数和生成预算；delta token 限额约束保存的正文。标准传输方式、推理预算和超时来自 `SettingsManager`。SDK 宿主可通过 `createLedgerContext({ requestOptionsReader: (ctx) => mainRequestOptions })` 提供主请求有效选项和回调的完整快照，替代设置文件提供的默认值。每次 delta 使用独立的路由 ID 和所属压缩的取消信号。
+
+暂时性错误和无效输出共享最多三次尝试，使用可取消的退避等待并关闭 provider 内层重试；认证、请求格式和账户额度错误直接进入恢复流程。失败尝试保存在会话 JSONL 的 compaction 条目 `details.generationFailures` 中，包含时间、尝试序号、阶段、模型、推理级别、HTTP 状态、停止原因，以及经过凭据脱敏且有长度上限的错误信息。恢复正文和历史工具输出提供恢复状态，操作者通过会话文件查看诊断详情。没有新增合格材料或 custom instructions 时，压缩复用匹配 delta 或记录 empty 状态。新 delta 随 pi compaction 条目提交后生效。
 
 恢复摘要为纯文本：附条目引用的 checkpoint 账本、其后的变化、带匹配状态的已保存证据引用、压缩关注点，以及简短的使用说明。变化内容更新 checkpoint，未被变化替换的 checkpoint 条目继续有效；后续用户更正和实际工具结果优先于已保存的事实。使用说明给出已保存状态之后事件的条目范围，以本次压缩快照为界。checkpoint 记录保留其 `requestHistoryPosition`，compaction details 保留完整来源信息，包括 `snapshotPosition`。工具调用保留匹配结果，完整来源条目保留在会话日志中。
 

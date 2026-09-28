@@ -36,12 +36,13 @@ import {
 	normalizeContext,
 	type Context,
 	type JsonObject,
+	type ModelsSimpleStreamOptions,
 	type TranscriptContext,
 } from "@earendil-works/pi-ai";
-import { stream as streamResponses } from "@earendil-works/pi-ai/api/openai-responses";
+import { stream as streamResponses, streamSimple as streamSimpleResponses } from "@earendil-works/pi-ai/api/openai-responses";
 import { stream as streamCompletions } from "@earendil-works/pi-ai/api/openai-completions";
 import { stream as streamAnthropic } from "@earendil-works/pi-ai/api/anthropic-messages";
-import { CHECKPOINT_ENTRY_TYPE, REMINDER_MESSAGE_TYPE, createLedgerContext, type LedgerContextSettingsReader, type LedgerCompactionDetails } from "../src/ledger-context.ts";
+import { CHECKPOINT_ENTRY_TYPE, REMINDER_MESSAGE_TYPE, createLedgerContext, type LedgerContextOptions, type LedgerContextSettingsReader, type LedgerCompactionDetails } from "../src/ledger-context.ts";
 
 const TEST_TIMEOUT_MS = 5_000;
 const extensionErrors: ExtensionError[] = [];
@@ -635,6 +636,7 @@ async function createFixture(
 		extraToolNames?: string[];
 		customTools?: ToolDefinition[];
 		settingsReader?: LedgerContextSettingsReader | null;
+		requestOptionsReader?: LedgerContextOptions["requestOptionsReader"];
 		modelInput?: ("text" | "image")[];
 	} = {},
 ) {
@@ -676,7 +678,7 @@ async function createFixture(
 	const settingsReader = options.settingsReader === null
 		? undefined
 		: options.settingsReader ?? ((ctx) => ({ source: "fixture SettingsManager", compaction: settingsManager.getCompactionSettings(ctx.model ?? undefined) }));
-	const ledgerExtension = createLedgerContext({ settingsReader });
+	const ledgerExtension = createLedgerContext({ settingsReader, requestOptionsReader: options.requestOptionsReader });
 	const resourceLoader = new DefaultResourceLoader({
 		cwd,
 		agentDir,
@@ -4631,7 +4633,7 @@ test("compaction without an agent checkpoint accumulates deltas and preserves th
 		ledgerFaux.setResponses([(context, options, _state, model) => {
 			const systemPrompt = getCurrentSystemPrompt(context.messages);
 			assert.equal(getCurrentTools(context.messages).length, 0);
-			assert.equal(options?.timeoutMs, undefined, "ledger generation must not impose a waiting timeout");
+			assert.ok(options?.timeoutMs && options.timeoutMs > 0, "delta inherits the main request timeout");
 			assert.equal(options?.maxRetries, 0);
 			assert.match(systemPrompt, /current window/);
 			const input = context.messages.reduce((sum, message) => sum + estimateTokens(message), 0) + textTokenEstimate(systemPrompt);
@@ -4718,6 +4720,97 @@ test("tool images retain Pi's native provider payload", { timeout: TEST_TIMEOUT_
 	}
 });
 
+test("delta inherits the current main model and native request parameters", async (t) => {
+	const requests: Array<{ model: any; context: any; options: any }> = [];
+	let mainRequestOptions: ModelsSimpleStreamOptions = {
+		transport: "sse", thinkingBudgets: { high: 6_000 }, timeoutMs: 45_000,
+		websocketConnectTimeoutMs: 8_000, maxRetryDelayMs: 7_000, cacheRetention: "long",
+		headers: { "X-Host-Header": "host-value" }, metadata: { user_id: "host-user" },
+		transformHeaders: async (headers) => ({ ...headers, "X-Host-Transformed": "transformed-value" }),
+		samplingParams: { temperature: 0.6, host_parameter: "inherited" },
+	};
+	const inspect = (pi: ExtensionAPI) => pi.on("session_start", (_event, ctx) => {
+		const stream = ctx.modelRegistry.streamSimple.bind(ctx.modelRegistry);
+		ctx.modelRegistry.streamSimple = (model, context, options) => {
+			if (getCurrentSystemPrompt(normalizeContext(context).messages).startsWith("Write the cumulative changes")) requests.push({ model, context, options });
+			return stream(model, context, options);
+		};
+	});
+	const fixture = await createFixture(true, [inspect], 64, {
+		compactionEnabled: false, maxTokens: 16_384, requestOptionsReader: () => mainRequestOptions,
+	});
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, faux, ledgerFaux, sessionManager } = fixture;
+	faux.setResponses([fauxAssistantMessage("First result."), fauxAssistantMessage("Second result.")]);
+	await session.prompt("First request.");
+	await session.prompt(`Second request ${"x".repeat(800)}`);
+	for (const level of ["high", "low"] as const) {
+		mainRequestOptions = { ...mainRequestOptions, temperature: level === "high" ? 0.3 : 0.2 };
+		const model = { ...faux.getModel(), reasoning: true, maxTokens: level === "high" ? 16_384 : 8_192,
+			baseUrl: "http://127.0.0.1:1", thinkingLevelMap: { off: null, low: "low", high: "high" },
+			samplingParams: { temperature: 0.4, top_p: 0.8, seed: 42, custom_model_parameter: "inherited" },
+			compat: { supportsDeveloperRole: false }, headers: { "X-Model-Header": "inherited" } };
+		await session.setModel(model);
+		session.setThinkingLevel(level);
+		faux.setResponses([fauxAssistantMessage("More work completed.")]);
+		await session.prompt(`More work ${"y".repeat(800)}`);
+		ledgerFaux.setResponses([(_context, options) => {
+			assert.equal(options?.headers?.["X-Host-Header"], "host-value");
+			assert.equal(options?.headers?.["X-Host-Transformed"], "transformed-value");
+			return fauxAssistantMessage("A small cumulative delta.");
+		}]);
+		await session.compact("Update the delta.");
+		const request = requests.at(-1);
+		assert.ok(request, "delta must use the same streamSimple parameter normalization as main requests");
+		assert.ok(session.model);
+		assert.deepEqual(request.model, session.model);
+		assert.equal(request.options.reasoning, level);
+		for (const [key, value] of Object.entries(mainRequestOptions)) assert.deepEqual(request.options[key], value, key);
+		assert.notEqual(request.options.sessionId, sessionManager.getSessionId(), "standalone generation must not replace the main request's routing state");
+		assert.equal(request.options.maxTokens, undefined, "the delta text budget must not replace the model generation budget");
+		let payload: any;
+		await streamSimpleResponses({ ...request.model, api: "openai-responses" }, normalizeContext(request.context), {
+			...request.options, apiKey: "local-test", onPayload: (value) => { payload = value; throw new Error("captured before HTTP"); },
+		}).result();
+		assert.equal(payload.reasoning.effort, level);
+		assert.equal(payload.max_output_tokens, model.maxTokens);
+		assert.equal(payload.temperature, 0.6, "host sampling parameters override the model defaults through the native adapter");
+		assert.equal(payload.top_p, 0.8);
+		assert.equal(payload.seed, 42);
+		assert.equal(payload.custom_model_parameter, "inherited");
+		assert.equal(payload.host_parameter, "inherited");
+		assert.equal(payload.input[0].role, "system");
+		assert.equal(generatedDelta(latestCompaction(sessionManager.getBranch())).ledger, "A small cumulative delta.");
+	}
+	assert.equal(requests.length, 2);
+});
+
+test("delta failure diagnostics persist without entering model recovery or history output", async (t) => {
+	const fixture = await createFixture(true, [], 64, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, faux, ledgerFaux, sessionManager } = fixture;
+	faux.setResponses([fauxAssistantMessage("First result."), fauxAssistantMessage("Second result.")]);
+	await session.prompt("First request.");
+	await session.prompt(`Second request ${"x".repeat(800)}`);
+	ledgerFaux.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: 'CLIProxy API error (400): invalid_request_error: DIAGNOSTIC_ONLY thinking.type.disabled; Authorization: Bearer secret-credential; api_key="another-secret"' })]);
+	await session.compact();
+	const entry = latestCompaction(SessionManager.open(sessionManager.getSessionFile()!).getBranch());
+	const failures = (entry.details as LedgerCompactionDetails & { generationFailures?: any[] }).generationFailures;
+	assert.equal(failures?.length, 1);
+	assert.equal(failures[0].attempt, 1);
+	assert.equal(failures[0].stage, "provider");
+	assert.equal(failures[0].status, 400);
+	assert.equal(failures[0].stopReason, "error");
+	assert.match(failures[0].message, /DIAGNOSTIC_ONLY thinking.type.disabled/);
+	assert.doesNotMatch(JSON.stringify(failures), /secret-credential|another-secret/);
+	assert.doesNotMatch(entry.summary, /DIAGNOSTIC_ONLY/);
+	assert.doesNotMatch(JSON.stringify(sessionManager.buildSessionProjection().messages), /DIAGNOSTIC_ONLY/);
+	for (const args of [{ entryId: entry.id }, { entryId: entry.id, view: "neighbors" }, { view: "many", items: [{ entryId: entry.id }] }]) {
+		const result = await inspectHistory(fixture, "history_read", args);
+		assert.doesNotMatch(JSON.stringify(result), /DIAGNOSTIC_ONLY/);
+	}
+});
+
 test("ledger refresh exhausts invalid outputs and transient errors, but stops on permanent failures", { timeout: 25_000 }, async () => {
 	for (const { response, attempts } of [
 		{ response: () => { throw new Error("generation request failed"); }, attempts: 1 },
@@ -4743,6 +4836,10 @@ test("ledger refresh exhausts invalid outputs and transient errors, but stops on
 			ledgerFaux.setResponses([response, response, response, fauxAssistantMessage("must never reach a fourth attempt")]);
 			await session.compact();
 			assert.equal(ledgerFaux.state.callCount, attempts);
+			const failures = (latestCompaction(sessionManager.getBranch()).details as LedgerCompactionDetails).generationFailures!;
+			assert.equal(failures.length, attempts);
+			assert.deepEqual(failures.map(failure => failure.attempt), Array.from({ length: attempts }, (_, index) => index + 1));
+			assert.ok(failures.every(failure => failure.message.length > 0));
 			assert.equal(checkpointEntries(sessionManager.getBranch()).length, 0);
 			assert.match(latestCompaction(sessionManager.getBranch()).summary, /No agent checkpoint/);
 			assert.match(latestCompaction(sessionManager.getBranch()).summary, /Delta update failed/);
@@ -4756,13 +4853,13 @@ test("ledger refresh exhausts invalid outputs and transient errors, but stops on
 test("ledger refresh shares three attempts across transport and validation failures and saves success once", { timeout: TEST_TIMEOUT_MS }, async () => {
 	let requests = 0;
 	const throwNetworkError = (pi: ExtensionAPI) => pi.on("session_start", (_event, ctx) => {
-		const complete = ctx.modelRegistry.complete.bind(ctx.modelRegistry);
-		ctx.modelRegistry.complete = (...args) => {
+		const stream = ctx.modelRegistry.streamSimple.bind(ctx.modelRegistry);
+		ctx.modelRegistry.streamSimple = (...args) => {
 			requests++;
 			assert.equal(args[2]?.maxRetries, 0);
-			assert.equal(args[2]?.timeoutMs, undefined);
+			assert.ok(args[2]?.timeoutMs && args[2].timeoutMs > 0);
 			if (requests === 1) throw new TypeError("fetch failed");
-			return complete(...args);
+			return stream(...args);
 		};
 	});
 	const { root, faux, ledgerFaux, session, sessionManager } = await createFixture(true, [throwNetworkError], 64, { contextWindow: 32_000, maxTokens: 512, reserveTokens: 0 });
@@ -4777,6 +4874,10 @@ test("ledger refresh shares three attempts across transport and validation failu
 		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 0);
 		assert.match(latestCompaction(sessionManager.getBranch()).summary, /Valid ledger on attempt three/);
 		assert.equal(generatedDelta(latestCompaction(sessionManager.getBranch())).ledger, "Valid ledger on attempt three.");
+		const failures = (latestCompaction(sessionManager.getBranch()).details as LedgerCompactionDetails).generationFailures!;
+		assert.deepEqual(failures.map(({ attempt, stage }) => ({ attempt, stage })), [{ attempt: 1, stage: "request" }, { attempt: 2, stage: "output" }]);
+		assert.match(failures[0].message, /fetch failed/);
+		assert.match(failures[1].message, /Delta output is empty/);
 		assert.equal(checkpointEntries(SessionManager.open(sessionManager.getSessionFile()!).getBranch()).length, 0);
 	} finally {
 		session.dispose();

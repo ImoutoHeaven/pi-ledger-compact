@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
-import { StringEnum, Type, isRetryableAssistantError, type Static } from "@earendil-works/pi-ai";
+import { StringEnum, Type, isRetryableAssistantError, type ModelsSimpleStreamOptions, type Static } from "@earendil-works/pi-ai";
 import {
 	SessionManager,
 	SettingsManager,
@@ -145,6 +145,8 @@ export type LedgerContextSettingsReader = (ctx: ExtensionContext) => LedgerConte
 
 export interface LedgerContextOptions {
 	settingsReader?: LedgerContextSettingsReader;
+	/** SDK hosts supply their main streamSimple request's complete effective options instead of reading settings from disk. */
+	requestOptionsReader?: (ctx: ExtensionContext) => ModelsSimpleStreamOptions;
 }
 
 interface NativeCompactionSettings {
@@ -406,6 +408,21 @@ export interface LedgerCompactionDetails {
 	previousCheckpointEntryId?: string | null;
 	lastUserEntryId?: string | null;
 	lastAssistantEntryId?: string | null;
+	/** Operator diagnostics, excluded from recovery text and model-facing history tools. */
+	generationFailures?: DeltaGenerationFailure[];
+}
+
+interface DeltaGenerationFailure {
+	timestamp: string;
+	attempt: number;
+	stage: "request" | "provider" | "output";
+	provider?: string;
+	model?: string;
+	api?: string;
+	thinkingLevel?: string;
+	stopReason?: string;
+	status?: number;
+	message: string;
 }
 
 interface StoredCheckpoint {
@@ -512,6 +529,20 @@ function defaultSettingsSnapshot(ctx: ExtensionContext): LedgerContextSettingsSn
 	} catch {
 		return { source: "settings-manager", error: "settings-read-failed" };
 	}
+}
+
+function defaultRequestOptions(ctx: ExtensionContext): ModelsSimpleStreamOptions {
+	const settings = SettingsManager.create(ctx.cwd, getAgentDir(), { projectTrusted: ctx.isProjectTrusted() });
+	if (settings.drainErrors().length > 0) throw new Error("Could not read main-agent request settings");
+	const retry = settings.getProviderRetrySettings();
+	const idleTimeout = settings.getHttpIdleTimeoutMs();
+	return {
+		transport: settings.getTransport(),
+		thinkingBudgets: settings.getThinkingBudgets(),
+		timeoutMs: retry.timeoutMs ?? (idleTimeout === 0 ? 2_147_483_647 : idleTimeout),
+		websocketConnectTimeoutMs: settings.getWebSocketConnectTimeoutMs(),
+		maxRetryDelayMs: retry.maxRetryDelayMs,
+	};
 }
 
 function nativeCompactionSettings(ctx: ExtensionContext, settingsReader?: LedgerContextSettingsReader): NativeCompactionSettings {
@@ -1137,7 +1168,10 @@ function historyViewAt(entries: SessionEntry[], ctx: ExtensionContext, index: nu
 		text += `\nContext edit history (body above is the original log record):\n${edits.map((edit) => `${historyEntryReference(edit.id)}: ${edit.replacement === null ? "omission" : "replacement"}`).join("\n")}`;
 	}
 	const delta = entry.type === "compaction" ? deltaForCompaction(entry, entries) : undefined;
-	if (entry.type === "compaction" && isLedgerCompactionDetails(entry.details) && contentIndex === undefined && (projection === "all" || projection === "text")) text += `\nCompaction recovery details:\n${safeJson(entry.details)}`;
+	if (entry.type === "compaction" && isLedgerCompactionDetails(entry.details) && contentIndex === undefined && (projection === "all" || projection === "text")) {
+		const { generationFailures: _diagnostics, ...recoveryDetails } = entry.details;
+		text += `\nCompaction recovery details:\n${safeJson(recoveryDetails)}`;
+	}
 	if (delta && delta.entryId === entry.id && contentIndex === undefined && (projection === "all" || projection === "text")) {
 		const positions = new Map(entries.map((entry, index) => [entry.id, index]));
 		const coverage = delta.data.inputCoverage;
@@ -2869,16 +2903,30 @@ function saveAgentCheckpoint(pi: ExtensionAPI, ctx: ExtensionContext, state: Ses
 	return saved;
 }
 
-function retryableLedgerError(error: unknown): boolean | undefined {
+function ledgerErrorStatus(error: unknown): number | undefined {
 	const message = error instanceof Error ? error.message : String(error);
 	// ponytail: assistant errors expose display text; use structured status when the SDK makes it available.
-	const status = error && typeof error === "object" && "status" in error && typeof error.status === "number" ? error.status
+	return (error && typeof error === "object" && "status" in error && typeof error.status === "number" ? error.status
 		: error && typeof error === "object" && "statusCode" in error && typeof error.statusCode === "number" ? error.statusCode
-		: Number(message.match(/(?:^|\bHTTP\s+|\bstatus(?: code)?[: ]+|\bAPI error\s*\()([45]\d{2})\b/i)?.[1]);
+		: Number(message.match(/(?:^|\bHTTP\s+|\bstatus(?: code)?[: ]+|\bAPI error\s*\()([45]\d{2})\b/i)?.[1])) || undefined;
+}
+
+function retryableLedgerError(error: unknown): boolean | undefined {
+	const message = error instanceof Error ? error.message : String(error);
+	const status = ledgerErrorStatus(error);
 	if (/insufficient_quota|quota exceeded|billing|out of budget|GoUsageLimitError|FreeUsageLimitError|Monthly usage limit reached|available balance|invalid_request_error|invalid api key|unauthorized|forbidden|authentication (?:failed|required)|unsupported parameter/i.test(message)) return false;
 	if (status) return status === 408 || status === 409 || status === 429 || status >= 500;
 	if (/network|connection|fetch failed|socket|ECONN|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|timed? out|timeout|overloaded|rate.?limit|service.?unavailable/i.test(message)) return true;
 	return undefined;
+}
+
+function diagnosticMessage(error: unknown): string {
+	return (error instanceof Error ? error.message : String(error))
+		.replace(/\b(Bearer|Basic)\s+[A-Za-z0-9+\/=._~-]+/gi, "$1 <REDACTED>")
+		.replace(/(["']?(?:api[-_]?key|access[-_]?token|refresh[-_]?token|authorization|password|secret)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}\]]+)/gi, "$1<REDACTED>")
+		.replace(/\b(?:sk|rk)-[A-Za-z0-9_-]{8,}/g, "<REDACTED>")
+		.replace(/(https?:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1<REDACTED>@")
+		.slice(0, 4_096);
 }
 
 function deltaHistoryMaterial(entry: SessionEntry, contentEntryId = entry.id): { text?: string; filtered?: boolean; excluded?: HistoryExclusion } {
@@ -2906,9 +2954,17 @@ async function generateCompactionDelta(
 	firstKeptEntryId: string | undefined,
 	deltaTokenLimit: number,
 	signal: AbortSignal,
-	customInstructions?: string,
+	customInstructions: string | undefined,
+	readRequestOptions: () => ModelsSimpleStreamOptions,
+	failures: DeltaGenerationFailure[],
 ): Promise<DeltaSlot> {
 	const model = ctx.model;
+	let attempt = 0;
+	let requestOptions: ModelsSimpleStreamOptions | undefined;
+	const recordFailure = (stage: DeltaGenerationFailure["stage"], error: unknown, stopReason?: string) => failures.push({
+		timestamp: new Date().toISOString(), attempt, stage, provider: model?.provider, model: model?.id, api: model?.api,
+		thinkingLevel: requestOptions?.reasoning, stopReason, status: ledgerErrorStatus(error), message: diagnosticMessage(error),
+	});
 	const failure = (reason: "generation-failed" | "input-capacity" | "no-model"): DeltaSlot => previous ? { status: "stale", sourceCompactionEntryId: previous.entryId } : { status: "unavailable", reason };
 	const unchanged: DeltaSlot = previous ? { status: "reused", sourceCompactionEntryId: previous.entryId } : { status: "empty" };
 	const after = previous?.data.scope.throughEntryId ?? base?.data.requestHistoryPosition.entryId ?? null;
@@ -2927,6 +2983,7 @@ async function generateCompactionDelta(
 	let removeAbortListener: (() => void) | undefined;
 	try {
 		signal.throwIfAborted();
+		requestOptions = { ...readRequestOptions(), signal, maxRetries: 0 };
 		const maxTokens = Math.min(deltaTokenLimit, model.maxTokens, Math.floor(model.contextWindow / 4));
 		if (maxTokens < 1) return failure("input-capacity");
 		const systemPrompt = [
@@ -2938,7 +2995,8 @@ async function generateCompactionDelta(
 			'Optionally end with a line <source-references>[{"entryId":"ID from the input","quote":"optional exact phrase"}]</source-references> listing up to 8 key sources, most important first. It replaces the previous list; leaving it out clears the list. Quotes are case-sensitive and at most 512 characters. Keep essential facts in the delta text itself.',
 			`Stay under ${maxTokens} estimated tokens and ${LEDGER_BYTE_LIMIT} UTF-8 bytes.`,
 		].join("\n");
-		const inputBudget = model.contextWindow - maxTokens - ledgerTokenEstimate(systemPrompt) - modelMetadataTokens(ctx) - 64;
+		const outputReserve = Math.min(requestOptions.maxTokens ?? model.maxTokens, Math.floor(model.contextWindow / 4));
+		const inputBudget = model.contextWindow - outputReserve - ledgerTokenEstimate(systemPrompt) - modelMetadataTokens(ctx) - 64;
 		if (inputBudget < 1) return failure("input-capacity");
 		const references = [...(base?.data.sourceReferences ?? []), ...(previous?.data.sourceReferences ?? [])];
 		const bases = [
@@ -2982,7 +3040,7 @@ async function generateCompactionDelta(
 			const faithfulPrefix = cut > entries.map((entry) => entry.type).lastIndexOf("compaction") && (!base || prefixIds.has(base.entryId)) &&
 				!entries.slice(cut).some((entry) => entry.type === "context_edit" && prefixIds.has(entry.targetId));
 			// The next compaction's delta covers the tail Pi keeps verbatim.
-			if (faithfulPrefix) return await generateCompactionDelta(ctx, base, previous, entries.slice(0, cut), undefined, deltaTokenLimit, signal, customInstructions);
+			if (faithfulPrefix) return await generateCompactionDelta(ctx, base, previous, entries.slice(0, cut), undefined, deltaTokenLimit, signal, customInstructions, () => requestOptions!, failures);
 			packet = pack(DELTA_TOOL_RESULT_CHARS);
 		}
 		if (ledgerTokenEstimate(packet.content) > inputBudget) return failure("input-capacity");
@@ -2993,23 +3051,28 @@ async function generateCompactionDelta(
 			signal.addEventListener("abort", onAbort, { once: true });
 			removeAbortListener = () => signal.removeEventListener("abort", onAbort);
 		});
-		for (let attempt = 0; attempt < 3; attempt++) {
-			if (attempt > 0) await delay(500 * 2 ** (attempt - 1), undefined, { signal });
+		for (attempt = 1; attempt <= 3; attempt++) {
+			if (attempt > 1) await delay(500 * 2 ** (attempt - 2), undefined, { signal });
 			signal.throwIfAborted();
 			let result;
 			try {
-				result = await Promise.race([ctx.modelRegistry.complete(model, {
+				result = await Promise.race([ctx.modelRegistry.streamSimple(model, {
 					systemPrompt,
 					messages: [{ role: "user", content, timestamp: Date.now() }],
-				}, { maxTokens, maxRetries: 0, signal }), aborted]);
+				}, requestOptions).result(), aborted]);
 			} catch (error) {
 				signal.throwIfAborted();
+				recordFailure("request", error);
 				if (!retryableLedgerError(error)) return failure("generation-failed");
 				continue;
 			}
 			signal.throwIfAborted();
-			if (result.stopReason === "aborted") return failure("generation-failed");
+			if (result.stopReason === "aborted") {
+				recordFailure("provider", result.errorMessage ?? "Delta request aborted by provider", result.stopReason);
+				return failure("generation-failed");
+			}
 			if (result.stopReason === "error") {
+				recordFailure("provider", result.errorMessage ?? "Unknown provider error", result.stopReason);
 				if (!(retryableLedgerError(result.errorMessage) ?? isRetryableAssistantError(result))) return failure("generation-failed");
 				continue;
 			}
@@ -3021,13 +3084,15 @@ async function generateCompactionDelta(
 				if (capacityError) throw new Error(capacityError);
 				const allowedIds = new Set([...references.flatMap(reference => reference.matches.flatMap(match => [match.entryId, ...(match.editEntryId ? [match.editEntryId] : [])])), ...supplied.keys(), ...projections.keys(), ...[...projections.values()].flatMap((part) => part.editEntryId ? [part.editEntryId] : [])]);
 				return { status: "generated", record: { kind: "compaction-delta", baseCheckpointEntryId: base?.entryId ?? null, scope: { afterEntryId: base?.data.requestHistoryPosition.entryId ?? null, throughEntryId: position.entryId }, ledger, sourceReferences: resolveSourceReferences(selectors, entries, allowedIds), inputCoverage } };
-			} catch {
+			} catch (error) {
+				recordFailure("output", error, result.stopReason);
 				// Invalid output shares the same attempt budget as provider failures.
 			}
 		}
 		return failure("generation-failed");
-	} catch {
+	} catch (error) {
 		signal.throwIfAborted();
+		recordFailure("request", error);
 		return failure("generation-failed");
 	} finally {
 		removeAbortListener?.();
@@ -3343,14 +3408,23 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 			const availableTokens = (ctx.model?.contextWindow ?? 0) - requestFixedTokens(pi, ctx) - budgets.outputReserveTokens;
 			const generationLeaf = ctx.sessionManager.getLeafId();
 			const generationModel = ctx.model;
+			const thinkingLevel = ctx.thinkingLevel ?? pi.getThinkingLevel();
+			const generationFailures: DeltaGenerationFailure[] = [];
+			const routingId = randomUUID();
 			const delta = await generateCompactionDelta(ctx, state.checkpoint, state.delta, branch, firstKeptEntryId,
 				Math.min(budgets.deltaTokens, availableTokens - ledgerTokenEstimate(summary) + ledgerTokenEstimate(state.delta?.data.ledger ?? "") - 256),
-				event.signal, event.customInstructions);
+				event.signal, event.customInstructions, () => ({
+					...(options.requestOptionsReader ?? defaultRequestOptions)(ctx),
+					reasoning: thinkingLevel === "off" ? undefined : thinkingLevel,
+					// Standalone summaries have their own routing ID, as in Pi's native compaction.
+					sessionId: routingId,
+				}), generationFailures);
 			event.signal.throwIfAborted();
 			if (ctx.sessionManager.getLeafId() !== generationLeaf || ctx.model !== generationModel) {
 				throw new Error("session branch or model changed during ledger generation");
 			}
 			details = buildCompactionDetails(state, branch, firstKeptEntryId, details.windowId, delta, snapshotPosition);
+			if (generationFailures.length > 0) details.generationFailures = generationFailures;
 			summary = renderBootstrap(branch, state, details, budgets, event.customInstructions);
 			const summaryTokens = ledgerTokenEstimate(summary);
 			if (summaryTokens > availableTokens) {
