@@ -46,7 +46,7 @@ const checkpointParameters = Type.Object({
 	ledger: Type.Optional(Type.String({ minLength: 1, description: "Your complete current working state, replacing the saved one. At most 65536 UTF-8 bytes and the configured token budget. Use either ledger or edits." })),
 	edits: Type.Optional(Type.Array(Type.Object({ oldText: Type.String({ minLength: 1 }), newText: Type.String() }, { additionalProperties: false }), {
 		minItems: 1,
-		description: `Exact replacements in the saved state: the latest checkpoint ledger, followed by "${FOLDED_CHANGES_HEADING}" and the compaction changes when a compaction happened after it. Each oldText must occur exactly once in that text; all edits match the same original text and must not overlap. Use either ledger or edits.`,
+		description: `Exact replacements in the saved state: the latest checkpoint ledger, followed by "${FOLDED_CHANGES_HEADING}" and the compaction changes when a compaction happened after it. Each oldText must occur exactly once in that text; all edits match the same original text and must not overlap. Each compaction folded in this way adds one section; merge several folded sections with a complete ledger. Use either ledger or edits.`,
 	})),
 	sourceQuotes: Type.Optional(
 		Type.Array(Type.String({ minLength: 1, maxLength: MAX_SOURCE_QUOTE_LENGTH }), {
@@ -3313,6 +3313,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		promptSnippet: "save your working state for recovery after compaction",
 		promptGuidelines: [
 			`checkpoint: ${CHECKPOINT_LEDGER_GUIDELINES}`,
+			`checkpoint: an edit save after a compaction appends that compaction's changes under "${FOLDED_CHANGES_HEADING}"; these sections are temporary. When a receipt reports several of them, make your next save a complete ledger that merges them into the current state and drops what they replaced.`,
 			"checkpoint: save after important decisions, user corrections and finished milestones, then continue the task. Put every essential fact in the ledger; sourceQuotes only point to evidence.",
 		],
 		parameters: checkpointParameters,
@@ -3339,6 +3340,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 				handoff: "active-baseline",
 				historyTools: "history_read known entryId first; history_search then history_read for unknown entries; continue with nextCursor/nextOffset on this branch",
 			};
+			const foldedSections = validated.data.ledger.split(/\r?\n/).filter((line) => line === FOLDED_CHANGES_HEADING).length;
 			const scopeText = saved.saveScope === "persistent" ? "the session file" : "process memory only (in-memory session)";
 			return {
 				content: [
@@ -3348,6 +3350,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 							`Checkpoint saved. It is now your recovery baseline (${historyEntryReference(saved.entryId)}); continue the task.`,
 							`Ledger size: ${validated.estimatedLedgerTokens} of ${validated.ledgerTokenLimit} estimated tokens. Stored in: ${scopeText}.`,
 							sourceReferenceReceipt(validated.data.sourceReferences),
+							foldedSections > 1 ? `This checkpoint holds ${foldedSections} "${FOLDED_CHANGES_HEADING}" sections. Make your next save a complete ledger that merges them into the current state and drops what they replaced.` : "",
 						].filter(Boolean).join("\n"),
 					},
 				],

@@ -127,6 +127,7 @@ test("checkpoint edits change the saved state, fold compaction changes and keep 
 	const edited = checkpointEntries(manager.getBranch()).at(-1)!.data as any;
 	assert.equal(edited.ledger, "Goal: ship.\nNext: release.\nDecision: keep API.\n\n## Folded compaction changes\nTests passed on Linux.");
 	assert.deepEqual(edited.sourceReferences, [...previous.sourceReferences, ...delta.sourceReferences]);
+	assert.doesNotMatch(receipts().at(-1)!, /complete ledger that merges them/, "one folded section needs no consolidation");
 	await session.reload();
 	manager.appendMessage({ role: "user", content: "Release started.", timestamp: Date.now() });
 	manager.appendMessage(fauxAssistantMessage("release work ".repeat(100)));
@@ -139,10 +140,13 @@ test("checkpoint edits change the saved state, fold compaction changes and keep 
 	const quoted = checkpointEntries(manager.getBranch()).at(-1)!.data as any;
 	assert.match(quoted.ledger, /keep API v2\.[\s\S]*Tests passed on Linux\.\n\n## Folded compaction changes\nRelease started\.$/);
 	assert.deepEqual(quoted.sourceReferences.map((reference: any) => reference.quote), ["Release started."]);
+	assert.match(receipts().at(-1)!, /holds 2 "## Folded compaction changes" sections\. Make your next save a complete ledger that merges them/);
 	// SDK callers bypass the model-facing schema; a sparse edit list must not save an unchanged checkpoint.
 	const checkpointTool = session.getToolDefinition("checkpoint")!;
 	await assert.rejects(checkpointTool.execute("sparse-edits", { edits: new Array(1) } as never, undefined, undefined, { sessionManager: manager } as never), /edits must be a non-empty list/);
 	assert.equal((checkpointEntries(manager.getBranch()).at(-1)!.data as any).ledger, quoted.ledger);
+	await save({ ledger: "State.\r\n\r\n## Folded compaction changes\r\nA.\r\n\r\n## Folded compaction changes\r\nB." });
+	assert.match(receipts().at(-1)!, /holds 2 "## Folded compaction changes" sections/, "CRLF headings count as sections");
 });
 
 /** Parses the recovery summary's later-events range. */
@@ -896,7 +900,7 @@ test("packed package installs and loads through the public pi package manager", 
 		const checkpointTool = session.getAllTools().find((tool) => tool.name === "checkpoint");
 		assert.ok(checkpointTool);
 		const checkpointGuidance = JSON.stringify(checkpointTool.promptGuidelines);
-		for (const phrase of ["important decisions", "complete current working state", "goal and status", "constraints and decisions", "verified, with evidence", "next step", "where to find evidence", "skills (or none)", "carrying over everything still needed", "compaction changes", "edits, which keep all other text", "plans apart from finished work", "redact secrets"]) {
+		for (const phrase of ["important decisions", "complete current working state", "goal and status", "constraints and decisions", "verified, with evidence", "next step", "where to find evidence", "skills (or none)", "carrying over everything still needed", "compaction changes", "edits, which keep all other text", "complete ledger that merges them", "plans apart from finished work", "redact secrets"]) {
 			assert.ok(checkpointGuidance.includes(phrase), `checkpoint guidance must include ${phrase}`);
 		}
 		let historySearchResult: Extract<SessionEntry, { type: "message" }> | undefined;
@@ -6808,7 +6812,7 @@ test("tool prompt text names its tool and stays within the static budget", async
 		for (const guideline of tool.promptGuidelines ?? []) assert.ok(guideline.startsWith(`${tool.name}: `), guideline);
 		chars += tool.description.length + (tool.promptGuidelines ?? []).join("").length + JSON.stringify(tool.parameters).length;
 	}
-	assert.ok(chars <= 14_000, `static tool prompt text grew to ${chars} characters`);
+	assert.ok(chars <= 15_000, `static tool prompt text grew to ${chars} characters`);
 });
 
 test("extension handlers have no unexpected errors", () => {
