@@ -24,7 +24,7 @@ The package registers these model tools:
 - `history_read` reads an entry, an original content block, one image, a tool exchange, neighboring log entries, or a batch of entry/image selections.
 - `history_list_items` browses filtered entries and checkpoint versions with bounded previews.
 - `history_list_windows` provides window navigation, filtered counts, user wording, and ledger excerpts.
-- `get_context_remaining` reports model headroom, effective-boundary headroom, output reserve, and usage provenance.
+- `get_context_remaining` reports model headroom, effective-boundary headroom, output reserve, usage provenance, and new work since the latest checkpoint or compaction.
 
 ## Checkpoints and recovery
 
@@ -75,11 +75,11 @@ Read known entry IDs with `history_read`. Locate evidence by browsing windows an
 
 ## Reminders and native boundaries
 
-Ledger Context measures new work after the later of the latest agent checkpoint request position and the latest committed compaction on the current branch. With neither, measurement starts at the branch beginning. Retained history and recovery material precede the new window's volume origin; checkpoint provenance stays unchanged. The counter covers ordinary user messages, assistant work, and ordinary tool interactions. Request capacity also includes checkpoint, history-tool, context-budget, and reminder maintenance. The volume reminder interval is 10% of the current model's context window, rounded down to at least one token. Each new interval queues one notice; a large result crossing several intervals produces one notice for the highest crossed mark. Delivered marks survive reload within their window and checkpoint origin. A model change recalculates the interval while preserving already-notified progress.
+Ledger Context measures new work after the later of the latest agent checkpoint request position and the latest committed compaction on the current branch. With neither, measurement starts at the branch beginning. Retained history and recovery material precede the new window's volume origin; checkpoint provenance stays unchanged. The counter covers ordinary user messages, assistant work, and ordinary tool interactions; an assistant message whose tool calls are all maintenance calls counts as maintenance. Request capacity also includes checkpoint, history-tool, context-budget, and reminder maintenance. The volume reminder interval is the larger of 10% of the current model's context window, rounded down, and `LEDGER_CONTEXT_VOLUME_MIN_TOKENS`: 65536 tokens for a 272000-token window and 100000 tokens for a 1000000-token window. Each new interval queues one notice; a large result crossing several intervals produces one notice for the highest crossed mark. Delivered marks survive reload within their window and checkpoint origin. A model change recalculates the interval while preserving already-notified progress.
 
 Reminders are one-time checkpoint requests scoped to their issuing window and checkpoint baseline. Each delivery combines newly triggered work-volume and budget reasons into one notice. After a tool batch, notices use pi's native steering; after a run ends, pending reasons wait for the next normal user request and are evaluated against the current state. Urgency upgrades append a new notice. Previously delivered notices retain their original text and position, including when native compaction retains them in its tail. The scope in the text makes later delivery of an earlier window's notice identifiable as completed by that compaction.
 
-A successful checkpoint fulfils reminder requests through its recorded history position. New work can trigger subsequent reminders within the same run. Delivered budget levels remain deduplicated within their window across saves and reloads. Reminders retain their custom identity in the log and Pi maps them to user messages, including when another extension forces the system prompt. Detailed measurements and source-entry ranges remain in metadata. Source selection excludes maintenance reminder records; request snapshot IDs may point to a reminder.
+A successful checkpoint fulfils reminder requests through its recorded history position. New work can trigger subsequent reminders within the same run. A budget level produces a notice once ordinary work exists after the latest checkpoint or compaction; context used by the save itself or by later maintenance leaves the level waiting for that work. Delivered budget levels remain deduplicated within their window across saves and reloads. A notice's level follows the current context pressure, including when only a volume reason is new. Reminders retain their custom identity in the log and Pi maps them to user messages, including when another extension forces the system prompt. Detailed measurements and source-entry ranges remain in metadata. Source selection excludes maintenance reminder records; request snapshot IDs may point to a reminder.
 
 Known native settings use the effective boundary `B = min(W - O, W - R)`, where `W` is the model window, `O` is the extension output reserve, and `R` is pi's native compaction reserve. Disabled or unknown native settings use `B = W - O` with window protection. The reminder settings are lead times before B. For `W=500000`, `O=16384`, and `R=27200`, `B=472800`; the default soft and urgent used-token triggers are `440032` (`B - 32768`) and `456416` (`B - 16384`), with lead times of `32768` and `16384` tokens.
 
@@ -130,7 +130,7 @@ history_list_items({ filter: { kinds: ["compaction_delta"] }, limit: 5 });
 history_read({ entryId: "result-id", view: "exchange" });
 ```
 
-`get_context_remaining` is a read-only capacity snapshot. `modelRemainingTokens` measures model headroom; `tokensUntilBoundary` measures headroom before the effective boundary. `usageKind` distinguishes `pi-context-usage`, `projected-content-estimate`, and unavailable data; unavailable numeric values are null. Pi controls compaction timing.
+`get_context_remaining` is a read-only capacity snapshot. `modelRemainingTokens` measures model headroom; `tokensUntilBoundary` measures headroom before the effective boundary. `usageKind` distinguishes `pi-context-usage`, `projected-content-estimate`, and unavailable data; unavailable numeric values are null. `newWorkTokens` uses the volume counter's measurement since the latest checkpoint or compaction. Pi controls compaction timing.
 
 `history_read` defaults to `view: "entry"` and accepts `projection`, an optional original `contentIndex`, and UTF-16 `offset`/`length` pagination. `offset` defaults to 0 and `length` to 65536. Copy `nextRead` to continue with the same projection and block, or use `nextOffset` with those parameters. Results report requested/returned lengths, total length, and `pageEnd`: `complete`, `length`, or `output_budget`.
 
@@ -158,6 +158,7 @@ All extension settings use the `LEDGER_CONTEXT_` namespace. Token budget values 
 | --- | --- | --- |
 | `LEDGER_CONTEXT_REMINDER_TOKENS` | `max(2, floor(min(window × 0.20, 32768)))` | Soft reminder lead time before the effective boundary; the used-token trigger is `B - lead time` |
 | `LEDGER_CONTEXT_URGENT_TOKENS` | `max(1, min(default soft lead time − 1, floor(min(window × 0.10, 16384))))` | Urgent reminder lead time before the effective boundary; the used-token trigger is `B - lead time` |
+| `LEDGER_CONTEXT_VOLUME_MIN_TOKENS` | `65536` | Minimum volume reminder interval; the interval is `max(this value, floor(window × 0.10))` |
 | `LEDGER_CONTEXT_LEDGER_TOKENS` | `4096` | Estimated token limit for an agent checkpoint |
 | `LEDGER_CONTEXT_DELTA_TOKENS` | `2048` | Estimated token limit for a cumulative compaction delta |
 | `LEDGER_CONTEXT_READ_TOKENS` | `2048` | Default total output estimate for one history query/read, including image estimates; `truncate: false` opts out for that call |

@@ -45,6 +45,8 @@ import { stream as streamAnthropic } from "@earendil-works/pi-ai/api/anthropic-m
 import { CHECKPOINT_ENTRY_TYPE, REMINDER_MESSAGE_TYPE, createLedgerContext, type LedgerContextOptions, type LedgerContextSettingsReader, type LedgerCompactionDetails } from "../src/ledger-context.ts";
 
 const TEST_TIMEOUT_MS = 5_000;
+// Fixtures use small model windows; the 10% volume interval applies unless a test opts into the default minimum.
+process.env.LEDGER_CONTEXT_VOLUME_MIN_TOKENS = "1";
 const extensionErrors: ExtensionError[] = [];
 const RED_2X2_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEUlEQVR4nGP4z8DwH4QZYAwAR8oH+WdZbrcAAAAASUVORK5CYII=";
 const BLUE_3X2_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAYAAACddGYaAAAAEElEQVR4nGNgYPj/H4GROACPigv118uacgAAAABJRU5ErkJggg==";
@@ -980,6 +982,7 @@ test("runtime lifecycle restores forked, switched, tree, and model state", { tim
 		assert.equal(capacityProviderCalled, true);
 		assert.equal(capacityProviderAborted, false);
 		await runtime.session.navigateTree(mainCompaction.id, { summarize: false });
+		mainManager.appendMessage({ role: "user", content: "small model work after the compaction", timestamp: Date.now() });
 		let smallModelContext: Context | undefined;
 		faux.setResponses([
 			(context) => {
@@ -1544,7 +1547,6 @@ test("long native run recovers twenty windows and reads its earliest operation",
 	let historySearchContext: Context | undefined;
 	let historyReadContext: Context | undefined;
 	let finalContext: Context | undefined;
-	let extraContext: Context | undefined;
 	const unsubscribe = session.subscribe((event) => {
 		if (event.type === "agent_start") agentStarts++;
 		if (event.type === "compaction_start") {
@@ -1603,10 +1605,6 @@ test("long native run recovers twenty windows and reads its earliest operation",
 				finalContext = context;
 				return fauxAssistantMessage("long-run history recovery complete");
 			}),
-			wrapResponse((context) => {
-				extraContext = context;
-				return fauxAssistantMessage("long-run reminder acknowledgement");
-			}),
 		];
 		faux.setResponses(responses);
 		const runPromise = session.prompt("run the 40 operation ledger recovery task");
@@ -1619,13 +1617,12 @@ test("long native run recovers twenty windows and reads its earliest operation",
 		assert.ok(compactionReasons.every((reason) => reason.startsWith("threshold:") || reason.startsWith("overflow:")));
 		assert.equal(executedOperations.size, operationIds.length);
 		assert.ok([...executedOperations.values()].every((count) => count === 1));
-		// 1 checkpoint + 20 operation batches + history search/read + final response + one queued reminder turn.
-		assert.equal(faux.state.callCount, operationIds.length / 2 + 5);
+		// 1 checkpoint + 20 operation batches + history search/read + final response; maintenance after a compaction requests no save.
+		assert.equal(faux.state.callCount, operationIds.length / 2 + 4);
 		assert.equal(providerContexts.length, faux.state.callCount);
-		assert.ok(extraContext);
 		assert.ok(providerContexts.some((context) => /Ledger Context reminder \(urgent\)/.test(JSON.stringify(context.messages))), "urgent reminder must reach a provider request before later compactions can replace it with a reference");
 		assert.equal(faux.getPendingResponseCount(), 0);
-		assert.equal(session.getLastAssistantText(), "long-run reminder acknowledgement");
+		assert.equal(session.getLastAssistantText(), "long-run history recovery complete");
 		assert.equal(sessionManager.getBranch().filter((entry) => entry.type === "compaction").length, compactionReasons.length);
 		const compactions = sessionManager.getBranch().filter(
 			(entry): entry is Extract<SessionEntry, { type: "compaction" }> => entry.type === "compaction",
@@ -1701,6 +1698,17 @@ test("long native run recovers twenty windows and reads its earliest operation",
 	}
 });
 
+const noopTool = (pi: ExtensionAPI): void => {
+	pi.registerTool({
+		name: "noop",
+		label: "Noop",
+		description: "Returns a small result so the run can continue.",
+		parameters: Type.Object({}),
+		executionMode: "sequential",
+		execute: async () => ({ content: [{ type: "text", text: "noop-result" }], details: {} }),
+	});
+};
+
 test("tool-batch reminders survive forced system prompts and reach every provider", { timeout: TEST_TIMEOUT_MS }, async () => {
 	const previousSoft = process.env.LEDGER_CONTEXT_REMINDER_TOKENS;
 	const previousUrgent = process.env.LEDGER_CONTEXT_URGENT_TOKENS;
@@ -1708,14 +1716,7 @@ test("tool-batch reminders survive forced system prompts and reach every provide
 	process.env.LEDGER_CONTEXT_URGENT_TOKENS = "6000";
 	const noopExtension = (pi: ExtensionAPI): void => {
 		pi.on("before_agent_start", (event) => ({ systemPrompt: `${event.systemPrompt}\n\nFORCED_PROMPT_SENTINEL` }));
-		pi.registerTool({
-			name: "noop",
-			label: "Noop",
-			description: "Returns a small result so the run can continue.",
-			parameters: Type.Object({}),
-			executionMode: "sequential",
-			execute: async () => ({ content: [{ type: "text", text: "noop-result" }], details: {} }),
-		});
+		noopTool(pi);
 	};
 	const { root, faux, session } = await createFixture(false, [noopExtension], 2_000, {
 		contextWindow: 8_000,
@@ -1790,6 +1791,63 @@ test("tool-batch reminders survive forced system prompts and reach every provide
 		else process.env.LEDGER_CONTEXT_REMINDER_TOKENS = previousSoft;
 		if (previousUrgent === undefined) delete process.env.LEDGER_CONTEXT_URGENT_TOKENS;
 		else process.env.LEDGER_CONTEXT_URGENT_TOKENS = previousUrgent;
+	}
+});
+
+test("budget save requests wait for new work after a checkpoint and notices carry the current pressure", { timeout: TEST_TIMEOUT_MS }, async () => {
+	const names = ["LEDGER_CONTEXT_REMINDER_TOKENS", "LEDGER_CONTEXT_URGENT_TOKENS"];
+	const previous = names.map((name) => process.env[name]);
+	process.env.LEDGER_CONTEXT_REMINDER_TOKENS = "1000000";
+	process.env.LEDGER_CONTEXT_URGENT_TOKENS = "1";
+	const { root, faux, session, sessionManager } = await createFixture(true, [noopTool], 2_000, {
+		contextWindow: 8_000, maxTokens: 512, reserveTokens: 0, compactionEnabled: false, extraToolNames: ["noop", "get_context_remaining"],
+	});
+	const saveRequests = (context: Context) =>
+		context.messages.filter((message) => message.role === "user" && JSON.stringify(message.content).includes("Call the checkpoint tool")).length;
+	const notices = () => sessionManager.getBranch().filter((entry): entry is Extract<SessionEntry, { type: "custom_message" }> =>
+		entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE);
+	try {
+		const seen: number[] = [];
+		faux.setResponses([
+			fauxAssistantMessage(fauxToolCall("noop", {}), { stopReason: "toolUse" }),
+			(context) => {
+				seen.push(saveRequests(context));
+				// The save itself moves the context into the urgent range.
+				process.env.LEDGER_CONTEXT_URGENT_TOKENS = "999999";
+				return fauxAssistantMessage([{ type: "text", text: "Saving first." }, fauxToolCall("checkpoint", { ledger: "fresh state" })], { stopReason: "toolUse" });
+			},
+			(context) => {
+				seen.push(saveRequests(context));
+				return fauxAssistantMessage(fauxToolCall("get_context_remaining", {}), { stopReason: "toolUse" });
+			},
+			(context) => {
+				seen.push(saveRequests(context));
+				return fauxAssistantMessage(fauxToolCall("noop", {}), { stopReason: "toolUse" });
+			},
+			(context) => {
+				seen.push(saveRequests(context));
+				return fauxAssistantMessage("done");
+			},
+		]);
+		await session.prompt("work, save, and continue");
+		assert.deepEqual(seen, [1, 1, 1, 2], "only ordinary work after the checkpoint brings the urgent save request");
+		assert.deepEqual(notices().map((entry) => (entry.details as { level: string }).level), ["soft", "urgent"]);
+		const remaining = messageEntries(sessionManager.getBranch()).find(({ message }) => message.role === "toolResult" && message.toolName === "get_context_remaining");
+		assert.equal((remaining?.message as { details?: { newWorkTokens?: number } }).details?.newWorkTokens, 0);
+
+		sessionManager.appendMessage({ role: "user", content: "x".repeat(3_200), timestamp: Date.now() });
+		faux.setResponses([fauxAssistantMessage("ok")]);
+		await session.prompt("continue");
+		const latest = notices().at(-1)!.details as { level: string; reasonKinds: string[] };
+		assert.deepEqual(latest.reasonKinds, ["stale-volume"]);
+		assert.equal(latest.level, "urgent", "a volume-only notice still reports urgent pressure");
+	} finally {
+		session.dispose();
+		rmSync(root, { recursive: true, force: true });
+		names.forEach((name, index) => {
+			if (previous[index] === undefined) delete process.env[name];
+			else process.env[name] = previous[index];
+		});
 	}
 });
 
@@ -2185,7 +2243,7 @@ test("stale volume counts ordinary work while excluding maintenance entries", { 
 	}
 });
 
-test("volume reminders follow ten-percent marks across jumps, reload, model changes and checkpoints", { timeout: TEST_TIMEOUT_MS }, async () => {
+test("volume reminders follow ten-percent marks across jumps, reload, model changes and checkpoints, with a 65536-token default minimum", { timeout: TEST_TIMEOUT_MS }, async () => {
 	const { root, faux, session, sessionManager } = await createFixture(true, [], 2_000, {
 		contextWindow: 20_000, maxTokens: 512, reserveTokens: 0, compactionEnabled: false,
 	});
@@ -2248,7 +2306,19 @@ test("volume reminders follow ten-percent marks across jumps, reload, model chan
 		const latest = notices().at(-1)!;
 		assert.equal(latest.type, "custom_message");
 		if (latest.type === "custom_message") assert.match(JSON.stringify(latest.details), /10%.*4000 tokens/);
+
+		delete process.env.LEDGER_CONTEXT_VOLUME_MIN_TOKENS;
+		await session.setModel({ ...faux.getModel(), contextWindow: 272_000 });
+		faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "default minimum origin" })), fauxAssistantMessage("saved")]);
+		await session.prompt("save default minimum origin");
+		fillTo(65_535);
+		await tick();
+		assert.equal(notices().length, 5, "a 272K window waits for the 65536-token minimum instead of its 27200-token 10% mark");
+		fillTo(66_000);
+		await tick();
+		assert.equal(notices().length, 6);
 	} finally {
+		process.env.LEDGER_CONTEXT_VOLUME_MIN_TOKENS = "1";
 		session.dispose();
 		rmSync(root, { recursive: true, force: true });
 	}

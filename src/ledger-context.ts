@@ -27,6 +27,7 @@ export const REMINDER_MESSAGE_TYPE = "ledger-context/reminder";
 export const REMINDER_HANDOFF_ENTRY_TYPE = "ledger-context/reminder-handoff";
 export const DEFAULT_SOFT_REMINDER_TOKEN_LIMIT = 32_768;
 export const DEFAULT_URGENT_REMINDER_TOKEN_LIMIT = 16_384;
+export const DEFAULT_VOLUME_REMINDER_MIN_TOKENS = 65_536;
 export const MAX_HISTORY_SEARCH_QUERY_LENGTH = 8_192;
 export const MAX_HISTORY_SEARCH_QUERIES = 32;
 /** Matches Pi's tool-result limit for summary serialization. */
@@ -717,10 +718,9 @@ function volumeMessagesForEntry(entry: SessionEntry): ContextMessage[] {
 	if (message.role !== "assistant") return [];
 	if (!Array.isArray(message.content)) return [];
 	const toolCalls = message.content.filter((block: any) => block?.type === "toolCall");
-	const hasOrdinaryToolCall = toolCalls.some((block: any) => !isMaintenanceToolCall(block));
+	if (toolCalls.length > 0 && toolCalls.every(isMaintenanceToolCall)) return [];
 	const content = message.content.filter((block: any) =>
-		block?.type === "text" ||
-		((block?.type === "thinking" || block?.type === "reasoning") && (toolCalls.length === 0 || hasOrdinaryToolCall)) ||
+		block?.type === "text" || block?.type === "thinking" || block?.type === "reasoning" ||
 		(block?.type === "toolCall" && !isMaintenanceToolCall(block)),
 	);
 	return content.length > 0 ? [{ ...message, content } as ContextMessage] : [];
@@ -2107,8 +2107,11 @@ function historyWindowsResult(params: HistoryListWindowsParameters, ctx: Extensi
 
 function contextRemainingResult(pi: ExtensionAPI, ctx: ExtensionContext, state: SessionState, settingsReader?: LedgerContextSettingsReader) {
 	const usage = reminderUsage(pi, ctx, settingsReader);
+	const entries = ctx.sessionManager.getBranch();
+	const newWorkTokens = volumeMeasurement(entries, positionStartIndex(entries, volumeOrigin(state, entries).position)).tokens;
 	const details = {
 		windowId: state.activeWindowId,
+		newWorkTokens,
 		contextWindowTokens: usage?.contextWindow ?? ctx.model?.contextWindow ?? null,
 		usedTokens: usage?.tokens ?? null,
 		modelRemainingTokens: usage?.modelRemaining ?? null,
@@ -2122,6 +2125,7 @@ function contextRemainingResult(pi: ExtensionAPI, ctx: ExtensionContext, state: 
 	const text = usage ? [
 		`tokensUntilBoundary: ${details.tokensUntilBoundary} (safety boundary at ${details.effectiveBoundaryTokens} of ${details.contextWindowTokens} tokens; Pi automatic compaction: ${details.nativeCompactionMode === "native" ? "on" : details.nativeCompactionMode === "disabled" ? "off" : "unknown"})`,
 		`used: ${details.usedTokens} tokens (${details.usageKind === "pi-context-usage" ? "reported by Pi" : "estimated"}); model headroom: ${details.modelRemainingTokens} tokens`,
+		`new work since the latest checkpoint or compaction: ${newWorkTokens} tokens`,
 	].join("\n") : "Context usage is unavailable for the current model.";
 	return { content: [{ type: "text" as const, text }], details };
 }
@@ -2613,12 +2617,13 @@ function collectReminderReasons(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	settingsReader?: LedgerContextSettingsReader,
-): { usage: ReminderUsage | undefined; reasons: ReminderReason[] } {
+): { usage: ReminderUsage | undefined; pressure: ReminderLevel | undefined; reasons: ReminderReason[] } {
 	const entries = ctx.sessionManager.getBranch();
 	const origin = volumeOrigin(state, entries);
 	const metric = volumeMeasurement(entries, positionStartIndex(entries, origin.position));
 	const contextWindow = ctx.model?.contextWindow ?? 0;
-	const interval = Number.isFinite(contextWindow) && contextWindow > 0 ? Math.max(1, Math.floor(contextWindow * 0.10)) : undefined;
+	const minInterval = positiveIntegerEnv("LEDGER_CONTEXT_VOLUME_MIN_TOKENS", DEFAULT_VOLUME_REMINDER_MIN_TOKENS);
+	const interval = Number.isFinite(contextWindow) && contextWindow > 0 ? Math.max(minInterval, Math.floor(contextWindow * 0.10)) : undefined;
 	const bucket = interval === undefined ? 0 : Math.floor(metric.tokens / interval);
 	const reasons: ReminderReason[] = [];
 	if (interval !== undefined && bucket >= 1) {
@@ -2629,28 +2634,27 @@ function collectReminderReasons(
 			checkpointEntryId: origin.checkpointEntryId,
 			fromEntryId: metric.fromEntryId,
 			toEntryId: metric.toEntryId,
-			cause: `new nonmaintenance volume (${metric.tokens} tokens) reached interval ${bucket}; each interval is 10% of the current model window (${interval} tokens)`,
+			cause: `new nonmaintenance volume (${metric.tokens} tokens) reached interval ${bucket}; each interval is the larger of 10% of the current model window and ${minInterval} tokens (${interval} tokens)`,
 		});
 	}
 	const usage = reminderUsage(pi, ctx, settingsReader);
-	if (usage) {
-		const thresholds = reminderThresholds(usage.contextWindow);
-		const level: ReminderLevel | undefined =
-			usage.boundaryRemaining <= thresholds.urgent ? "urgent" : usage.boundaryRemaining <= thresholds.soft ? "soft" : undefined;
-		if (level) {
-			reasons.push({
-				key: `${state.activeWindowId}:budget:${level}`,
-				kind: "budget",
-				level,
-				windowId: state.activeWindowId,
-				checkpointEntryId: origin.checkpointEntryId,
-				fromEntryId: metric.fromEntryId,
-				toEntryId: metric.toEntryId,
-				cause: `${level} budget lead time reached before the effective native boundary`,
-			});
-		}
+	const thresholds = usage && reminderThresholds(usage.contextWindow);
+	const pressure: ReminderLevel | undefined = !usage || !thresholds ? undefined
+		: usage.boundaryRemaining <= thresholds.urgent ? "urgent" : usage.boundaryRemaining <= thresholds.soft ? "soft" : undefined;
+	// A save request needs ordinary work after the latest checkpoint or compaction.
+	if (pressure && metric.fromEntryId !== null) {
+		reasons.push({
+			key: `${state.activeWindowId}:budget:${pressure}`,
+			kind: "budget",
+			level: pressure,
+			windowId: state.activeWindowId,
+			checkpointEntryId: origin.checkpointEntryId,
+			fromEntryId: metric.fromEntryId,
+			toEntryId: metric.toEntryId,
+			cause: `${pressure} budget lead time reached before the effective native boundary`,
+		});
 	}
-	return { usage, reasons: [...new Map(reasons.map((reason) => [reason.key, reason])).values()] };
+	return { usage, pressure, reasons: [...new Map(reasons.map((reason) => [reason.key, reason])).values()] };
 }
 
 function volumeReminderMark(key: string): { prefix: string; tokens: number } | undefined {
@@ -2701,7 +2705,7 @@ function deliverReminderReasons(
 		return;
 	}
 	if (reasons.length === 0 || !collected.usage) return;
-	const level: ReminderLevel = reasons.some((reason) => reason.level === "urgent") ? "urgent" : "soft";
+	const level: ReminderLevel = collected.pressure ?? "soft";
 	const usage = collected.usage;
 	const hasCurrentWindowReason = reasons.some((reason) => reason.windowId === state.activeWindowId);
 	const windowId = hasCurrentWindowReason ? state.activeWindowId : reasons[0].windowId;
@@ -3380,9 +3384,9 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 	pi.registerTool({
 		name: "get_context_remaining",
 		label: "Context Remaining",
-		description: "Report context usage and the tokens left before the context safety boundary (tokensUntilBoundary): the earlier of Pi's automatic-compaction point and the reserved output space. Unknown values are null.",
+		description: "Report context usage, new work since the latest checkpoint or compaction, and the tokens left before the context safety boundary (tokensUntilBoundary): the earlier of Pi's automatic-compaction point and the reserved output space. Unknown values are null.",
 		promptSnippet: "check remaining context before compaction",
-		promptGuidelines: ["get_context_remaining: when tokensUntilBoundary runs low, save a checkpoint."],
+		promptGuidelines: ["get_context_remaining: when tokensUntilBoundary runs low and there is new work since the latest checkpoint or compaction, save a checkpoint."],
 		parameters: Type.Object({}),
 		executionMode: "sequential",
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {

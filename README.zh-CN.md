@@ -24,7 +24,7 @@ pi install -l .
 - `history_read` 读取条目、原始内容块、单张图片、工具调用过程、邻近日志条目或一批条目/图片选择。
 - `history_list_items` 按条件浏览条目和 checkpoint 版本，返回有界预览。
 - `history_list_windows` 提供窗口导航、过滤统计、用户措辞和 ledger 摘录。
-- `get_context_remaining` 返回模型余量、有效边界余量、输出预留及用量来源。
+- `get_context_remaining` 返回模型余量、有效边界余量、输出预留、用量来源，以及最近一次 checkpoint 或 compaction 之后的新增工作量。
 
 ## 检查点与恢复
 
@@ -75,11 +75,11 @@ Delta 通过公开的 `modelRegistry.streamSimple()` 使用当前完整模型、
 
 ## 提醒与原生边界
 
-Ledger Context 从当前分支最新 agent checkpoint 的请求位置与最近一次已提交 compaction 中较晚的位置之后统计新增工作量；两者均无时从分支起点统计。保留历史和恢复材料位于新窗口的计量起点之前，checkpoint 的来源记录保持原样。工作量统计覆盖普通用户消息、助手工作和普通工具交互。请求容量同时包含 checkpoint、历史工具、容量查询和提醒等维护活动。体积提醒的间隔为当前模型窗口的 10%，向下取整且至少一个 token。每跨过一个新区间排队一条提醒；大型结果跨过多个区间时按最高位置提醒一次。已提醒的位置在所属窗口和 checkpoint 起点内跨重载保留；模型变化时重新计算间隔并保留已提醒进度。
+Ledger Context 从当前分支最新 agent checkpoint 的请求位置与最近一次已提交 compaction 中较晚的位置之后统计新增工作量；两者均无时从分支起点统计。保留历史和恢复材料位于新窗口的计量起点之前，checkpoint 的来源记录保持原样。工作量统计覆盖普通用户消息、助手工作和普通工具交互；工具调用全部为维护工具的助手消息计为维护活动。请求容量同时包含 checkpoint、历史工具、容量查询和提醒等维护活动。体积提醒的间隔取当前模型窗口的 10%（向下取整）与 `LEDGER_CONTEXT_VOLUME_MIN_TOKENS` 中的较大值：272000 token 窗口为 65536 token，1000000 token 窗口为 100000 token。每跨过一个新区间排队一条提醒；大型结果跨过多个区间时按最高位置提醒一次。已提醒的位置在所属窗口和 checkpoint 起点内跨重载保留；模型变化时重新计算间隔并保留已提醒进度。
 
 提醒是一次性的 checkpoint 请求，范围由产生时的窗口和 checkpoint 基线确定。每次投递将新触发的工作量与预算原因合并为一条通知。工具批次结束后，通过 pi 原生消息插入机制投递；运行结束后，待处理原因留到下一次正常用户请求，按当时的状态计算。紧急度升级在末尾追加新通知。已投递提醒保持原有正文和位置，原生压缩保留尾部中的提醒同样如此。正文中的范围使稍后抵达的旧窗口提醒能够被识别为已由该次压缩完成。
 
-成功保存的 checkpoint 完成截至其所记录历史位置的提醒请求。同一个 run 中，后续新增工作仍可触发提醒。已投递的预算级别在所属窗口内跨保存和重载保持去重。提醒在日志中保留 custom 身份，Pi 将其转换为模型输入中的 user 消息；其他扩展强制替换系统提示时，这条投递路径仍然有效。详细计量信息与工作区间的来源条目 ID 保存在 metadata 中。来源选择排除维护提醒记录；请求快照 ID 可以指向提醒记录。
+成功保存的 checkpoint 完成截至其所记录历史位置的提醒请求。同一个 run 中，后续新增工作仍可触发提醒。最近一次 checkpoint 或 compaction 之后出现普通工作时，预算级别才产生通知；保存本身或之后的维护活动占用的上下文让该级别等待新的普通工作。已投递的预算级别在所属窗口内跨保存和重载保持去重。通知级别跟随当前上下文压力，仅有工作量原因新增时同样如此。提醒在日志中保留 custom 身份，Pi 将其转换为模型输入中的 user 消息；其他扩展强制替换系统提示时，这条投递路径仍然有效。详细计量信息与工作区间的来源条目 ID 保存在 metadata 中。来源选择排除维护提醒记录；请求快照 ID 可以指向提醒记录。
 
 已知原生设置使用有效边界 `B = min(W - O, W - R)`，其中 `W` 是模型窗口，`O` 是扩展输出预留，`R` 是 pi 原生压缩预留。原生设置关闭或未知时使用带窗口保护的 `B = W - O`。两项提醒配置表示相对 B 的提前量。因此 `W=500000`、`O=16384`、`R=27200` 时，`B=472800`；默认柔性和紧急提醒的已用 token 触发值分别为 `440032`（`B - 32768`）和 `456416`（`B - 16384`），对应提前量分别为 `32768` 和 `16384` token。
 
@@ -130,7 +130,7 @@ history_list_items({ filter: { kinds: ["compaction_delta"] }, limit: 5 });
 history_read({ entryId: "result-id", view: "exchange" });
 ```
 
-`get_context_remaining` 提供只读容量快照：`modelRemainingTokens` 表示模型窗口余量，`tokensUntilBoundary` 表示有效边界前的余量；`usageKind` 区分 `pi-context-usage`、`projected-content-estimate` 和不可用状态，不可用的数值为 null。Pi 管理压缩时机。
+`get_context_remaining` 提供只读容量快照：`modelRemainingTokens` 表示模型窗口余量，`tokensUntilBoundary` 表示有效边界前的余量；`usageKind` 区分 `pi-context-usage`、`projected-content-estimate` 和不可用状态，不可用的数值为 null。`newWorkTokens` 使用工作量计数器对最近一次 checkpoint 或 compaction 之后的计量。Pi 管理压缩时机。
 
 `history_read` 默认使用 `view: "entry"`，接受 `projection`、可选的原始 `contentIndex`，以及按 UTF-16 计量的 `offset`/`length` 正文分页。`offset` 默认 0，`length` 默认 65536。复制 `nextRead` 可保持相同投影和内容块继续读取，也可保持这些参数并使用 `nextOffset`。结果回报请求长度、实际返回长度、总长度和 `pageEnd`：`complete`、`length` 或 `output_budget`。
 
@@ -158,6 +158,7 @@ Pi 在工具结果进入历史前，按自身自动缩放设置与当前模型�
 | --- | --- | --- |
 | `LEDGER_CONTEXT_REMINDER_TOKENS` | `max(2, floor(min(window × 0.20, 32768)))` | 柔性提醒在有效边界前的提前量；已用 token 触发值为 `B - 提前量` |
 | `LEDGER_CONTEXT_URGENT_TOKENS` | `max(1, min(默认柔性提醒提前量 − 1, floor(min(window × 0.10, 16384))))` | 紧急提醒在有效边界前的提前量；已用 token 触发值为 `B - 提前量` |
+| `LEDGER_CONTEXT_VOLUME_MIN_TOKENS` | `65536` | 体积提醒的最小间隔；间隔为 `max(该值, floor(window × 0.10))` |
 | `LEDGER_CONTEXT_LEDGER_TOKENS` | `4096` | Agent checkpoint 的估计 token 上限 |
 | `LEDGER_CONTEXT_DELTA_TOKENS` | `2048` | 累计 compaction delta 的估计 token 上限 |
 | `LEDGER_CONTEXT_READ_TOKENS` | `2048` | 单次历史查询/读取的默认总输出估计上限，包含图片估计；truncate: false 显式取消该次调用的裁剪 |
