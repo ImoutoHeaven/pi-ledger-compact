@@ -19,7 +19,7 @@ pi install -l .
 
 The package registers these model tools:
 
-- `checkpoint` saves a complete active ledger and returns its persistence scope and handoff state.
+- `checkpoint` saves a complete active ledger, written whole or as exact edits to the saved state, and returns its persistence scope and handoff state.
 - `history_search` finds literal text in selected history parts and returns source references and match coordinates.
 - `history_read` reads an entry, an original content block, one image, a tool exchange, neighboring log entries, or a batch of entry/image selections.
 - `history_list_items` browses filtered entries and checkpoint versions with bounded previews.
@@ -28,7 +28,9 @@ The package registers these model tools:
 
 ## Checkpoints and recovery
 
-Call `checkpoint` with the complete current working state in `ledger` and optional `sourceQuotes`: case-sensitive phrases copied from source messages, ordered by recovery priority. Matching treats whitespace runs as equivalent and ignores a quote's leading and trailing whitespace; letters, punctuation and word boundaries retain their literal meaning. Essential facts and constraints belong in the ledger. A successful save replaces the baseline for subsequent compaction and its entire source list; omitting `sourceQuotes` saves an empty list. Earlier versions remain in history. The receipt reports the saved entry, ledger size, storage, and each quote's `matched`, `ambiguous`, or `unmatched` result. Pi controls compaction timing.
+Call `checkpoint` with the complete current working state in `ledger` and optional `sourceQuotes`: case-sensitive phrases copied from source messages, ordered by recovery priority. Matching treats whitespace runs as equivalent and ignores a quote's leading and trailing whitespace; letters, punctuation and word boundaries retain their literal meaning. Essential facts and constraints belong in the ledger. A successful save replaces the baseline for subsequent compaction and its entire source list; omitting `sourceQuotes` saves an empty list. Earlier versions remain in history.
+
+Alternatively, call `checkpoint` with `edits: [{ oldText, newText }]` instead of `ledger`. Edits change the saved state: the latest checkpoint ledger, followed by `## Folded compaction changes` and the current compaction delta when one exists. Every `oldText` occurs exactly once in that text, all edits match the same original text, and edits stay disjoint; a failed match returns the saved state text with the error. The edited text becomes the new checkpoint ledger under the same size limits, so a save after compaction folds the delta into the checkpoint. With `edits`, omitting `sourceQuotes` keeps the saved checkpoint references followed by the delta references, up to 8; supplied quotes replace them. The receipt reports the saved entry, ledger size, storage, and each quote's `matched`, `ambiguous`, or `unmatched` result. Pi controls compaction timing.
 
 Quotes resolve at save time against original user, assistant and ordinary tool messages on the current branch through the generating request snapshot, with context edits applied. Each quote records its total matching entry count and the first four candidates in chronological order, including IDs, edit provenance and first match offsets. Ambiguous and unmatched quotes accompany a successful ledger save. The agent determines relevance; the extension supplies literal locators.
 

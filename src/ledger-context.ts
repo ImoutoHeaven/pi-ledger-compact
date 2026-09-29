@@ -38,14 +38,20 @@ export const MAX_HISTORY_READ_LENGTH = 65_536;
 export const MAX_HISTORY_SEARCH_SNIPPET_LENGTH = 256;
 export const MAX_HISTORY_QUERY_DISPLAY_LENGTH = 128;
 const LEDGER_CONTENTS = "goal and status; constraints and decisions still in force; what was done and what was verified, with evidence; the next step or what you are waiting for; where to find evidence (paths, pi://entry IDs); useful skills (or none)";
-const CHECKPOINT_LEDGER_GUIDELINES = `Write the ledger as your complete current working state: ${LEDGER_CONTENTS}. Each save replaces the previous checkpoint, so carry over everything still needed from it, from the compaction delta and from recent work. Keep plans apart from finished work, and redact secrets.`;
+const CHECKPOINT_LEDGER_GUIDELINES = `Write the ledger as your complete current working state: ${LEDGER_CONTENTS}. Save it whole with ledger, carrying over everything still needed from the previous checkpoint, the compaction changes and recent work; or change parts of the saved state with edits, which keep all other text and the saved sourceQuotes. Keep plans apart from finished work, and redact secrets.`;
+/** Separates the checkpoint text from folded compaction changes in the text that checkpoint edits change. */
+const FOLDED_CHANGES_HEADING = "## Folded compaction changes";
 
 const checkpointParameters = Type.Object({
-	ledger: Type.String({ minLength: 1, description: "Your complete current working state. At most 65536 UTF-8 bytes and the configured token budget." }),
+	ledger: Type.Optional(Type.String({ minLength: 1, description: "Your complete current working state, replacing the saved one. At most 65536 UTF-8 bytes and the configured token budget. Use either ledger or edits." })),
+	edits: Type.Optional(Type.Array(Type.Object({ oldText: Type.String({ minLength: 1 }), newText: Type.String() }, { additionalProperties: false }), {
+		minItems: 1,
+		description: `Exact replacements in the saved state: the latest checkpoint ledger, followed by "${FOLDED_CHANGES_HEADING}" and the compaction changes when a compaction happened after it. Each oldText must occur exactly once in that text; all edits match the same original text and must not overlap. Use either ledger or edits.`,
+	})),
 	sourceQuotes: Type.Optional(
 		Type.Array(Type.String({ minLength: 1, maxLength: MAX_SOURCE_QUOTE_LENGTH }), {
 			maxItems: MAX_SOURCE_REFERENCES,
-			description: "Exact phrases copied from earlier messages that locate key evidence, most important first. Case-sensitive; any whitespace run matches any other. Replaces the previous list. Unmatched phrases are reported and the save still succeeds.",
+			description: "Exact phrases copied from earlier messages that locate key evidence, most important first. Case-sensitive; any whitespace run matches any other. Replaces the saved list; when omitted, ledger saves an empty list and edits keep the saved list. Unmatched phrases are reported and the save still succeeds.",
 		}),
 	),
 }, { additionalProperties: false });
@@ -2815,21 +2821,58 @@ function parseDeltaOutput(output: string): { ledger: string; selectors: SourceSe
 	return { ledger: output.slice(0, start).trim(), selectors };
 }
 
+/** The text checkpoint edits change: the checkpoint ledger plus the compaction changes shown after it in recovery. */
+function savedStateText(state: SessionState): string | undefined {
+	const parts = [state.checkpoint?.data.ledger, state.delta && `${FOLDED_CHANGES_HEADING}\n${state.delta.data.ledger}`].filter((part) => part !== undefined);
+	return parts.length > 0 ? parts.join("\n\n") : undefined;
+}
+
+function applyLedgerEdits(base: string, input: unknown): string {
+	// Array.from turns sparse holes into undefined so every position is validated.
+	const edits = Array.isArray(input) ? Array.from(input) : [];
+	if (edits.length === 0 || !edits.every((edit) => edit && typeof edit === "object" && Object.keys(edit).every((key) => key === "oldText" || key === "newText") &&
+		typeof edit.oldText === "string" && edit.oldText.length > 0 && typeof edit.newText === "string")) {
+		throw validationError("edits must be a non-empty list of { oldText, newText } with non-empty oldText");
+	}
+	const failure = (message: string) => validationError(`${message}. The saved state these edits change:\n${base}`);
+	const ranges = edits.map(({ oldText, newText }: { oldText: string; newText: string }, index) => {
+		const start = base.indexOf(oldText);
+		if (start < 0) throw failure(`edits[${index}].oldText was not found`);
+		if (base.indexOf(oldText, start + 1) >= 0) throw failure(`edits[${index}].oldText occurs more than once; include more surrounding text`);
+		return { start, end: start + oldText.length, newText, index };
+	}).sort((a, b) => a.start - b.start);
+	for (let i = 1; i < ranges.length; i++) {
+		if (ranges[i].start < ranges[i - 1].end) throw failure(`edits[${ranges[i - 1].index}] and edits[${ranges[i].index}] overlap; merge them into one edit`);
+	}
+	return ranges.reduceRight((text, range) => text.slice(0, range.start) + range.newText + text.slice(range.end), base);
+}
+
 function validateCheckpoint(
 	params: CheckpointParameters,
 	state: SessionState,
 	entries: SessionEntry[],
 ): { data: AgentCheckpoint; estimatedLedgerTokens: number; ledgerBytes: number; ledgerTokenLimit: number } {
-	if (!params || typeof params.ledger !== "string" || params.ledger.trim().length === 0) {
-		throw validationError("ledger must be a non-empty string");
+	if (!params || typeof params !== "object") throw validationError("parameters must be an object");
+	if (Object.keys(params).some((key) => key !== "ledger" && key !== "edits" && key !== "sourceQuotes")) throw validationError("unsupported checkpoint parameter");
+	const editMode = params.edits !== undefined;
+	if (editMode === (params.ledger !== undefined)) throw validationError("provide either ledger (the complete state) or edits (changes to the saved state)");
+	let ledger: string;
+	if (editMode) {
+		const base = savedStateText(state);
+		if (base === undefined) throw validationError("edits need a saved checkpoint or compaction changes; save a complete ledger first");
+		ledger = applyLedgerEdits(base, params.edits);
+	} else {
+		if (typeof params.ledger !== "string") throw validationError("ledger must be a non-empty string");
+		ledger = params.ledger;
 	}
+	if (ledger.trim().length === 0) throw validationError("ledger must be a non-empty string");
 	const ledgerTokenLimit = positiveIntegerEnv("LEDGER_CONTEXT_LEDGER_TOKENS", DEFAULT_LEDGER_TOKEN_LIMIT);
-	const ledgerBytes = utf8Bytes(params.ledger);
-	const estimatedLedgerTokens = ledgerTokenEstimate(params.ledger);
-	const capacityError = ledgerCapacityError(params.ledger, ledgerTokenLimit);
-	if (capacityError) throw validationError(capacityError);
-
-	if (Object.keys(params).some((key) => key !== "ledger" && key !== "sourceQuotes")) throw validationError("unsupported checkpoint parameter");
+	const ledgerBytes = utf8Bytes(ledger);
+	const estimatedLedgerTokens = ledgerTokenEstimate(ledger);
+	const capacityError = ledgerCapacityError(ledger, ledgerTokenLimit);
+	if (capacityError) {
+		throw validationError(editMode ? `${capacityError} after the edits (${estimatedLedgerTokens} estimated tokens); shorten it with more edits or save a complete ledger` : capacityError);
+	}
 	const sourceQuotes = params.sourceQuotes ?? [];
 	if (!Array.isArray(sourceQuotes) || sourceQuotes.length > MAX_SOURCE_REFERENCES || sourceQuotes.some((quote) => !validSourceSelector({ quote }))) {
 		throw validationError(`sourceQuotes must contain at most ${MAX_SOURCE_REFERENCES} non-empty source phrases of at most ${MAX_SOURCE_QUOTE_LENGTH} characters`);
@@ -2844,8 +2887,10 @@ function validateCheckpoint(
 		data: {
 			schemaVersion: LEDGER_SCHEMA_VERSION,
 			kind: "agent-checkpoint",
-			ledger: params.ledger,
-			sourceReferences: resolveSourceReferences(sourceQuotes.map((quote) => ({ quote })), entries.slice(0, positionStartIndex(entries, requestHistoryPosition))),
+			ledger,
+			sourceReferences: editMode && params.sourceQuotes === undefined
+				? [...(state.checkpoint?.data.sourceReferences ?? []), ...(state.delta?.data.sourceReferences ?? [])].slice(0, MAX_SOURCE_REFERENCES)
+				: resolveSourceReferences(sourceQuotes.map((quote) => ({ quote })), entries.slice(0, positionStartIndex(entries, requestHistoryPosition))),
 			requestHistoryPosition,
 			sourceWindowId: state.activeWindowId,
 			inputCoverage: { measurement: "unmeasured", source: "agent-context", snapshotThrough: requestHistoryPosition.entryId, recoveryBasis: state.currentAgentRequest.recoveryBasis },
@@ -3264,7 +3309,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 	pi.registerTool({
 		name: "checkpoint",
 		label: "Checkpoint",
-		description: "Save your complete working state. After context compaction you resume from the latest checkpoint plus an automatic summary of later changes. Each save replaces the previous checkpoint; older versions stay in history.",
+		description: "Save your complete working state, whole (ledger) or as exact edits to the saved state (edits). After context compaction you resume from the latest checkpoint plus an automatic summary of later changes. Each save becomes the new checkpoint; older versions stay in history.",
 		promptSnippet: "save your working state for recovery after compaction",
 		promptGuidelines: [
 			`checkpoint: ${CHECKPOINT_LEDGER_GUIDELINES}`,

@@ -87,6 +87,64 @@ test("checkpoint source quotes resolve snapshot evidence without blocking saves 
 	assert.deepEqual((checkpointEntries(manager.getBranch()).at(-1)!.data as any).sourceReferences, []);
 });
 
+test("checkpoint edits change the saved state, fold compaction changes and keep saved references", async (t) => {
+	const fixture = await createFixture(true, [], 1, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager: manager, faux, ledgerFaux } = fixture;
+	const receipts = () => messageEntries(manager.getBranch()).filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "checkpoint").map(toolResultText);
+	const save = async (...calls: Parameters<typeof fauxToolCall>[1][]) => {
+		faux.setResponses([fauxAssistantMessage(calls.map((args) => fauxToolCall("checkpoint", args))), fauxAssistantMessage("saved")]);
+		await session.prompt("Save working state.");
+	};
+
+	await save({ edits: [{ oldText: "a", newText: "b" }] });
+	assert.match(receipts().at(-1)!, /save a complete ledger first/);
+	manager.appendMessage({ role: "user", content: "Keep the checkpoint-quoted constraint.", timestamp: Date.now() });
+	await save({ ledger: "Goal: ship.\nNext: run tests.\nDecision: keep API.", sourceQuotes: ["checkpoint-quoted constraint"] });
+	const deltaSource = manager.appendMessage({ role: "user", content: "Tests passed on Linux.", timestamp: Date.now() });
+	manager.appendMessage(fauxAssistantMessage("observed work ".repeat(100)));
+	ledgerFaux.setResponses([fauxAssistantMessage(`Tests passed on Linux.\n<source-references>${JSON.stringify([{ entryId: deltaSource }])}</source-references>`)]);
+	await session.compact();
+	const previous = checkpointEntries(manager.getBranch()).at(-1)!.data as any;
+	const delta = generatedDelta(latestCompaction(manager.getBranch()));
+
+	const before = checkpointEntries(manager.getBranch()).length;
+	await save(
+		{ ledger: "Both modes.", edits: [{ oldText: "Goal", newText: "Aim" }] },
+		{ edits: [{ oldText: "absent text", newText: "x" }] },
+		{ edits: [{ oldText: "e", newText: "x" }] },
+		{ edits: [{ oldText: "Goal: ship.", newText: "x" }, { oldText: "ship.\nNext", newText: "y" }] },
+	);
+	assert.equal(checkpointEntries(manager.getBranch()).length, before);
+	const failures = receipts().slice(-4);
+	assert.match(failures[0], /either ledger .* or edits/);
+	assert.match(failures[1], /edits\[0\]\.oldText was not found/);
+	assert.match(failures[1], /Decision: keep API\.[\s\S]*Folded compaction changes[\s\S]*Tests passed on Linux/, "a failed match shows the text it edits");
+	assert.match(failures[2], /occurs more than once/);
+	assert.match(failures[3], /overlap/);
+
+	await save({ edits: [{ oldText: "Next: run tests.", newText: "Next: release." }] });
+	const edited = checkpointEntries(manager.getBranch()).at(-1)!.data as any;
+	assert.equal(edited.ledger, "Goal: ship.\nNext: release.\nDecision: keep API.\n\n## Folded compaction changes\nTests passed on Linux.");
+	assert.deepEqual(edited.sourceReferences, [...previous.sourceReferences, ...delta.sourceReferences]);
+	await session.reload();
+	manager.appendMessage({ role: "user", content: "Release started.", timestamp: Date.now() });
+	manager.appendMessage(fauxAssistantMessage("release work ".repeat(100)));
+	ledgerFaux.setResponses([fauxAssistantMessage("Release started.")]);
+	await session.compact();
+	const recovery = latestCompaction(manager.getBranch()).summary;
+	assert.match(recovery, /Next: release\.[\s\S]*Folded compaction changes\nTests passed on Linux\.[\s\S]*## Changes after the checkpoint[\s\S]*Release started\./);
+
+	await save({ edits: [{ oldText: "Decision: keep API.", newText: "Decision: keep API v2." }], sourceQuotes: ["Release started."] });
+	const quoted = checkpointEntries(manager.getBranch()).at(-1)!.data as any;
+	assert.match(quoted.ledger, /keep API v2\.[\s\S]*Tests passed on Linux\.\n\n## Folded compaction changes\nRelease started\.$/);
+	assert.deepEqual(quoted.sourceReferences.map((reference: any) => reference.quote), ["Release started."]);
+	// SDK callers bypass the model-facing schema; a sparse edit list must not save an unchanged checkpoint.
+	const checkpointTool = session.getToolDefinition("checkpoint")!;
+	await assert.rejects(checkpointTool.execute("sparse-edits", { edits: new Array(1) } as never, undefined, undefined, { sessionManager: manager } as never), /edits must be a non-empty list/);
+	assert.equal((checkpointEntries(manager.getBranch()).at(-1)!.data as any).ledger, quoted.ledger);
+});
+
 /** Parses the recovery summary's later-events range. */
 function laterEvents(summary: string): { fromEntryId: string | null; toEntryId: string | null } {
 	const match = /Events after the saved state: entries (\S+) to (\S+)\./.exec(summary);
@@ -838,7 +896,7 @@ test("packed package installs and loads through the public pi package manager", 
 		const checkpointTool = session.getAllTools().find((tool) => tool.name === "checkpoint");
 		assert.ok(checkpointTool);
 		const checkpointGuidance = JSON.stringify(checkpointTool.promptGuidelines);
-		for (const phrase of ["important decisions", "complete current working state", "goal and status", "constraints and decisions", "verified, with evidence", "next step", "where to find evidence", "skills (or none)", "replaces the previous checkpoint", "compaction delta", "plans apart from finished work", "redact secrets"]) {
+		for (const phrase of ["important decisions", "complete current working state", "goal and status", "constraints and decisions", "verified, with evidence", "next step", "where to find evidence", "skills (or none)", "carrying over everything still needed", "compaction changes", "edits, which keep all other text", "plans apart from finished work", "redact secrets"]) {
 			assert.ok(checkpointGuidance.includes(phrase), `checkpoint guidance must include ${phrase}`);
 		}
 		let historySearchResult: Extract<SessionEntry, { type: "message" }> | undefined;
