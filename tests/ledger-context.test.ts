@@ -100,7 +100,8 @@ test("checkpoint edits change the saved state, fold compaction changes and keep 
 	await save({ edits: [{ oldText: "a", newText: "b" }] });
 	assert.match(receipts().at(-1)!, /save a complete ledger first/);
 	manager.appendMessage({ role: "user", content: "Keep the checkpoint-quoted constraint.", timestamp: Date.now() });
-	await save({ ledger: "Goal: ship.\nNext: run tests.\nDecision: keep API.", sourceQuotes: ["checkpoint-quoted constraint"] });
+	// Strict function calling fills every parameter: the unused mode arrives as edits that change nothing, or as an empty ledger.
+	await save({ ledger: "Goal: ship.\nNext: run tests.\nDecision: keep API.", edits: [{ oldText: "unused", newText: "unused" }], sourceQuotes: ["checkpoint-quoted constraint"] });
 	const deltaSource = manager.appendMessage({ role: "user", content: "Tests passed on Linux.", timestamp: Date.now() });
 	manager.appendMessage(fauxAssistantMessage("observed work ".repeat(100)));
 	ledgerFaux.setResponses([fauxAssistantMessage(`Tests passed on Linux.\n<source-references>${JSON.stringify([{ entryId: deltaSource }])}</source-references>`)]);
@@ -110,20 +111,24 @@ test("checkpoint edits change the saved state, fold compaction changes and keep 
 
 	const before = checkpointEntries(manager.getBranch()).length;
 	await save(
+		{ ledger: "Both modes.", edits: false } as never,
+		{ ledger: "Unknown key.", unknownField: null } as never,
 		{ ledger: "Both modes.", edits: [{ oldText: "Goal", newText: "Aim" }] },
 		{ edits: [{ oldText: "absent text", newText: "x" }] },
 		{ edits: [{ oldText: "e", newText: "x" }] },
 		{ edits: [{ oldText: "Goal: ship.", newText: "x" }, { oldText: "ship.\nNext", newText: "y" }] },
 	);
 	assert.equal(checkpointEntries(manager.getBranch()).length, before);
-	const failures = receipts().slice(-4);
+	const [malformed, unknownKey, ...failures] = receipts().slice(-6);
+	assert.match(malformed, /edits has a value of the wrong type/);
+	assert.match(unknownKey, /unknownField/);
 	assert.match(failures[0], /either ledger .* or edits/);
 	assert.match(failures[1], /edits\[0\]\.oldText was not found/);
 	assert.match(failures[1], /Decision: keep API\.[\s\S]*Folded compaction changes[\s\S]*Tests passed on Linux/, "a failed match shows the text it edits");
 	assert.match(failures[2], /occurs more than once/);
 	assert.match(failures[3], /overlap/);
 
-	await save({ edits: [{ oldText: "Next: run tests.", newText: "Next: release." }] });
+	await save({ ledger: "", edits: [{ oldText: "Next: run tests.", newText: "Next: release." }], sourceQuotes: null } as never);
 	const edited = checkpointEntries(manager.getBranch()).at(-1)!.data as any;
 	assert.equal(edited.ledger, "Goal: ship.\nNext: release.\nDecision: keep API.\n\n## Folded compaction changes\nTests passed on Linux.");
 	assert.deepEqual(edited.sourceReferences, [...previous.sourceReferences, ...delta.sourceReferences]);
@@ -147,6 +152,22 @@ test("checkpoint edits change the saved state, fold compaction changes and keep 
 	assert.equal((checkpointEntries(manager.getBranch()).at(-1)!.data as any).ledger, quoted.ledger);
 	await save({ ledger: "State.\r\n\r\n## Folded compaction changes\r\nA.\r\n\r\n## Folded compaction changes\r\nB." });
 	assert.match(receipts().at(-1)!, /holds 2 "## Folded compaction changes" sections/, "CRLF headings count as sections");
+});
+
+test("a checkpoint saves when extensions finish binding while the request runs", async (t) => {
+	const fixture = await createFixture(true, [], 70, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager, faux } = fixture;
+	// Pi Web starts binding a subagent's extensions without awaiting it, so session_start can follow the request's context event.
+	faux.setResponses([
+		async () => {
+			await session.bindExtensions({ mode: "print", onError: collectExtensionError });
+			return fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Saved after late binding." }));
+		},
+		fauxAssistantMessage("saved"),
+	]);
+	await session.prompt("Save working state.");
+	assert.equal((checkpointEntries(sessionManager.getBranch()).at(-1)?.data as any)?.ledger, "Saved after late binding.");
 });
 
 /** Parses the recovery summary's later-events range. */
@@ -5593,6 +5614,30 @@ async function navigationCall(fixture: Awaited<ReturnType<typeof createFixture>>
 	return result;
 }
 
+test("history tools accept the null-filled arguments of strict function calling", async (t) => {
+	const fixture = await createFixture(false, [], 70, { compactionEnabled: false, extraToolNames: ["history_list_items", "history_list_windows"] });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const source = fixture.sessionManager.appendMessage({ role: "user", content: "Compaction cancelled during the probe.", timestamp: Date.now() });
+	// Argument shapes a model sent through an endpoint that enforces strict function calling: every parameter present, unused ones null.
+	const noFilter = { kinds: null, excludeKinds: null, toolNames: null, statuses: null, windowIds: null, afterEntryId: null, beforeEntryId: null, hasImage: null, includeMaintenance: null };
+	const calls: Array<[string, JsonObject, RegExp]> = [
+		["history_search", { truncate: true, cursor: null, limit: 20, order: "oldest", filter: { ...noFilter, includeMaintenance: true }, projection: "all", maxChars: 1000, query: "Compaction cancelled", queries: null, caseSensitive: false }, new RegExp(`entry: ${source}`)],
+		["history_read", { items: null, snapshotThrough: null, entryId: source, view: "entry", contentIndex: null, projection: "all", offset: null, length: null, before: null, after: null, truncate: false, cursor: null, limit: null, order: null }, /Compaction cancelled during the probe\./],
+		["history_list_items", { truncate: false, cursor: null, limit: 100, order: "newest", filter: { ...noFilter, kinds: ["user_input"] }, projection: "all", maxChars: 1000 }, new RegExp(`entry: ${source}`)],
+		["history_list_windows", { truncate: null, cursor: null, limit: null, order: null, filter: null }, /1 window/],
+	];
+	for (const [name, args, expected] of calls) {
+		const result = await navigationCall(fixture, name, args);
+		assert.notEqual((result.message as { isError?: boolean }).isError, true, `${name}: ${toolResultText(result)}`);
+		assert.match(toolResultText(result), expected, name);
+	}
+	// Pi coerces a malformed "", 0 or false toward null for a nullable parameter; such a value stays an error, as does null on an undeclared key.
+	for (const args of [{ filter: { kinds: 0 } }, { limit: "" }, { filter: { hasImage: "" } }, { unknownField: null }, { filter: { unknownField: null } }] as JsonObject[]) {
+		const result = await navigationCall(fixture, "history_list_items", args);
+		assert.equal((result.message as { isError?: boolean }).isError, true, JSON.stringify(args));
+	}
+});
+
 test("history navigation discovers checkpoint versions independently of recovery capacity", async (t) => {
 	const previous = process.env.LEDGER_CONTEXT_LEDGER_TOKENS;
 	process.env.LEDGER_CONTEXT_LEDGER_TOKENS = "64";
@@ -6858,7 +6903,7 @@ test("complete history outputs fit a budget equal to their own size", async (t) 
 	}
 });
 
-test("tool prompt text names its tool, stays within the static budget, and keeps the tools out of script calls", async (t) => {
+test("tool prompt text names its tool, stays within the static budget, declares null for omitted parameters, and keeps the tools out of script calls", async (t) => {
 	const fixture = await createFixture(false, [], 64, { compactionEnabled: false, extraToolNames: ["history_list_items", "history_list_windows", "get_context_remaining"] });
 	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
 	const names = ["checkpoint", "history_read", "history_search", "history_list_items", "history_list_windows", "get_context_remaining"];
@@ -6871,6 +6916,15 @@ test("tool prompt text names its tool, stays within the static budget, and keeps
 		chars += tool.description.length + (tool.promptGuidelines ?? []).join("").length + JSON.stringify(tool.parameters).length;
 	}
 	assert.ok(chars <= 15_000, `static tool prompt text grew to ${chars} characters`);
+	// Strict function calling requires every parameter; a model can leave one out only if its schema admits null.
+	const rejectsNull: string[] = [];
+	const visit = (schema: any, path: string, optional: boolean) => {
+		if (optional && !(schema.type.includes("null") && (!schema.enum || schema.enum.includes(null)))) rejectsNull.push(path);
+		for (const [key, property] of Object.entries(schema.properties ?? {})) visit(property, `${path}.${key}`, !(schema.required ?? []).includes(key));
+		if (schema.items) visit(schema.items, `${path}[]`, false);
+	};
+	for (const tool of tools) visit(tool.parameters, tool.name, false);
+	assert.deepEqual(rejectsNull, []);
 	// Maintenance detection reads model-issued calls, so scripts such as codemode cannot call these tools.
 	assert.deepEqual(names.filter((name) => fixture.session.getCallableToolNames().includes(name)), []);
 	assert.deepEqual(names.filter((name) => !fixture.session.getActiveToolNames().includes(name)), []);

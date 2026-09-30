@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
-import { StringEnum, Type, isRetryableAssistantError, type ModelsSimpleStreamOptions, type Static } from "@earendil-works/pi-ai";
+import { StringEnum, Type, isRetryableAssistantError, type ModelsSimpleStreamOptions, type Static, type TSchema } from "@earendil-works/pi-ai";
 import {
 	SessionManager,
 	SettingsManager,
@@ -42,13 +42,62 @@ const CHECKPOINT_LEDGER_GUIDELINES = `Write the ledger as your complete current 
 /** Separates the checkpoint text from folded compaction changes in the text that checkpoint edits change. */
 const FOLDED_CHANGES_HEADING = "## Folded compaction changes";
 
+/**
+ * An optional parameter that also accepts null. Endpoints that enforce strict function calling make
+ * every parameter required, so the model sends null for a parameter it leaves out; each tool's
+ * prepareArguments removes those nulls before pi validates the arguments.
+ */
+function optional<T extends TSchema>(schema: T) {
+	// A type list, unlike a union with null, keeps TypeBox conversion from turning invalid values into null.
+	const json = schema as unknown as { type: string; enum?: unknown[] };
+	return Type.Optional(Type.Unsafe<Static<T> | null>({ ...json, type: [json.type, "null"], ...(json.enum ? { enum: [...json.enum, null] } : {}) }));
+}
+
+type WithoutNulls<T> = T extends null ? never : T extends readonly (infer U)[] ? WithoutNulls<U>[] : T extends object ? { [K in keyof T]: WithoutNulls<T[K]> } : T;
+
+type ParameterSchema = { properties?: Record<string, ParameterSchema>; required?: string[]; items?: ParameterSchema };
+
+/** Removes null from declared optional parameters; other values, including undeclared keys, stay for pi's validation. */
+function withoutNulls(value: unknown, schema: ParameterSchema): unknown {
+	if (Array.isArray(value)) return schema.items ? value.map((item) => withoutNulls(item, schema.items!)) : value;
+	if (!value || typeof value !== "object" || !schema.properties) return value;
+	const properties = schema.properties;
+	return Object.fromEntries(Object.entries(value).flatMap(([key, item]) => {
+		if (!Object.hasOwn(properties, key)) return [[key, item]];
+		if (item === null && !schema.required?.includes(key)) return [];
+		return [[key, withoutNulls(item, properties[key])]];
+	}));
+}
+
+function preparedArguments<T extends TSchema>(schema: T) {
+	return (args: unknown) => withoutNulls(args, schema as ParameterSchema) as Static<T>;
+}
+
+/**
+ * pi's argument coercion turns a malformed "", 0 or false into null for a nullable parameter. Prepared
+ * arguments carry no nulls, so a null that reaches a tool marks such a value and is rejected.
+ */
+function preparedParameters<T>(params: T, error: (message: string) => Error): WithoutNulls<T> {
+	const nullPath = (value: unknown, path: string): string | undefined => {
+		if (value === null) return path;
+		if (!value || typeof value !== "object") return undefined;
+		for (const [key, item] of Object.entries(value)) {
+			const found = nullPath(item, path ? `${path}.${key}` : key);
+			if (found) return found;
+		}
+		return undefined;
+	};
+	const path = nullPath(params, "");
+	if (path !== undefined) throw error(`${path} has a value of the wrong type`);
+	return params as WithoutNulls<T>;
+}
+
 const checkpointParameters = Type.Object({
-	ledger: Type.Optional(Type.String({ minLength: 1, description: "Your complete current working state, replacing the saved one. At most 65536 UTF-8 bytes and the configured token budget. Use either ledger or edits." })),
-	edits: Type.Optional(Type.Array(Type.Object({ oldText: Type.String({ minLength: 1 }), newText: Type.String() }, { additionalProperties: false }), {
-		minItems: 1,
+	ledger: optional(Type.String({ description: "Your complete current working state, replacing the saved one. At most 65536 UTF-8 bytes and the configured token budget. Use either ledger or edits." })),
+	edits: optional(Type.Array(Type.Object({ oldText: Type.String({ minLength: 1 }), newText: Type.String() }, { additionalProperties: false }), {
 		description: `Exact replacements in the saved state: the latest checkpoint ledger, followed by "${FOLDED_CHANGES_HEADING}" and the compaction changes when a compaction happened after it. Each oldText must occur exactly once in that text; all edits match the same original text and must not overlap. Each compaction folded in this way adds one section; merge several folded sections with a complete ledger. Use either ledger or edits.`,
 	})),
-	sourceQuotes: Type.Optional(
+	sourceQuotes: optional(
 		Type.Array(Type.String({ minLength: 1, maxLength: MAX_SOURCE_QUOTE_LENGTH }), {
 			maxItems: MAX_SOURCE_REFERENCES,
 			description: "Exact phrases copied from earlier messages that locate key evidence, most important first. Case-sensitive; any whitespace run matches any other. Replaces the saved list; when omitted, ledger saves an empty list and edits keep the saved list. Unmatched phrases are reported and the save still succeeds.",
@@ -61,67 +110,67 @@ type HistoryKind = typeof HISTORY_KINDS[number];
 type HistoryPageTool = "history_search" | "history_list_items" | "history_list_windows" | "history_read";
 const historyKindSchema = StringEnum(["user_input", "assistant_text", "tool_call", "tool_result", "checkpoint", "compaction_delta", "metadata"] as const);
 const historyFilterSchema = Type.Object({
-	kinds: Type.Optional(Type.Array(historyKindSchema, { minItems: 1, maxItems: 7 })),
-	excludeKinds: Type.Optional(Type.Array(historyKindSchema, { minItems: 1, maxItems: 7 })),
-	toolNames: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 32, description: "Exact tool names; matches their calls and results." })),
-	statuses: Type.Optional(Type.Array(StringEnum(["received", "requested", "completed", "failed", "saved", "committed", "metadata"] as const), { minItems: 1, maxItems: 7 })),
-	windowIds: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 32, description: "Window IDs from history_list_windows." })),
-	afterEntryId: Type.Optional(Type.String({ minLength: 1, description: "Only entries after this entry." })),
-	beforeEntryId: Type.Optional(Type.String({ minLength: 1, description: "Only entries before this entry." })),
-	hasImage: Type.Optional(Type.Boolean({ description: "Only entries with (true) or without (false) images." })),
-	includeMaintenance: Type.Optional(Type.Boolean({ description: "Include checkpoint, history and context-budget tool traffic (default false)." })),
+	kinds: optional(Type.Array(historyKindSchema, { minItems: 1, maxItems: 7 })),
+	excludeKinds: optional(Type.Array(historyKindSchema, { minItems: 1, maxItems: 7 })),
+	toolNames: optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 32, description: "Exact tool names; matches their calls and results." })),
+	statuses: optional(Type.Array(StringEnum(["received", "requested", "completed", "failed", "saved", "committed", "metadata"] as const), { minItems: 1, maxItems: 7 })),
+	windowIds: optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 32, description: "Window IDs from history_list_windows." })),
+	afterEntryId: optional(Type.String({ minLength: 1, description: "Only entries after this entry." })),
+	beforeEntryId: optional(Type.String({ minLength: 1, description: "Only entries before this entry." })),
+	hasImage: optional(Type.Boolean({ description: "Only entries with (true) or without (false) images." })),
+	includeMaintenance: optional(Type.Boolean({ description: "Include checkpoint, history and context-budget tool traffic (default false)." })),
 }, { additionalProperties: false, description: "Fields combine with AND, values within a field with OR; excludeKinds overrides kinds." });
 const historyProjectionSchema = StringEnum(["references", "text", "images", "all"] as const, { description: "Output shape: all (text and image references, default), text, images (image references), references (entry metadata only)." });
 
 const historyPageFields = {
-	truncate: Type.Optional(Type.Boolean({ description: "false returns full text beyond the default output budget; explicit limit, maxChars and length still apply." })),
-	cursor: Type.Optional(Type.String({ minLength: 1, description: "nextCursor from the previous page; repeat the other arguments." })),
-	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_HISTORY_PAGE_SIZE, description: "Maximum results per page (default 20)." })),
-	order: Type.Optional(StringEnum(["newest", "oldest"] as const, { description: "Default newest; exchange and neighbors default to oldest." })),
+	truncate: optional(Type.Boolean({ description: "false returns full text beyond the default output budget; explicit limit, maxChars and length still apply." })),
+	cursor: optional(Type.String({ minLength: 1, description: "nextCursor from the previous page; repeat the other arguments." })),
+	limit: optional(Type.Integer({ minimum: 1, maximum: MAX_HISTORY_PAGE_SIZE, description: "Maximum results per page (default 20)." })),
+	order: optional(StringEnum(["newest", "oldest"] as const, { description: "Default newest; exchange and neighbors default to oldest." })),
 };
 
 const historyItemFields = {
 	...historyPageFields,
-	filter: Type.Optional(historyFilterSchema),
-	projection: Type.Optional(historyProjectionSchema),
-	maxChars: Type.Optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER, description: "Preview length per entry (default 256)." })),
+	filter: optional(historyFilterSchema),
+	projection: optional(historyProjectionSchema),
+	maxChars: optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER, description: "Preview length per entry (default 256)." })),
 };
 
 const historyListItemsParameters = Type.Object(historyItemFields, { additionalProperties: false });
-const historyListWindowsParameters = Type.Object({ ...historyPageFields, filter: Type.Optional(historyFilterSchema) }, { additionalProperties: false });
+const historyListWindowsParameters = Type.Object({ ...historyPageFields, filter: optional(historyFilterSchema) }, { additionalProperties: false });
 const historySearchParameters = Type.Object({
 	...historyItemFields,
-	query: Type.Optional(Type.String({ minLength: 1, description: "Literal text to find. Use either query or queries." })),
-	queries: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: MAX_HISTORY_SEARCH_QUERIES, description: "Several literal texts matched with OR (8192 UTF-8 bytes in total); each hit lists the zero-based indexes of the queries it matched." })),
-	caseSensitive: Type.Optional(Type.Boolean({ description: "Match letter case exactly (default false)." })),
+	query: optional(Type.String({ minLength: 1, description: "Literal text to find. Use either query or queries." })),
+	queries: optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: MAX_HISTORY_SEARCH_QUERIES, description: "Several literal texts matched with OR (8192 UTF-8 bytes in total); each hit lists the zero-based indexes of the queries it matched." })),
+	caseSensitive: optional(Type.Boolean({ description: "Match letter case exactly (default false)." })),
 }, { additionalProperties: false });
 const historyReadItemParameters = Type.Object({
 	entryId: Type.String({ minLength: 1 }),
-	view: Type.Optional(StringEnum(["entry", "image"] as const)),
-	contentIndex: Type.Optional(Type.Integer({ minimum: 0 })),
-	projection: Type.Optional(historyProjectionSchema),
-	offset: Type.Optional(Type.Integer({ minimum: 0 })),
-	length: Type.Optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })),
+	view: optional(StringEnum(["entry", "image"] as const)),
+	contentIndex: optional(Type.Integer({ minimum: 0 })),
+	projection: optional(historyProjectionSchema),
+	offset: optional(Type.Integer({ minimum: 0 })),
+	length: optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })),
 }, { additionalProperties: false });
 const historyReadParameters = Type.Object({
-	items: Type.Optional(Type.Array(historyReadItemParameters, { minItems: 1, maxItems: MAX_HISTORY_PAGE_SIZE, description: "view=many: entry or image reads, returned in order." })),
-	snapshotThrough: Type.Optional(Type.String({ minLength: 1, description: "view=many continuation: copy from nextRead." })),
-	entryId: Type.Optional(Type.String({ minLength: 1, description: "Entry to read; view=many uses items instead." })),
-	view: Type.Optional(StringEnum(["entry", "image", "exchange", "neighbors", "many"] as const, { description: "entry (default): paged text. image: one image block. exchange: a tool call with its results. neighbors: surrounding log entries. many: several reads via items." })),
-	contentIndex: Type.Optional(Type.Integer({ minimum: 0, description: "Content block index: required for image; selects one block for entry and one call for exchange." })),
-	projection: Type.Optional(historyProjectionSchema),
-	offset: Type.Optional(Type.Integer({ minimum: 0, description: "view=entry: start position in UTF-16 units (default 0)." })),
-	length: Type.Optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER, description: "view=entry: UTF-16 units to return (default 65536; truncate=false returns the rest)." })),
-	before: Type.Optional(Type.Integer({ minimum: 0, maximum: 20, description: "view=neighbors: entries before the anchor (default 2)." })),
-	after: Type.Optional(Type.Integer({ minimum: 0, maximum: 20, description: "view=neighbors: entries after the anchor (default 2)." })),
+	items: optional(Type.Array(historyReadItemParameters, { minItems: 1, maxItems: MAX_HISTORY_PAGE_SIZE, description: "view=many: entry or image reads, returned in order." })),
+	snapshotThrough: optional(Type.String({ minLength: 1, description: "view=many continuation: copy from nextRead." })),
+	entryId: optional(Type.String({ minLength: 1, description: "Entry to read; view=many uses items instead." })),
+	view: optional(StringEnum(["entry", "image", "exchange", "neighbors", "many"] as const, { description: "entry (default): paged text. image: one image block. exchange: a tool call with its results. neighbors: surrounding log entries. many: several reads via items." })),
+	contentIndex: optional(Type.Integer({ minimum: 0, description: "Content block index: required for image; selects one block for entry and one call for exchange." })),
+	projection: optional(historyProjectionSchema),
+	offset: optional(Type.Integer({ minimum: 0, description: "view=entry: start position in UTF-16 units (default 0)." })),
+	length: optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER, description: "view=entry: UTF-16 units to return (default 65536; truncate=false returns the rest)." })),
+	before: optional(Type.Integer({ minimum: 0, maximum: 20, description: "view=neighbors: entries before the anchor (default 2)." })),
+	after: optional(Type.Integer({ minimum: 0, maximum: 20, description: "view=neighbors: entries after the anchor (default 2)." })),
 	...historyPageFields,
 }, { additionalProperties: false });
 
-type CheckpointParameters = Static<typeof checkpointParameters>;
-type HistoryReadParameters = Static<typeof historyReadParameters>;
-type HistoryListItemsParameters = Static<typeof historyListItemsParameters>;
-type HistoryListWindowsParameters = Static<typeof historyListWindowsParameters>;
-type HistoryFilter = Static<typeof historyFilterSchema>;
+type CheckpointParameters = WithoutNulls<Static<typeof checkpointParameters>>;
+type HistoryReadParameters = WithoutNulls<Static<typeof historyReadParameters>>;
+type HistoryListItemsParameters = WithoutNulls<Static<typeof historyListItemsParameters>>;
+type HistoryListWindowsParameters = WithoutNulls<Static<typeof historyListWindowsParameters>>;
+type HistoryFilter = WithoutNulls<Static<typeof historyFilterSchema>>;
 type HistoryProjection = "references" | "text" | "images" | "all";
 type ContextMessage = Parameters<typeof convertToLlm>[0][number];
 type MessageLike = {
@@ -2870,6 +2919,9 @@ function validateCheckpoint(
 ): { data: AgentCheckpoint; estimatedLedgerTokens: number; ledgerBytes: number; ledgerTokenLimit: number } {
 	if (!params || typeof params !== "object") throw validationError("parameters must be an object");
 	if (Object.keys(params).some((key) => key !== "ledger" && key !== "edits" && key !== "sourceQuotes")) throw validationError("unsupported checkpoint parameter");
+	// Callers that must fill every parameter send an empty ledger, or edits that change nothing, for the unused mode.
+	if (typeof params.ledger === "string" && params.ledger.trim() === "") params = { ...params, ledger: undefined };
+	if (Array.isArray(params.edits) && Array.from(params.edits).every((edit) => edit && typeof edit === "object" && edit.oldText === edit.newText)) params = { ...params, edits: undefined };
 	const editMode = params.edits !== undefined;
 	if (editMode === (params.ledger !== undefined)) throw validationError("provide either ledger (the complete state) or edits (changes to the saved state)");
 	let ledger: string;
@@ -3236,7 +3288,10 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 	pi.on("session_start", async (_event, ctx) => {
 		const state = getState(ctx);
 		if (blockIfPersistenceUncertain(state, ctx)) return;
+		// Hosts may bind extensions while the first request is already running; its snapshot stays valid.
+		const request = state.currentAgentRequest;
 		hydrateState(state, ctx.sessionManager.getBranch(), ctx);
+		if (!state.recoveryError) state.currentAgentRequest = request;
 	});
 
 	pi.on("before_agent_start", async (_event, ctx) => {
@@ -3333,6 +3388,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 			"checkpoint: save after important decisions, user corrections and finished milestones, then continue the task. Put every essential fact in the ledger; sourceQuotes only point to evidence.",
 		],
 		parameters: checkpointParameters,
+		prepareArguments: preparedArguments(checkpointParameters),
 		executionMode: "sequential",
 		// Maintenance detection reads model-issued calls; script calls would hide checkpoints and history output as ordinary work.
 		exposure: "model-only",
@@ -3344,7 +3400,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 				);
 			}
 			const entries = ctx.sessionManager.getBranch();
-			const validated = validateCheckpoint(params, state, entries);
+			const validated = validateCheckpoint(preparedParameters(params, validationError), state, entries);
 			const saved = saveAgentCheckpoint(pi, ctx, state, validated.data);
 			const details: CheckpointReceiptDetails = {
 				...validated.data,
@@ -3386,12 +3442,13 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 			"history_read: use it when you know the entry ID (from a pi://entry reference, a search hit or a listing). Continue a long read with the returned nextRead, or nextCursor for exchange and neighbors.",
 		],
 		parameters: historyReadParameters,
+		prepareArguments: preparedArguments(historyReadParameters),
 		executionMode: "sequential",
 		// Maintenance detection reads model-issued calls; script calls would hide checkpoints and history output as ordinary work.
 		exposure: "model-only",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			try {
-				return await historyReadResult(params, ctx, _signal, _toolCallId);
+				return await historyReadResult(preparedParameters(params, historyValidationError), ctx, _signal, _toolCallId);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				throw message.startsWith("history validation failed:") || message.startsWith("history_output_capacity:") || message.startsWith("history_cursor_invalid:")
@@ -3410,12 +3467,13 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 			"history_search: use it when you need evidence but lack the entry ID, then read hits with history_read (entryId, plus contentIndex and offset from match).",
 		],
 		parameters: historySearchParameters,
+		prepareArguments: preparedArguments(historySearchParameters),
 		executionMode: "sequential",
 		// Maintenance detection reads model-issued calls; script calls would hide checkpoints and history output as ordinary work.
 		exposure: "model-only",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			try {
-				return historyItemsResult(params, ctx, _toolCallId);
+				return historyItemsResult(preparedParameters(params, historyValidationError), ctx, _toolCallId);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				throw message.startsWith("history validation failed:") || message.startsWith("history_output_capacity:") || message.startsWith("history_cursor_invalid:")
@@ -3432,11 +3490,12 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		promptSnippet: "browse history entries, checkpoints and deltas",
 		promptGuidelines: ["history_list_items: filter.kinds=[\"checkpoint\"] lists your saved checkpoints, [\"compaction_delta\"] the compaction deltas, [\"user_input\"] user requests."],
 		parameters: historyListItemsParameters,
+		prepareArguments: preparedArguments(historyListItemsParameters),
 		executionMode: "sequential",
 		// Maintenance detection reads model-issued calls; script calls would hide checkpoints and history output as ordinary work.
 		exposure: "model-only",
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-			return historyItemsResult(params, ctx, toolCallId, "history_list_items");
+			return historyItemsResult(preparedParameters(params, historyValidationError), ctx, toolCallId, "history_list_items");
 		},
 	});
 
@@ -3447,11 +3506,12 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		promptSnippet: "list context windows",
 		promptGuidelines: ["history_list_windows: use it to orient in a long session, then pass a windowId in filter.windowIds to history_list_items or history_search."],
 		parameters: historyListWindowsParameters,
+		prepareArguments: preparedArguments(historyListWindowsParameters),
 		executionMode: "sequential",
 		// Maintenance detection reads model-issued calls; script calls would hide checkpoints and history output as ordinary work.
 		exposure: "model-only",
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-			return historyWindowsResult(params, ctx, toolCallId);
+			return historyWindowsResult(preparedParameters(params, historyValidationError), ctx, toolCallId);
 		},
 	});
 

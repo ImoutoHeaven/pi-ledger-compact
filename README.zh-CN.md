@@ -26,7 +26,7 @@ pi install -l .
 - `history_list_windows` 提供窗口导航、过滤统计、用户措辞和 ledger 摘录。
 - `get_context_remaining` 返回模型余量、有效边界余量、输出预留、用量来源，以及最近一次 checkpoint 或 compaction 之后的新增工作量。
 
-这些工具使用 `exposure: "model-only"`：模型直接调用，`codemode.mode: "only"` 下同样如此；codemode 等脚本无法调用它们。维护活动识别和记录的请求位置依赖模型直接发出的调用。
+这些工具使用 `exposure: "model-only"`：模型直接调用，`codemode.mode: "only"` 下同样如此；codemode 等脚本无法调用它们。维护活动识别和记录的请求位置依赖模型直接发出的调用。所有可选参数也接受 `null`，表示省略，因此强制 strict 函数调用的端点也能省略参数。对于 `checkpoint`，空 `ledger` 或替换前后相同的 `edits` 同样视为未使用的模式。
 
 ## 检查点与恢复
 

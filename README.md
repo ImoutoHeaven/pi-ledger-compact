@@ -26,7 +26,7 @@ The package registers these model tools:
 - `history_list_windows` provides window navigation, filtered counts, user wording, and ledger excerpts.
 - `get_context_remaining` reports model headroom, effective-boundary headroom, output reserve, usage provenance, and new work since the latest checkpoint or compaction.
 
-The tools use `exposure: "model-only"`: the model calls them directly, including under `codemode.mode: "only"`, and scripts such as codemode cannot call them. Maintenance detection and the recorded request position rely on model-issued calls.
+The tools use `exposure: "model-only"`: the model calls them directly, including under `codemode.mode: "only"`, and scripts such as codemode cannot call them. Maintenance detection and the recorded request position rely on model-issued calls. Every optional parameter also accepts `null`, which means omitted, so endpoints that enforce strict function calling can leave parameters out. For `checkpoint`, an empty `ledger`, or `edits` whose replacements change nothing, also counts as the unused mode.
 
 ## Checkpoints and recovery
 
