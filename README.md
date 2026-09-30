@@ -4,7 +4,7 @@ Ledger Context preserves the main agent's checkpoints and separate cumulative co
 
 ## Requirements
 
-- Runtime baseline: `@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` `>=0.87.1 <0.88.0` with Node.js `>=22.19.0`; development and validation use 0.87.1.
+- Runtime baseline: `@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` `>=0.99.1 <0.100.0` with Node.js `>=22.19.0`; development and validation use 0.99.1.
 - Keep pi native automatic compaction enabled for automatic window changes. Pi owns the compaction threshold, session log, steering and follow-up queues, overflow retry, and compaction lifecycle.
 - Configure one compaction content extension per session. Ledger Context supplies the compaction summary and recovery bootstrap for each window.
 - All six model tools and manual `/compact` remain available when automatic compaction is disabled.
@@ -25,6 +25,8 @@ The package registers these model tools:
 - `history_list_items` browses filtered entries and checkpoint versions with bounded previews.
 - `history_list_windows` provides window navigation, filtered counts, user wording, and ledger excerpts.
 - `get_context_remaining` reports model headroom, effective-boundary headroom, output reserve, usage provenance, and new work since the latest checkpoint or compaction.
+
+The tools use `exposure: "model-only"`: the model calls them directly, including under `codemode.mode: "only"`, and scripts such as codemode cannot call them. Maintenance detection and the recorded request position rely on model-issued calls.
 
 ## Checkpoints and recovery
 
@@ -83,7 +85,7 @@ Reminders are one-time checkpoint requests scoped to their issuing window and ch
 
 A successful checkpoint fulfils reminder requests through its recorded history position. New work can trigger subsequent reminders within the same run. A budget level produces a notice once ordinary work exists after the latest checkpoint or compaction; context used by the save itself or by later maintenance leaves the level waiting for that work. Delivered budget levels remain deduplicated within their window across saves and reloads. A notice's level follows the current context pressure, including when only a volume reason is new. Reminders retain their custom identity in the log and Pi maps them to user messages, including when another extension forces the system prompt. Detailed measurements and source-entry ranges remain in metadata. Source selection excludes maintenance reminder records; request snapshot IDs may point to a reminder.
 
-Known native settings use the effective boundary `B = min(W - O, W - R)`, where `W` is the model window, `O` is the extension output reserve, and `R` is pi's native compaction reserve. Disabled or unknown native settings use `B = W - O` with window protection. The reminder settings are lead times before B. For `W=500000`, `O=16384`, and `R=27200`, `B=472800`; the default soft and urgent used-token triggers are `440032` (`B - 32768`) and `456416` (`B - 16384`), with lead times of `32768` and `16384` tokens.
+Model limits follow Pi's context usage: under a virtual model selection, the physical model and thinking level of the latest successful response in the effective context supply the window, output limits and delta request, and the delta request goes to that physical model directly; when the providers differ, it leaves out the credentials the host resolved for the virtual provider. When that response's provider and ID no longer name a registered physical model, the virtual selection, its declared limits and its thinking level apply. Known native settings use the effective boundary `B = min(W - O, W - R)`, where `W` is the model window, `O` is the extension output reserve, and `R` is pi's native compaction reserve. Disabled or unknown native settings use `B = W - O` with window protection. The reminder settings are lead times before B. For `W=500000`, `O=16384`, and `R=27200`, `B=472800`; the default soft and urgent used-token triggers are `440032` (`B - 32768`) and `456416` (`B - 16384`), with lead times of `32768` and `16384` tokens.
 
 The package reads native settings through the public `SettingsManager`, using the current working directory, agent directory, and project trust state. An SDK host can supply its actual settings through `settingsReader`. Here, `settingsManager` is the host's existing instance; include `ledgerExtension` in the `extensionFactories` constructor option of the host's resource loader:
 

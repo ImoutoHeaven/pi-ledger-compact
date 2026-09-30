@@ -1605,7 +1605,7 @@ test("long native run recovers twenty windows and reads its earliest operation",
 		firstCompactionResolve = resolve;
 	});
 	let firstCompactionObserved = false;
-	let steeringPromise: Promise<void> | undefined;
+	let steeringPromise: Promise<unknown> | undefined;
 	let historySearchContext: Context | undefined;
 	let historyReadContext: Context | undefined;
 	let finalContext: Context | undefined;
@@ -4917,6 +4917,64 @@ test("delta inherits the current main model and native request parameters", asyn
 	assert.equal(requests.length, 2);
 });
 
+test("a virtual model selection compacts with the delta sized for and sent to the routed physical model of the effective context", async (t) => {
+	const requests: Array<{ model: any; options: any }> = [];
+	const inspect = (pi: ExtensionAPI) => pi.on("session_start", (_event, ctx) => {
+		const stream = ctx.modelRegistry.streamSimple.bind(ctx.modelRegistry);
+		ctx.modelRegistry.streamSimple = (model, context, options) => {
+			if (getCurrentSystemPrompt(normalizeContext(context).messages).startsWith("Write the cumulative changes")) requests.push({ model, options });
+			return stream(model, context, options);
+		};
+	});
+	// Credentials the host resolved for the selected (virtual) provider.
+	const fixture = await createFixture(true, [inspect], 1, {
+		compactionEnabled: false,
+		requestOptionsReader: () => ({ transport: "sse", apiKey: "router-key", headers: { Authorization: "Bearer router" }, env: { ROUTER_TOKEN: "router" } }),
+	});
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, faux, ledgerFaux, sessionManager, modelRuntime } = fixture;
+	// Routing requires credentials for the physical provider; the faux provider has none.
+	modelRuntime.hasConfiguredAuth = () => true;
+	modelRuntime.registerVirtualModel({
+		provider: "router", id: "auto", name: "Auto", contextWindow: 64_000, maxTokens: 4_096, thinkingLevels: ["off", "low", "high"],
+		route: () => ({ model: faux.getModel(), thinkingLevel: "off" }),
+	});
+	const virtual = modelRuntime.getModel("router", "auto");
+	assert.ok(virtual);
+	await session.setModel(virtual);
+	session.setThinkingLevel("low");
+	const physical = `${faux.getModel().provider}/${faux.getModel().id}`;
+	const retiredResponse = () => ({ ...fauxAssistantMessage("retired model answer"), provider: faux.getModel().provider, model: "retired-model", thinkingLevel: "high" as const });
+	faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "virtual-selection ledger" })), fauxAssistantMessage("saved"), fauxAssistantMessage("work done ".repeat(200))]);
+	await session.prompt("Save the state.");
+	await session.prompt("Do more work.");
+	assert.equal(session.getContextUsage()?.contextWindow, faux.getModel().contextWindow, "Pi reports the routed physical model's limits");
+	// A later response omitted from the effective context does not choose the limits.
+	sessionManager.appendContextEdit(sessionManager.appendMessage(retiredResponse()), null);
+	ledgerFaux.setResponses([fauxAssistantMessage("Virtual-selection delta.")]);
+	await session.compact();
+	const compaction = latestCompaction(sessionManager.getBranch());
+	assert.equal(generatedDelta(compaction).ledger, "Virtual-selection delta.");
+	assert.match(compaction.summary, /virtual-selection ledger/);
+	assert.equal(`${requests[0].model.provider}/${requests[0].model.id}`, physical);
+	assert.equal(requests[0].options.transport, "sse");
+	assert.deepEqual([requests[0].options.apiKey, requests[0].options.headers, requests[0].options.env], [undefined, undefined, undefined],
+		"credentials for the virtual provider stay off the physical provider's request");
+
+	// A latest response whose provider and ID now name a virtual model, not a physical one, leaves the selection and its thinking level in charge.
+	modelRuntime.registerVirtualModel({ provider: faux.getModel().provider, id: "retired-model", name: "Retired", route: () => ({ model: faux.getModel(), thinkingLevel: "off" }) });
+	faux.setResponses([fauxAssistantMessage("work done ".repeat(200))]);
+	await session.prompt("Do further work.");
+	sessionManager.appendMessage(retiredResponse());
+	ledgerFaux.setResponses([fauxAssistantMessage("Second virtual-selection delta.")]);
+	await session.compact();
+	assert.equal(generatedDelta(latestCompaction(sessionManager.getBranch())).ledger, "Second virtual-selection delta.");
+	assert.equal(`${requests[1].model.provider}/${requests[1].model.id}`, "router/auto");
+	assert.equal(requests[1].options.reasoning, "low");
+	assert.equal(requests[1].options.apiKey, "router-key");
+	assert.equal(requests.length, 2);
+});
+
 test("delta failure diagnostics persist without entering model recovery or history output", async (t) => {
 	const fixture = await createFixture(true, [], 64, { compactionEnabled: false });
 	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
@@ -6800,7 +6858,7 @@ test("complete history outputs fit a budget equal to their own size", async (t) 
 	}
 });
 
-test("tool prompt text names its tool and stays within the static budget", async (t) => {
+test("tool prompt text names its tool, stays within the static budget, and keeps the tools out of script calls", async (t) => {
 	const fixture = await createFixture(false, [], 64, { compactionEnabled: false, extraToolNames: ["history_list_items", "history_list_windows", "get_context_remaining"] });
 	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
 	const names = ["checkpoint", "history_read", "history_search", "history_list_items", "history_list_windows", "get_context_remaining"];
@@ -6813,6 +6871,9 @@ test("tool prompt text names its tool and stays within the static budget", async
 		chars += tool.description.length + (tool.promptGuidelines ?? []).join("").length + JSON.stringify(tool.parameters).length;
 	}
 	assert.ok(chars <= 15_000, `static tool prompt text grew to ${chars} characters`);
+	// Maintenance detection reads model-issued calls, so scripts such as codemode cannot call these tools.
+	assert.deepEqual(names.filter((name) => fixture.session.getCallableToolNames().includes(name)), []);
+	assert.deepEqual(names.filter((name) => !fixture.session.getActiveToolNames().includes(name)), []);
 });
 
 test("extension handlers have no unexpected errors", () => {

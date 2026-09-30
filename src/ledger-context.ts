@@ -501,8 +501,24 @@ function activeToolSchemaTokens(pi: ExtensionAPI): number {
 	return ledgerTokenEstimate(safeJson(schemas));
 }
 
+/** Pi marks virtual model selections with this API; it does not export its isVirtualModel check. */
+const VIRTUAL_MODEL_API = "pi-virtual";
+
+/**
+ * The model whose limits apply, as in Pi's context usage: under a virtual selection, the physical
+ * model and thinking level of the latest successful response in the effective context. Without a
+ * registered physical model under that provider and ID, the selection and its own thinking level apply.
+ */
+function limitsModel(ctx: ExtensionContext) {
+	if (ctx.model?.api !== VIRTUAL_MODEL_API) return { model: ctx.model, thinkingLevel: undefined };
+	const latest = [...ctx.sessionManager.buildSessionProjection().messages].reverse().find((message) => message.role === "assistant" &&
+		message.stopReason !== "error" && message.stopReason !== "aborted");
+	const physical = latest?.role === "assistant" ? ctx.modelRegistry.find(latest.provider, latest.model) : undefined;
+	return physical && physical.api !== VIRTUAL_MODEL_API && latest?.role === "assistant" ? { model: physical, thinkingLevel: latest.thinkingLevel } : { model: ctx.model, thinkingLevel: undefined };
+}
+
 function modelMetadataTokens(ctx: ExtensionContext): number {
-	const model = ctx.model;
+	const model = limitsModel(ctx).model;
 	if (!model) return 0;
 	return ledgerTokenEstimate(
 		safeJson({
@@ -602,7 +618,7 @@ interface ReminderUsage {
 
 function reminderUsage(pi: ExtensionAPI, ctx: ExtensionContext, settingsReader?: LedgerContextSettingsReader): ReminderUsage | undefined {
 	const usage = ctx.getContextUsage();
-	const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
+	const contextWindow = usage?.contextWindow ?? limitsModel(ctx).model?.contextWindow ?? 0;
 	if (!Number.isFinite(contextWindow) || contextWindow <= 0) return undefined;
 	const usageKnown = usage?.tokens !== null && usage?.tokens !== undefined && Number.isFinite(usage.tokens) && usage.tokens >= 0;
 	let tokens: number;
@@ -2118,7 +2134,7 @@ function contextRemainingResult(pi: ExtensionAPI, ctx: ExtensionContext, state: 
 	const details = {
 		windowId: state.activeWindowId,
 		newWorkTokens,
-		contextWindowTokens: usage?.contextWindow ?? ctx.model?.contextWindow ?? null,
+		contextWindowTokens: usage?.contextWindow ?? limitsModel(ctx).model?.contextWindow ?? null,
 		usedTokens: usage?.tokens ?? null,
 		modelRemainingTokens: usage?.modelRemaining ?? null,
 		effectiveBoundaryTokens: usage?.boundaryTokens ?? null,
@@ -2627,7 +2643,7 @@ function collectReminderReasons(
 	const entries = ctx.sessionManager.getBranch();
 	const origin = volumeOrigin(state, entries);
 	const metric = volumeMeasurement(entries, positionStartIndex(entries, origin.position));
-	const contextWindow = ctx.model?.contextWindow ?? 0;
+	const contextWindow = limitsModel(ctx).model?.contextWindow ?? 0;
 	const minInterval = positiveIntegerEnv("LEDGER_CONTEXT_VOLUME_MIN_TOKENS", DEFAULT_VOLUME_REMINDER_MIN_TOKENS);
 	const interval = Number.isFinite(contextWindow) && contextWindow > 0 ? Math.max(minInterval, Math.floor(contextWindow * 0.10)) : undefined;
 	const bucket = interval === undefined ? 0 : Math.floor(metric.tokens / interval);
@@ -3007,7 +3023,7 @@ async function generateCompactionDelta(
 	readRequestOptions: () => ModelsSimpleStreamOptions,
 	failures: DeltaGenerationFailure[],
 ): Promise<DeltaSlot> {
-	const model = ctx.model;
+	const model = limitsModel(ctx).model;
 	let attempt = 0;
 	let requestOptions: ModelsSimpleStreamOptions | undefined;
 	const recordFailure = (stage: DeltaGenerationFailure["stage"], error: unknown, stopReason?: string) => failures.push({
@@ -3318,6 +3334,8 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		],
 		parameters: checkpointParameters,
 		executionMode: "sequential",
+		// Maintenance detection reads model-issued calls; script calls would hide checkpoints and history output as ordinary work.
+		exposure: "model-only",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const state = getState(ctx);
 			if (blockIfPersistenceUncertain(state, ctx)) {
@@ -3369,6 +3387,8 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		],
 		parameters: historyReadParameters,
 		executionMode: "sequential",
+		// Maintenance detection reads model-issued calls; script calls would hide checkpoints and history output as ordinary work.
+		exposure: "model-only",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			try {
 				return await historyReadResult(params, ctx, _signal, _toolCallId);
@@ -3391,6 +3411,8 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		],
 		parameters: historySearchParameters,
 		executionMode: "sequential",
+		// Maintenance detection reads model-issued calls; script calls would hide checkpoints and history output as ordinary work.
+		exposure: "model-only",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			try {
 				return historyItemsResult(params, ctx, _toolCallId);
@@ -3411,6 +3433,8 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		promptGuidelines: ["history_list_items: filter.kinds=[\"checkpoint\"] lists your saved checkpoints, [\"compaction_delta\"] the compaction deltas, [\"user_input\"] user requests."],
 		parameters: historyListItemsParameters,
 		executionMode: "sequential",
+		// Maintenance detection reads model-issued calls; script calls would hide checkpoints and history output as ordinary work.
+		exposure: "model-only",
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
 			return historyItemsResult(params, ctx, toolCallId, "history_list_items");
 		},
@@ -3424,6 +3448,8 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		promptGuidelines: ["history_list_windows: use it to orient in a long session, then pass a windowId in filter.windowIds to history_list_items or history_search."],
 		parameters: historyListWindowsParameters,
 		executionMode: "sequential",
+		// Maintenance detection reads model-issued calls; script calls would hide checkpoints and history output as ordinary work.
+		exposure: "model-only",
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
 			return historyWindowsResult(params, ctx, toolCallId);
 		},
@@ -3437,6 +3463,8 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		promptGuidelines: ["get_context_remaining: when tokensUntilBoundary runs low and there is new work since the latest checkpoint or compaction, save a checkpoint."],
 		parameters: Type.Object({}),
 		executionMode: "sequential",
+		// Maintenance detection reads model-issued calls; script calls would hide checkpoints and history output as ordinary work.
+		exposure: "model-only",
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			return contextRemainingResult(pi, ctx, getState(ctx), settingsReader);
 		},
@@ -3448,7 +3476,8 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 			if (blockIfPersistenceUncertain(state, ctx)) return { cancel: true };
 			if (event.signal.aborted) return { cancel: true };
 			const branch = event.branchEntries;
-			const budgets = contentBudgets(ctx.model?.contextWindow ?? 0);
+			const limits = limitsModel(ctx);
+			const budgets = contentBudgets(limits.model?.contextWindow ?? 0);
 			hydrateState(state, branch, ctx, false);
 			if (state.recoveryError) throw new Error(state.recoveryError);
 			const firstKeptEntryId = event.preparation.firstKeptEntryId;
@@ -3457,20 +3486,25 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 				`window:${ctx.sessionManager.getSessionId()}:${randomUUID()}`,
 				state.delta ? { status: "reused", sourceCompactionEntryId: state.delta.entryId } : { status: "empty" }, snapshotPosition);
 			let summary = renderBootstrap(branch, state, details, budgets, event.customInstructions);
-			const availableTokens = (ctx.model?.contextWindow ?? 0) - requestFixedTokens(pi, ctx) - budgets.outputReserveTokens;
+			const availableTokens = (limits.model?.contextWindow ?? 0) - requestFixedTokens(pi, ctx) - budgets.outputReserveTokens;
 			const generationLeaf = ctx.sessionManager.getLeafId();
 			const generationModel = ctx.model;
-			const thinkingLevel = ctx.thinkingLevel ?? pi.getThinkingLevel();
+			const thinkingLevel = limits.thinkingLevel ?? ctx.thinkingLevel ?? pi.getThinkingLevel();
 			const generationFailures: DeltaGenerationFailure[] = [];
 			const routingId = randomUUID();
 			const delta = await generateCompactionDelta(ctx, state.checkpoint, state.delta, branch, firstKeptEntryId,
 				Math.min(budgets.deltaTokens, availableTokens - ledgerTokenEstimate(summary) + ledgerTokenEstimate(state.delta?.data.ledger ?? "") - 256),
-				event.signal, event.customInstructions, () => ({
-					...(options.requestOptionsReader ?? defaultRequestOptions)(ctx),
-					reasoning: thinkingLevel === "off" ? undefined : thinkingLevel,
-					// Standalone summaries have their own routing ID, as in Pi's native compaction.
-					sessionId: routingId,
-				}), generationFailures);
+				event.signal, event.customInstructions, () => {
+					const requestOptions = (options.requestOptionsReader ?? defaultRequestOptions)(ctx);
+					const { apiKey: _apiKey, headers: _headers, env: _env, ...withoutAuth } = requestOptions;
+					return {
+						// As in Pi's virtual routing, credentials resolved for the selected provider stay with that provider.
+						...(limits.model?.provider === ctx.model?.provider ? requestOptions : withoutAuth),
+						reasoning: thinkingLevel === "off" ? undefined : thinkingLevel,
+						// Standalone summaries have their own routing ID, as in Pi's native compaction.
+						sessionId: routingId,
+					};
+				}, generationFailures);
 			event.signal.throwIfAborted();
 			if (ctx.sessionManager.getLeafId() !== generationLeaf || ctx.model !== generationModel) {
 				throw new Error("session branch or model changed during ledger generation");
