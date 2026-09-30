@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
-import { StringEnum, Type, isRetryableAssistantError, type ModelsSimpleStreamOptions, type Static, type TSchema } from "@earendil-works/pi-ai";
+import { StringEnum, Type, isRetryableAssistantError, type ModelsSimpleStreamOptions, type Static, type TSchema, type Usage } from "@earendil-works/pi-ai";
 import {
 	SessionManager,
 	SettingsManager,
@@ -57,20 +57,35 @@ type WithoutNulls<T> = T extends null ? never : T extends readonly (infer U)[] ?
 
 type ParameterSchema = { properties?: Record<string, ParameterSchema>; required?: string[]; items?: ParameterSchema };
 
-/** Removes null from declared optional parameters; other values, including undeclared keys, stay for pi's validation. */
-function withoutNulls(value: unknown, schema: ParameterSchema): unknown {
-	if (Array.isArray(value)) return schema.items ? value.map((item) => withoutNulls(item, schema.items!)) : value;
+/**
+ * Removes null from declared optional parameters and rejects null for required parameters and list
+ * items, which pi's argument conversion would otherwise turn into a string. Undeclared keys
+ * stay for pi's validation.
+ */
+function withoutNulls(value: unknown, schema: ParameterSchema, error: (message: string) => Error, path = ""): unknown {
+	if (Array.isArray(value)) {
+		const items = schema.items;
+		if (!items) return value;
+		return value.map((item, index) => {
+			if (item === null) throw error(`${path}[${index}] cannot be null`);
+			return withoutNulls(item, items, error, `${path}[${index}]`);
+		});
+	}
 	if (!value || typeof value !== "object" || !schema.properties) return value;
 	const properties = schema.properties;
 	return Object.fromEntries(Object.entries(value).flatMap(([key, item]) => {
 		if (!Object.hasOwn(properties, key)) return [[key, item]];
-		if (item === null && !schema.required?.includes(key)) return [];
-		return [[key, withoutNulls(item, properties[key])]];
+		const itemPath = path ? `${path}.${key}` : key;
+		if (item === null) {
+			if (schema.required?.includes(key)) throw error(`${itemPath} cannot be null`);
+			return [];
+		}
+		return [[key, withoutNulls(item, properties[key], error, itemPath)]];
 	}));
 }
 
-function preparedArguments<T extends TSchema>(schema: T) {
-	return (args: unknown) => withoutNulls(args, schema as ParameterSchema) as Static<T>;
+function preparedArguments<T extends TSchema>(schema: T, error: (message: string) => Error) {
+	return (args: unknown) => withoutNulls(args, schema as ParameterSchema, error) as Static<T>;
 }
 
 /**
@@ -564,6 +579,32 @@ function limitsModel(ctx: ExtensionContext) {
 		message.stopReason !== "error" && message.stopReason !== "aborted");
 	const physical = latest?.role === "assistant" ? ctx.modelRegistry.find(latest.provider, latest.model) : undefined;
 	return physical && physical.api !== VIRTUAL_MODEL_API && latest?.role === "assistant" ? { model: physical, thinkingLevel: latest.thinkingLevel } : { model: ctx.model, thinkingLevel: undefined };
+}
+
+function addUsage(first: Usage, second: Usage): Usage {
+	const optional = (key: "cacheWrite1h" | "reasoning") =>
+		first[key] === undefined && second[key] === undefined ? {} : { [key]: (first[key] ?? 0) + (second[key] ?? 0) };
+	return {
+		input: first.input + second.input,
+		output: first.output + second.output,
+		cacheRead: first.cacheRead + second.cacheRead,
+		cacheWrite: first.cacheWrite + second.cacheWrite,
+		...optional("cacheWrite1h"),
+		...optional("reasoning"),
+		totalTokens: first.totalTokens + second.totalTokens,
+		cost: {
+			input: first.cost.input + second.cost.input,
+			output: first.cost.output + second.cost.output,
+			cacheRead: first.cost.cacheRead + second.cost.cacheRead,
+			cacheWrite: first.cost.cacheWrite + second.cost.cacheWrite,
+			total: first.cost.total + second.cost.total,
+		},
+	};
+}
+
+/** A model limit, or Infinity while it is unknown: Pi records unset virtual model limits as 0. */
+function knownLimit(tokens: number | undefined): number {
+	return tokens !== undefined && Number.isFinite(tokens) && tokens > 0 ? tokens : Infinity;
 }
 
 function modelMetadataTokens(ctx: ExtensionContext): number {
@@ -3074,6 +3115,7 @@ async function generateCompactionDelta(
 	customInstructions: string | undefined,
 	readRequestOptions: () => ModelsSimpleStreamOptions,
 	failures: DeltaGenerationFailure[],
+	usages: Usage[],
 ): Promise<DeltaSlot> {
 	const model = limitsModel(ctx).model;
 	let attempt = 0;
@@ -3101,7 +3143,8 @@ async function generateCompactionDelta(
 	try {
 		signal.throwIfAborted();
 		requestOptions = { ...readRequestOptions(), signal, maxRetries: 0 };
-		const maxTokens = Math.min(deltaTokenLimit, model.maxTokens, Math.floor(model.contextWindow / 4));
+		const window = knownLimit(model.contextWindow);
+		const maxTokens = Math.min(deltaTokenLimit, knownLimit(model.maxTokens), Math.floor(window / 4));
 		if (maxTokens < 1) return failure("input-capacity");
 		const systemPrompt = [
 			"Write the cumulative changes since the main agent's checkpoint. Return only the delta text, without tool calls.",
@@ -3112,8 +3155,8 @@ async function generateCompactionDelta(
 			'Optionally end with a line <source-references>[{"entryId":"ID from the input","quote":"optional exact phrase"}]</source-references> listing up to 8 key sources, most important first. It replaces the previous list; leaving it out clears the list. Quotes are case-sensitive and at most 512 characters. Keep essential facts in the delta text itself.',
 			`Stay under ${maxTokens} estimated tokens and ${LEDGER_BYTE_LIMIT} UTF-8 bytes.`,
 		].join("\n");
-		const outputReserve = Math.min(requestOptions.maxTokens ?? model.maxTokens, Math.floor(model.contextWindow / 4));
-		const inputBudget = model.contextWindow - outputReserve - ledgerTokenEstimate(systemPrompt) - modelMetadataTokens(ctx) - 64;
+		const outputReserve = Math.min(requestOptions.maxTokens ?? knownLimit(model.maxTokens), Math.floor(window / 4));
+		const inputBudget = window === Infinity ? Infinity : window - outputReserve - ledgerTokenEstimate(systemPrompt) - modelMetadataTokens(ctx) - 64;
 		if (inputBudget < 1) return failure("input-capacity");
 		const references = [...(base?.data.sourceReferences ?? []), ...(previous?.data.sourceReferences ?? [])];
 		const bases = [
@@ -3157,7 +3200,7 @@ async function generateCompactionDelta(
 			const faithfulPrefix = cut > entries.map((entry) => entry.type).lastIndexOf("compaction") && (!base || prefixIds.has(base.entryId)) &&
 				!entries.slice(cut).some((entry) => entry.type === "context_edit" && prefixIds.has(entry.targetId));
 			// The next compaction's delta covers the tail Pi keeps verbatim.
-			if (faithfulPrefix) return await generateCompactionDelta(ctx, base, previous, entries.slice(0, cut), undefined, deltaTokenLimit, signal, customInstructions, () => requestOptions!, failures);
+			if (faithfulPrefix) return await generateCompactionDelta(ctx, base, previous, entries.slice(0, cut), undefined, deltaTokenLimit, signal, customInstructions, () => requestOptions!, failures, usages);
 			packet = pack(DELTA_TOOL_RESULT_CHARS);
 		}
 		if (ledgerTokenEstimate(packet.content) > inputBudget) return failure("input-capacity");
@@ -3183,6 +3226,7 @@ async function generateCompactionDelta(
 				if (!retryableLedgerError(error)) return failure("generation-failed");
 				continue;
 			}
+			if (result.usage) usages.push(result.usage);
 			signal.throwIfAborted();
 			if (result.stopReason === "aborted") {
 				recordFailure("provider", result.errorMessage ?? "Delta request aborted by provider", result.stopReason);
@@ -3388,7 +3432,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 			"checkpoint: save after important decisions, user corrections and finished milestones, then continue the task. Put every essential fact in the ledger; sourceQuotes only point to evidence.",
 		],
 		parameters: checkpointParameters,
-		prepareArguments: preparedArguments(checkpointParameters),
+		prepareArguments: preparedArguments(checkpointParameters, validationError),
 		executionMode: "sequential",
 		// Maintenance detection reads model-issued calls; script calls would hide checkpoints and history output as ordinary work.
 		exposure: "model-only",
@@ -3442,7 +3486,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 			"history_read: use it when you know the entry ID (from a pi://entry reference, a search hit or a listing). Continue a long read with the returned nextRead, or nextCursor for exchange and neighbors.",
 		],
 		parameters: historyReadParameters,
-		prepareArguments: preparedArguments(historyReadParameters),
+		prepareArguments: preparedArguments(historyReadParameters, historyValidationError),
 		executionMode: "sequential",
 		// Maintenance detection reads model-issued calls; script calls would hide checkpoints and history output as ordinary work.
 		exposure: "model-only",
@@ -3467,7 +3511,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 			"history_search: use it when you need evidence but lack the entry ID, then read hits with history_read (entryId, plus contentIndex and offset from match).",
 		],
 		parameters: historySearchParameters,
-		prepareArguments: preparedArguments(historySearchParameters),
+		prepareArguments: preparedArguments(historySearchParameters, historyValidationError),
 		executionMode: "sequential",
 		// Maintenance detection reads model-issued calls; script calls would hide checkpoints and history output as ordinary work.
 		exposure: "model-only",
@@ -3490,7 +3534,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		promptSnippet: "browse history entries, checkpoints and deltas",
 		promptGuidelines: ["history_list_items: filter.kinds=[\"checkpoint\"] lists your saved checkpoints, [\"compaction_delta\"] the compaction deltas, [\"user_input\"] user requests."],
 		parameters: historyListItemsParameters,
-		prepareArguments: preparedArguments(historyListItemsParameters),
+		prepareArguments: preparedArguments(historyListItemsParameters, historyValidationError),
 		executionMode: "sequential",
 		// Maintenance detection reads model-issued calls; script calls would hide checkpoints and history output as ordinary work.
 		exposure: "model-only",
@@ -3506,7 +3550,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		promptSnippet: "list context windows",
 		promptGuidelines: ["history_list_windows: use it to orient in a long session, then pass a windowId in filter.windowIds to history_list_items or history_search."],
 		parameters: historyListWindowsParameters,
-		prepareArguments: preparedArguments(historyListWindowsParameters),
+		prepareArguments: preparedArguments(historyListWindowsParameters, historyValidationError),
 		executionMode: "sequential",
 		// Maintenance detection reads model-issued calls; script calls would hide checkpoints and history output as ordinary work.
 		exposure: "model-only",
@@ -3546,11 +3590,15 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 				`window:${ctx.sessionManager.getSessionId()}:${randomUUID()}`,
 				state.delta ? { status: "reused", sourceCompactionEntryId: state.delta.entryId } : { status: "empty" }, snapshotPosition);
 			let summary = renderBootstrap(branch, state, details, budgets, event.customInstructions);
-			const availableTokens = (limits.model?.contextWindow ?? 0) - requestFixedTokens(pi, ctx) - budgets.outputReserveTokens;
+			// A virtual model without declared limits has an unknown window until its first response; the recovery
+			// text then keeps only its own caps, and the routed delta request fails if the evidence does not fit.
+			const window = knownLimit(limits.model?.contextWindow);
+			const availableTokens = window - requestFixedTokens(pi, ctx) - budgets.outputReserveTokens;
 			const generationLeaf = ctx.sessionManager.getLeafId();
 			const generationModel = ctx.model;
 			const thinkingLevel = limits.thinkingLevel ?? ctx.thinkingLevel ?? pi.getThinkingLevel();
 			const generationFailures: DeltaGenerationFailure[] = [];
+			const generationUsages: Usage[] = [];
 			const routingId = randomUUID();
 			const delta = await generateCompactionDelta(ctx, state.checkpoint, state.delta, branch, firstKeptEntryId,
 				Math.min(budgets.deltaTokens, availableTokens - ledgerTokenEstimate(summary) + ledgerTokenEstimate(state.delta?.data.ledger ?? "") - 256),
@@ -3564,7 +3612,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 						// Standalone summaries have their own routing ID, as in Pi's native compaction.
 						sessionId: routingId,
 					};
-				}, generationFailures);
+				}, generationFailures, generationUsages);
 			event.signal.throwIfAborted();
 			if (ctx.sessionManager.getLeafId() !== generationLeaf || ctx.model !== generationModel) {
 				throw new Error("session branch or model changed during ledger generation");
@@ -3582,9 +3630,12 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 					firstKeptEntryId,
 					tokensBefore: event.preparation.tokensBefore,
 					details,
+					// Every delta attempt, including failed ones, counts toward the session's usage totals.
+					...(generationUsages.length > 0 ? { usage: generationUsages.reduce(addUsage) } : {}),
 				},
 			};
 		} catch (error) {
+			// ponytail: a cancelled compaction drops its delta usage; extensions have no usage entry to record it in.
 			const message = error instanceof Error ? error.message : String(error);
 			if (!event.signal.aborted) notify(ctx, `Ledger Context compaction cancelled: ${message}`, "error");
 			return { cancel: true };

@@ -38,6 +38,7 @@ import {
 	type JsonObject,
 	type ModelsSimpleStreamOptions,
 	type TranscriptContext,
+	type Usage,
 } from "@earendil-works/pi-ai";
 import { stream as streamResponses, streamSimple as streamSimpleResponses } from "@earendil-works/pi-ai/api/openai-responses";
 import { stream as streamCompletions } from "@earendil-works/pi-ai/api/openai-completions";
@@ -113,15 +114,18 @@ test("checkpoint edits change the saved state, fold compaction changes and keep 
 	await save(
 		{ ledger: "Both modes.", edits: false } as never,
 		{ ledger: "Unknown key.", unknownField: null } as never,
+		// Pi's argument conversion would turn a required null into a string and replace the matched text with it.
+		{ edits: [{ oldText: "Goal: ship.", newText: null }] } as never,
 		{ ledger: "Both modes.", edits: [{ oldText: "Goal", newText: "Aim" }] },
 		{ edits: [{ oldText: "absent text", newText: "x" }] },
 		{ edits: [{ oldText: "e", newText: "x" }] },
 		{ edits: [{ oldText: "Goal: ship.", newText: "x" }, { oldText: "ship.\nNext", newText: "y" }] },
 	);
 	assert.equal(checkpointEntries(manager.getBranch()).length, before);
-	const [malformed, unknownKey, ...failures] = receipts().slice(-6);
+	const [malformed, unknownKey, requiredNull, ...failures] = receipts().slice(-7);
 	assert.match(malformed, /edits has a value of the wrong type/);
 	assert.match(unknownKey, /unknownField/);
+	assert.match(requiredNull, /edits\[0\]\.newText cannot be null/);
 	assert.match(failures[0], /either ledger .* or edits/);
 	assert.match(failures[1], /edits\[0\]\.oldText was not found/);
 	assert.match(failures[1], /Decision: keep API\.[\s\S]*Folded compaction changes[\s\S]*Tests passed on Linux/, "a failed match shows the text it edits");
@@ -4996,6 +5000,45 @@ test("a virtual model selection compacts with the delta sized for and sent to th
 	assert.equal(requests.length, 2);
 });
 
+test("a virtual model without declared limits compacts before its first response and counts every delta attempt's usage", async (t) => {
+	const requests: Array<{ model: string; usage?: Usage }> = [];
+	const inspect = (pi: ExtensionAPI) => pi.on("session_start", (_event, ctx) => {
+		const stream = ctx.modelRegistry.streamSimple.bind(ctx.modelRegistry);
+		ctx.modelRegistry.streamSimple = (model, context, options) => {
+			const result = stream(model, context, options);
+			if (!getCurrentSystemPrompt(normalizeContext(context).messages).startsWith("Write the cumulative changes")) return result;
+			const request: { model: string; usage?: Usage } = { model: `${model.provider}/${model.id}` };
+			requests.push(request);
+			const read = result.result.bind(result);
+			result.result = async () => { const message = await read(); request.usage = message.usage; return message; };
+			return result;
+		};
+	});
+	const fixture = await createFixture(true, [inspect], 1, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, faux, ledgerFaux, sessionManager, modelRuntime } = fixture;
+	modelRuntime.hasConfiguredAuth = () => true;
+	// Pi records the unset limits as 0 until a routed response supplies the physical model's limits.
+	modelRuntime.registerVirtualModel({ provider: "router", id: "auto", name: "Auto", route: () => ({ model: faux.getModel(), thinkingLevel: "off" }) });
+	await session.setModel(modelRuntime.getModel("router", "auto")!);
+	// An imported conversation: user turns only, no response from any model yet.
+	for (const text of ["Imported goal: migrate the API.", "Imported detail: " + "d".repeat(4_000), "Imported next step: run tests."]) {
+		sessionManager.appendMessage({ role: "user", content: text, timestamp: Date.now() });
+	}
+	ledgerFaux.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "OpenAI API error (503): service unavailable" }), fauxAssistantMessage("Cold-start delta.")]);
+	await session.compact();
+	const compaction = latestCompaction(sessionManager.getBranch());
+	assert.equal(generatedDelta(compaction).ledger, "Cold-start delta.");
+	assert.deepEqual(requests.map((request) => request.model), ["router/auto", "router/auto"], "the delta request goes through the router");
+	const [failed, succeeded] = requests.map((request) => request.usage!);
+	assert.ok(failed.totalTokens > 0 && succeeded.totalTokens > 0);
+	assert.deepEqual(compaction.usage, {
+		input: failed.input + succeeded.input, output: failed.output + succeeded.output, cacheRead: failed.cacheRead + succeeded.cacheRead,
+		cacheWrite: failed.cacheWrite + succeeded.cacheWrite, totalTokens: failed.totalTokens + succeeded.totalTokens,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	});
+});
+
 test("delta failure diagnostics persist without entering model recovery or history output", async (t) => {
 	const fixture = await createFixture(true, [], 64, { compactionEnabled: false });
 	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
@@ -5636,6 +5679,8 @@ test("history tools accept the null-filled arguments of strict function calling"
 		const result = await navigationCall(fixture, "history_list_items", args);
 		assert.equal((result.message as { isError?: boolean }).isError, true, JSON.stringify(args));
 	}
+	// A null list item is rejected with its position.
+	assert.match(toolResultText(await navigationCall(fixture, "history_search", { queries: [null] })), /queries\[0\] cannot be null/);
 });
 
 test("history navigation discovers checkpoint versions independently of recovery capacity", async (t) => {
