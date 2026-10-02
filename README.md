@@ -4,7 +4,7 @@ Ledger Context preserves the main agent's checkpoints and separate cumulative co
 
 ## Requirements
 
-- Runtime baseline: `@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` `>=0.99.1 <0.100.0` with Node.js `>=22.19.0`; development and validation use 0.99.1.
+- Runtime baseline: `@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` `>=1.0.0 <2.0.0` with Node.js `>=22.19.0`; development and validation use 1.0.0.
 - Keep pi native automatic compaction enabled for automatic window changes. Pi owns the compaction threshold, session log, steering and follow-up queues, overflow retry, and compaction lifecycle.
 - Configure one compaction content extension per session. Ledger Context supplies the compaction summary and recovery bootstrap for each window.
 - All six model tools and manual `/compact` remain available when automatic compaction is disabled.
