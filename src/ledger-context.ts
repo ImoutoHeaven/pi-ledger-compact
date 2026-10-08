@@ -10,7 +10,7 @@ import {
 	getAgentDir,
 	sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
-import type { ContextEditEntry, ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { ContextEditEntry, CustomMessageEntryDraft, ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 
 export const CHECKPOINT_ENTRY_TYPE = "ledger-context/checkpoint";
 export const COMPACTION_DETAILS_KIND = "ledger-context";
@@ -24,10 +24,8 @@ export const DEFAULT_DELTA_TOKEN_LIMIT = 2_048;
 export const DEFAULT_HISTORY_READ_TOKEN_LIMIT = 2_048;
 export const DEFAULT_OUTPUT_RESERVE_TOKEN_LIMIT = 16_384;
 export const REMINDER_MESSAGE_TYPE = "ledger-context/reminder";
-export const REMINDER_HANDOFF_ENTRY_TYPE = "ledger-context/reminder-handoff";
 export const DEFAULT_SOFT_REMINDER_TOKEN_LIMIT = 32_768;
 export const DEFAULT_URGENT_REMINDER_TOKEN_LIMIT = 16_384;
-export const DEFAULT_VOLUME_REMINDER_MIN_TOKENS = 65_536;
 export const MAX_HISTORY_SEARCH_QUERY_LENGTH = 8_192;
 export const MAX_HISTORY_SEARCH_QUERIES = 32;
 /** Matches Pi's tool-result limit for summary serialization. */
@@ -202,8 +200,6 @@ type MessageLike = {
 
 type HistoryExecutionStatus = "received" | "requested" | "completed" | "failed" | "saved" | "committed" | "metadata";
 
-type ReminderLevel = "soft" | "urgent";
-
 export type LedgerContextCompactionSnapshot = ReturnType<SettingsManager["getCompactionSettings"]>;
 
 export interface LedgerContextSettingsSnapshot {
@@ -226,64 +222,35 @@ interface NativeCompactionSettings {
 	error?: "settings-read-failed" | "settings-reader-failed" | "settings-missing" | "settings-invalid";
 }
 
-type ReminderReasonKind = "budget" | "stale-volume";
-
-interface ReminderReason {
-	key: string;
-	kind: ReminderReasonKind;
-	level?: ReminderLevel;
-	windowId: string;
-	checkpointEntryId: string | null;
-	fromEntryId: string | null;
-	toEntryId: string | null;
-	cause: string;
-}
-
-interface ReminderHandoffRecord {
-	schemaVersion: typeof LEDGER_SCHEMA_VERSION;
-	kind: typeof REMINDER_HANDOFF_ENTRY_TYPE;
-	pendingReminderReasons: ReminderReason[];
-	queuedReminderReasons: ReminderReason[];
-}
-
 interface ContentBudgets {
 	ledgerTokens: number;
 	deltaTokens: number;
 	outputReserveTokens: number;
 }
 
+/** Context pressure relative to the reminder lead times before the effective boundary. */
+type ReminderPressure = "none" | "filling" | "urgent";
+
+/** A checkpoint request. Its origin is the history position and checkpoint baseline from which new work is counted. */
 interface ReminderDetails {
 	schemaVersion: typeof LEDGER_SCHEMA_VERSION;
-	reminderKey: string;
-	level: ReminderLevel;
 	windowId: string;
+	/** The latest compaction or checkpoint request position; null at the branch beginning. */
+	originEntryId: string | null;
+	checkpointEntryId: string | null;
+	/** 0 for the first request of an origin; later requests repeat an unanswered one. */
+	sequence: number;
+	pressure: ReminderPressure;
+	newWorkTokens: number;
+	intervalTokens: number;
+	fromEntryId: string;
+	toEntryId: string;
 	contextWindow: number;
-	estimatedTokens: number;
-	remainingTokens: number;
-	usageKnown: boolean;
-	checkpointEntryId?: string | null;
-	fromEntryId?: string | null;
-	toEntryId?: string | null;
-	reasonKeys?: string[];
-	reasonKinds?: ReminderReasonKind[];
-	reasonWindows?: string[];
-	reasonDetails: Array<{
-		key: string;
-		kind: ReminderReasonKind;
-		windowId: string;
-		checkpointEntryId: string | null;
-		fromEntryId: string | null;
-		toEntryId: string | null;
-		cause: string;
-	}>;
-	causes?: string[];
-	usageWindowId?: string;
-	effectiveBoundaryTokens?: number | null;
-	effectiveBoundaryRemaining?: number | null;
-	usageKind?: "pi-context-usage" | "projected-content-estimate";
-	configSource?: string;
-	nativeBoundaryKnown?: boolean;
-	nativeBoundaryMode?: "native" | "disabled" | "unknown";
+	usedTokens: number;
+	usageKind: "pi-context-usage" | "projected-content-estimate";
+	effectiveBoundaryTokens: number;
+	nativeBoundaryMode: "native" | "disabled" | "unknown";
+	configSource: string;
 }
 
 interface HistoryPayloadReference {
@@ -509,11 +476,6 @@ interface SessionState {
 	currentAgentRequest?: { position: RequestHistoryPosition; recoveryBasis: RecoveryBasis | null };
 	recoveryError?: string;
 	persistenceUncertain?: string;
-	deliveredReminderKeys: Set<string>;
-	queuedReminderKeys: Set<string>;
-	pendingReminderReasons: ReminderReason[];
-	pendingNormalInput: boolean;
-	lastAgentStopReason?: string;
 }
 
 function positiveIntegerEnv(name: string, fallback: number): number {
@@ -541,6 +503,15 @@ function reminderThresholds(contextWindow: number): { soft: number; urgent: numb
 		throw new Error("LEDGER_CONTEXT_URGENT_TOKENS must be less than LEDGER_CONTEXT_REMINDER_TOKENS");
 	}
 	return { soft, urgent };
+}
+
+/**
+ * New work between checkpoint requests. The space before the soft lead time, at least half the boundary, is split into
+ * three to five intervals, more for larger windows, so each window asks for a similar number of checkpoints.
+ */
+function reminderIntervalTokens(boundaryTokens: number, softLeadTokens: number): number {
+	const span = Math.max(boundaryTokens - softLeadTokens, Math.floor(boundaryTokens / 2));
+	return Math.max(1, Math.floor(span / (span > 400_000 ? 5 : span > 150_000 ? 4 : 3)));
 }
 
 function contentBudgets(contextWindow: number): ContentBudgets {
@@ -696,14 +667,14 @@ function ledgerTokenEstimate(value: string): number {
 interface ReminderUsage {
 	contextWindow: number;
 	tokens: number;
-	usageKnown: boolean;
 	usageKind: "pi-context-usage" | "projected-content-estimate";
 	modelRemaining: number;
 	boundaryTokens: number;
 	boundaryRemaining: number;
 	configSource: string;
-	nativeBoundaryKnown: boolean;
 	nativeBoundaryMode: "native" | "disabled" | "unknown";
+	/** Pi compacts before the next model request; a virtual selection checks the routed model's threshold instead. */
+	nativeCompactionDue: boolean;
 }
 
 function reminderUsage(pi: ExtensionAPI, ctx: ExtensionContext, settingsReader?: LedgerContextSettingsReader): ReminderUsage | undefined {
@@ -738,76 +709,27 @@ function reminderUsage(pi: ExtensionAPI, ctx: ExtensionContext, settingsReader?:
 	return {
 		contextWindow,
 		tokens,
-		usageKnown,
 		usageKind: usageKnown ? "pi-context-usage" : "projected-content-estimate",
 		modelRemaining: Math.max(0, contextWindow - tokens),
 		boundaryTokens,
 		boundaryRemaining: boundaryTokens - tokens,
 		configSource: native.error ? `${native.source} (unknown: ${native.error})` : native.source,
-		nativeBoundaryKnown,
 		nativeBoundaryMode,
+		nativeCompactionDue: ctx.model?.api !== VIRTUAL_MODEL_API && nativeBoundaryKnown && tokens > contextWindow - native.compaction!.reserveTokens,
 	};
 }
 
-function reminderText(
-	details: ReminderDetails,
-	reasons: ReminderReason[],
-): string {
-	const causes = [
-		...(reasons.some((reason) => reason.kind === "budget") ? [details.level === "urgent" ? "the context is nearly full" : "the context is filling up"] : []),
-		...(reasons.some((reason) => reason.kind === "stale-volume") ? ["much work has happened since your last checkpoint"] : []),
-	];
+function reminderText(details: ReminderDetails, previousReminderEntryId: string | undefined): string {
+	const pressure = details.pressure === "urgent" ? ", and the context is nearly full" : details.pressure === "filling" ? ", and the context is filling up" : "";
+	const work = `${details.newWorkTokens} tokens of new work since your last checkpoint${pressure}`;
 	return [
-		`Ledger Context reminder${details.level === "urgent" ? " (urgent)" : ""}: ${causes.join(", and ")}.`,
+		previousReminderEntryId
+			? `Ledger Context reminder (repeating ${historyEntryReference(previousReminderEntryId)}): ${work}.`
+			: `Ledger Context reminder: ${work}.`,
 		"Call the checkpoint tool once now, then continue the task.",
 		CHECKPOINT_LEDGER_GUIDELINES,
 		`This notice is for window ${details.windowId} with checkpoint ${details.checkpointEntryId ?? "none"}; any later checkpoint or compaction fulfils it. Leave the notice itself out of the ledger and sourceQuotes.`,
 	].join("\n");
-}
-
-function reminderDetails(
-	level: ReminderLevel,
-	windowId: string,
-	usage: ReminderUsage,
-	reasons: ReminderReason[] = [],
-	usageWindowId = windowId,
-): ReminderDetails {
-	const reasonSuffix = reasons.length > 0 ? `:${createHash("sha256").update(JSON.stringify(reasons.map((reason) => reason.key)), "utf8").digest("hex").slice(0, 12)}` : "";
-	const scopedReasons = reasons.filter((reason) => reason.windowId === windowId);
-	const referenceReasons = scopedReasons.length > 0 ? scopedReasons : reasons;
-	return {
-		schemaVersion: LEDGER_SCHEMA_VERSION,
-		reminderKey: `${windowId}:${level}${reasonSuffix}`,
-		level,
-		windowId,
-		contextWindow: usage.contextWindow,
-		estimatedTokens: usage.tokens,
-		remainingTokens: Math.max(0, usage.modelRemaining),
-		usageKnown: usage.usageKnown,
-		checkpointEntryId: referenceReasons.find((reason) => reason.checkpointEntryId !== null)?.checkpointEntryId ?? null,
-		fromEntryId: referenceReasons.find((reason) => reason.fromEntryId !== null)?.fromEntryId ?? null,
-		toEntryId: referenceReasons.slice().reverse().find((reason) => reason.toEntryId !== null)?.toEntryId ?? null,
-		reasonKeys: reasons.map((reason) => reason.key),
-		reasonKinds: [...new Set(reasons.map((reason) => reason.kind))],
-		reasonWindows: [...new Set(reasons.map((reason) => reason.windowId))],
-		reasonDetails: reasons.map((reason) => ({
-			key: reason.key,
-			kind: reason.kind,
-			windowId: reason.windowId,
-			checkpointEntryId: reason.checkpointEntryId,
-			fromEntryId: reason.fromEntryId,
-			toEntryId: reason.toEntryId,
-			cause: reason.cause,
-		})),
-		causes: reasons.map((reason) => reason.cause),
-		usageWindowId,
-		effectiveBoundaryTokens: usage.boundaryTokens,
-		effectiveBoundaryRemaining: Math.max(0, usage.boundaryRemaining),
-		usageKind: usage.usageKind,
-		configSource: usage.configSource,
-		nativeBoundaryKnown: usage.nativeBoundaryKnown,
-		nativeBoundaryMode: usage.nativeBoundaryMode,
-	};
 }
 
 interface VolumeMeasurement {
@@ -874,99 +796,17 @@ function volumeOrigin(state: SessionState, entries: SessionEntry[]): { position:
 	};
 }
 
-function isReminderReason(value: unknown): value is ReminderReason {
-	if (!value || typeof value !== "object") return false;
-	const input = value as Record<string, unknown>;
-	return (
-		typeof input.key === "string" &&
-		input.key.length > 0 &&
-		(input.kind === "budget" || input.kind === "stale-volume") &&
-		(input.level === undefined || input.level === "soft" || input.level === "urgent") &&
-		typeof input.windowId === "string" &&
-		input.windowId.length > 0 &&
-		(input.checkpointEntryId === null || typeof input.checkpointEntryId === "string") &&
-		(input.fromEntryId === null || typeof input.fromEntryId === "string") &&
-		(input.toEntryId === null || typeof input.toEntryId === "string") &&
-		typeof input.cause === "string" &&
-		input.cause.length > 0 &&
-		input.cause.length <= 512
-	);
-}
-
 function isReminderDetails(value: unknown): value is ReminderDetails {
 	if (!value || typeof value !== "object") return false;
 	const input = value as Record<string, unknown>;
-	if (
-		input.schemaVersion !== LEDGER_SCHEMA_VERSION ||
-		(input.level !== "soft" && input.level !== "urgent") ||
-		typeof input.windowId !== "string" ||
-		input.windowId.length === 0 ||
-		(typeof input.reminderKey !== "string" || !input.reminderKey.startsWith(`${input.windowId}:${input.level}`)) ||
-		typeof input.contextWindow !== "number" ||
-		!Number.isFinite(input.contextWindow) ||
-		input.contextWindow <= 0 ||
-		typeof input.estimatedTokens !== "number" ||
-		!Number.isFinite(input.estimatedTokens) ||
-		input.estimatedTokens < 0 ||
-		typeof input.remainingTokens !== "number" ||
-		!Number.isFinite(input.remainingTokens) ||
-		input.remainingTokens < 0 ||
-		typeof input.usageKnown !== "boolean" ||
-		(input.reasonKeys !== undefined && (!Array.isArray(input.reasonKeys) || input.reasonKeys.some((key) => typeof key !== "string"))) ||
-		(input.reasonKinds !== undefined && (!Array.isArray(input.reasonKinds) || input.reasonKinds.some((kind) => kind !== "budget" && kind !== "stale-volume"))) ||
-		(input.reasonWindows !== undefined && (!Array.isArray(input.reasonWindows) || input.reasonWindows.some((window) => typeof window !== "string"))) ||
-		(input.usageWindowId !== undefined && (typeof input.usageWindowId !== "string" || input.usageWindowId.length === 0)) ||
-		(!Array.isArray(input.reasonDetails) || input.reasonDetails.length === 0 || input.reasonDetails.some((reason) => !isReminderReason(reason)))
-	) {
-		return false;
-	}
-	return true;
-}
-
-function isReminderHandoffRecord(value: unknown): value is ReminderHandoffRecord {
-	if (!value || typeof value !== "object") return false;
-	const input = value as Record<string, unknown>;
-	return (
-		input.schemaVersion === LEDGER_SCHEMA_VERSION &&
-		input.kind === REMINDER_HANDOFF_ENTRY_TYPE &&
-		Array.isArray(input.pendingReminderReasons) &&
-		input.pendingReminderReasons.length <= 256 &&
-		input.pendingReminderReasons.every(isReminderReason) &&
-		Array.isArray(input.queuedReminderReasons) &&
-		input.queuedReminderReasons.length <= 256 &&
-		input.queuedReminderReasons.every(isReminderReason)
-	);
-}
-
-function appendReminderHandoff(
-	pi: ExtensionAPI,
-	ctx: ExtensionContext,
-	state: SessionState,
-	data: ReminderHandoffRecord,
-): void {
-	const previousLeafId = ctx.sessionManager.getLeafId();
-	try {
-		pi.appendEntry(REMINDER_HANDOFF_ENTRY_TYPE, data);
-		const entry = ctx.sessionManager.getLeafEntry();
-		if (
-			!entry ||
-			entry.id === previousLeafId ||
-			entry.type !== "custom" ||
-			entry.customType !== REMINDER_HANDOFF_ENTRY_TYPE ||
-			!isReminderHandoffRecord(entry.data) ||
-			JSON.stringify(entry.data) !== JSON.stringify(data)
-		) {
-			throw new Error("pi did not expose the newly appended reminder handoff");
-		}
-	} catch {
-		state.persistenceUncertain = "reminder handoff persistence failed";
-		try {
-			ctx.abort();
-		} catch {
-			// The host may already be finishing the reload.
-		}
-		notify(ctx, "Ledger Context stopped after a reminder handoff write failure. Reopen the persisted session before continuing.", "error");
-	}
+	const count = (field: unknown) => Number.isSafeInteger(field) && (field as number) >= 0;
+	return input.schemaVersion === LEDGER_SCHEMA_VERSION &&
+		typeof input.windowId === "string" && input.windowId.length > 0 &&
+		(input.originEntryId === null || typeof input.originEntryId === "string") &&
+		(input.checkpointEntryId === null || typeof input.checkpointEntryId === "string") &&
+		count(input.sequence) &&
+		(input.pressure === "none" || input.pressure === "filling" || input.pressure === "urgent") &&
+		count(input.newWorkTokens);
 }
 
 function ledgerCapacityError(value: string, tokenLimit: number): string | undefined {
@@ -2414,72 +2254,7 @@ function initialWindowId(ctx: ExtensionContext): string {
 function createState(ctx: ExtensionContext): SessionState {
 	return {
 		activeWindowId: initialWindowId(ctx),
-		deliveredReminderKeys: new Set(),
-		queuedReminderKeys: new Set(),
-		pendingReminderReasons: [],
-		pendingNormalInput: false,
 	};
-}
-
-function reminderKeys(details: ReminderDetails): string[] {
-	return [details.reminderKey, ...details.reasonDetails.flatMap((reason) => reminderDeliveryKeys({ ...reason, level: details.level }))];
-}
-
-function reminderDeliveryKeys(reason: ReminderReason): string[] {
-	return reason.kind === "budget" && reason.level === "urgent" ? [reason.key, `${reason.windowId}:budget:soft`] : [reason.key];
-}
-
-function reconcileReminderQueue(state: SessionState, ctx: ExtensionContext, clearUnpersisted: boolean): void {
-	const persistedKeys = new Set<string>();
-	for (const entry of ctx.sessionManager.getBranch()) {
-		if (entry.type !== "custom_message" || entry.customType !== REMINDER_MESSAGE_TYPE || !isReminderDetails(entry.details)) continue;
-		for (const key of reminderKeys(entry.details)) {
-			persistedKeys.add(key);
-			state.deliveredReminderKeys.add(key);
-		}
-	}
-	state.pendingReminderReasons = state.pendingReminderReasons.filter(
-		(reason) => !persistedKeys.has(reason.key),
-	);
-	if (clearUnpersisted) {
-		for (const key of state.queuedReminderKeys) {
-			if (!persistedKeys.has(key)) state.queuedReminderKeys.delete(key);
-		}
-	}
-}
-
-function restoreReminderState(state: SessionState, entries: SessionEntry[]): void {
-	state.deliveredReminderKeys = new Set();
-	state.queuedReminderKeys.clear();
-	state.pendingReminderReasons = [];
-	for (const entry of [...entries].reverse()) {
-		if (entry.type !== "custom_message" || entry.customType !== REMINDER_MESSAGE_TYPE) continue;
-		const details = entry.details;
-		if (!isReminderDetails(details)) continue;
-		for (const key of reminderKeys(details)) state.deliveredReminderKeys.add(key);
-	}
-}
-
-function latestReminderHandoff(state: SessionState, entries: SessionEntry[]): ReminderHandoffRecord | undefined {
-	const checkpointIndex = state.checkpoint ? entries.findIndex((entry) => entry.id === state.checkpoint!.entryId) : -1;
-	for (let index = entries.length - 1; index >= 0; index--) {
-		const entry = entries[index];
-		if (entry.type !== "custom" || entry.customType !== REMINDER_HANDOFF_ENTRY_TYPE || !isReminderHandoffRecord(entry.data)) continue;
-		if (checkpointIndex >= 0 && index <= checkpointIndex) continue;
-		return entry.data;
-	}
-	return undefined;
-}
-
-function restoreReminderHandoff(state: SessionState, entries: SessionEntry[]): void {
-	const handoff = latestReminderHandoff(state, entries);
-	if (!handoff) return;
-	state.pendingReminderReasons = [...new Map(
-		[...handoff.pendingReminderReasons, ...handoff.queuedReminderReasons].map((reason) => [reason.key, reason]),
-	).values()];
-	for (const reason of handoff.queuedReminderReasons) {
-		for (const key of reminderDeliveryKeys(reason)) state.queuedReminderKeys.add(key);
-	}
 }
 
 function latestBranchCompaction(entries: SessionEntry[]): Extract<SessionEntry, { type: "compaction" }> | undefined {
@@ -2519,11 +2294,6 @@ function invalidateUncertainState(state: SessionState, ctx: ExtensionContext, re
 	state.delta = undefined;
 	state.currentAgentRequest = undefined;
 	state.activeWindowId = initialWindowId(ctx);
-	state.deliveredReminderKeys.clear();
-	state.queuedReminderKeys.clear();
-	state.pendingReminderReasons = [];
-	state.pendingNormalInput = false;
-	state.lastAgentStopReason = undefined;
 }
 
 function blockIfPersistenceUncertain(state: SessionState, ctx: ExtensionContext): boolean {
@@ -2552,11 +2322,11 @@ function blockIfPersistenceUncertain(state: SessionState, ctx: ExtensionContext)
 	return true;
 }
 
-function hydrateState(state: SessionState, entries: SessionEntry[], ctx: ExtensionContext, restoreReminders = true): void {
+function hydrateState(state: SessionState, entries: SessionEntry[], ctx: ExtensionContext, resetRequest = true): void {
 	state.checkpoint = undefined;
 	state.delta = undefined;
 	state.recoveryError = undefined;
-	if (restoreReminders) state.currentAgentRequest = undefined;
+	if (resetRequest) state.currentAgentRequest = undefined;
 	try {
 		const indexes = new Map(entries.map((entry, index) => [entry.id, index]));
 		const ancestor = (id: string | null, before: number): number => {
@@ -2641,10 +2411,6 @@ function hydrateState(state: SessionState, entries: SessionEntry[], ctx: Extensi
 		}
 		const latestWindow = latestLedgerCompaction(entries);
 		state.activeWindowId = latestWindow && isLedgerCompactionDetails(latestWindow.details) ? latestWindow.details.windowId : initialWindowId(ctx);
-		if (restoreReminders) {
-			restoreReminderState(state, entries);
-			restoreReminderHandoff(state, entries);
-		}
 	} catch (error) {
 		state.recoveryError = error instanceof Error ? error.message : String(error);
 		state.currentAgentRequest = undefined;
@@ -2724,116 +2490,61 @@ function notify(ctx: ExtensionContext, message: string, type: "info" | "warning"
 	}
 }
 
-function collectReminderReasons(
+
+
+
+
+/**
+ * The checkpoint request due now, if any. New work is counted from the latest checkpoint or compaction (the origin).
+ * The first request of an origin follows one interval of new work, or half an interval once the context reaches the
+ * soft lead time. An unanswered request is repeated once after a quarter interval more work, and once more when the
+ * context first reaches the urgent lead time.
+ */
+function dueReminder(
 	state: SessionState,
 	pi: ExtensionAPI,
-	ctx: ExtensionContext,
-	settingsReader?: LedgerContextSettingsReader,
-): { usage: ReminderUsage | undefined; pressure: ReminderLevel | undefined; reasons: ReminderReason[] } {
-	const entries = ctx.sessionManager.getBranch();
-	const origin = volumeOrigin(state, entries);
-	const metric = volumeMeasurement(entries, positionStartIndex(entries, origin.position));
-	const contextWindow = limitsModel(ctx).model?.contextWindow ?? 0;
-	const minInterval = positiveIntegerEnv("LEDGER_CONTEXT_VOLUME_MIN_TOKENS", DEFAULT_VOLUME_REMINDER_MIN_TOKENS);
-	const interval = Number.isFinite(contextWindow) && contextWindow > 0 ? Math.max(minInterval, Math.floor(contextWindow * 0.10)) : undefined;
-	const bucket = interval === undefined ? 0 : Math.floor(metric.tokens / interval);
-	const reasons: ReminderReason[] = [];
-	if (interval !== undefined && bucket >= 1) {
-		reasons.push({
-			key: `${origin.windowId}:stale-volume:${origin.checkpointEntryId ?? "none"}:tokens:${bucket * interval}`,
-			kind: "stale-volume",
-			windowId: origin.windowId,
-			checkpointEntryId: origin.checkpointEntryId,
-			fromEntryId: metric.fromEntryId,
-			toEntryId: metric.toEntryId,
-			cause: `new nonmaintenance volume (${metric.tokens} tokens) reached interval ${bucket}; each interval is the larger of 10% of the current model window and ${minInterval} tokens (${interval} tokens)`,
-		});
-	}
-	const usage = reminderUsage(pi, ctx, settingsReader);
-	const thresholds = usage && reminderThresholds(usage.contextWindow);
-	const pressure: ReminderLevel | undefined = !usage || !thresholds ? undefined
-		: usage.boundaryRemaining <= thresholds.urgent ? "urgent" : usage.boundaryRemaining <= thresholds.soft ? "soft" : undefined;
-	// A save request needs ordinary work after the latest checkpoint or compaction.
-	if (pressure && metric.fromEntryId !== null) {
-		reasons.push({
-			key: `${state.activeWindowId}:budget:${pressure}`,
-			kind: "budget",
-			level: pressure,
-			windowId: state.activeWindowId,
-			checkpointEntryId: origin.checkpointEntryId,
-			fromEntryId: metric.fromEntryId,
-			toEntryId: metric.toEntryId,
-			cause: `${pressure} budget lead time reached before the effective native boundary`,
-		});
-	}
-	return { usage, pressure, reasons: [...new Map(reasons.map((reason) => [reason.key, reason])).values()] };
-}
-
-function volumeReminderMark(key: string): { prefix: string; tokens: number } | undefined {
-	const match = /^(.*:stale-volume:.*:tokens:)(\d+)$/.exec(key);
-	const tokens = Number(match?.[2]);
-	return match && Number.isSafeInteger(tokens) && tokens > 0 ? { prefix: match[1], tokens } : undefined;
-}
-
-function reminderReasonKnown(state: SessionState, reason: ReminderReason): boolean {
-	if (state.deliveredReminderKeys.has(reason.key) || state.queuedReminderKeys.has(reason.key)) return true;
-	const volume = reason.kind === "stale-volume" ? volumeReminderMark(reason.key) : undefined;
-	if (volume) {
-		for (const knownKeys of [state.deliveredReminderKeys, state.queuedReminderKeys]) {
-			for (const key of knownKeys) {
-				const known = volumeReminderMark(key);
-				if (known?.prefix === volume.prefix && known.tokens >= volume.tokens) return true;
-			}
-		}
-	}
-	return false;
-}
-
-function mergeReminderReasons(left: ReminderReason[], right: ReminderReason[]): ReminderReason[] {
-	const merged = new Map<string, ReminderReason>();
-	for (const reason of [...left, ...right]) {
-		const volume = reason.kind === "stale-volume" ? volumeReminderMark(reason.key) : undefined;
-		if (reason.kind === "stale-volume" && !volume) continue;
-		const key = volume?.prefix ?? reason.key;
-		const previous = merged.get(key);
-		if (!previous || !volume || volume.tokens >= (volumeReminderMark(previous.key)?.tokens ?? 0)) merged.set(key, reason);
-	}
-	return [...merged.values()];
-}
-
-function deliverReminderReasons(
-	pi: ExtensionAPI,
-	state: SessionState,
 	ctx: ExtensionContext,
 	settingsReader: LedgerContextSettingsReader | undefined,
-	delivery: "steer" | "beforeAgentStart" | "defer",
-): { customType: string; content: string; display: false; details: ReminderDetails } | undefined {
-	if (state.persistenceUncertain) return;
-	reconcileReminderQueue(state, ctx, false);
-	const collected = collectReminderReasons(state, pi, ctx, settingsReader);
-	const reasons = collected.reasons.filter((reason) => !reminderReasonKnown(state, reason));
-	if (delivery === "defer") {
-		state.pendingReminderReasons = collected.reasons;
-		return;
-	}
-	if (reasons.length === 0 || !collected.usage) return;
-	const level: ReminderLevel = collected.pressure ?? "soft";
-	const usage = collected.usage;
-	const hasCurrentWindowReason = reasons.some((reason) => reason.windowId === state.activeWindowId);
-	const windowId = hasCurrentWindowReason ? state.activeWindowId : reasons[0].windowId;
-	const details = reminderDetails(level, windowId, usage, reasons, state.activeWindowId);
-	for (const reason of reasons) for (const key of reminderDeliveryKeys(reason)) state.queuedReminderKeys.add(key);
-	state.pendingReminderReasons = mergeReminderReasons(state.pendingReminderReasons, reasons);
-	const message = {
-		customType: REMINDER_MESSAGE_TYPE,
-		content: reminderText(details, reasons),
-		display: false as const,
-		details,
+): CustomMessageEntryDraft & { details: ReminderDetails } | undefined {
+	const usage = reminderUsage(pi, ctx, settingsReader);
+	// The compaction that Pi runs before the next model request fulfils any request.
+	if (!usage || usage.nativeCompactionDue) return undefined;
+	const entries = ctx.sessionManager.getBranch();
+	const origin = volumeOrigin(state, entries);
+	const work = volumeMeasurement(entries, positionStartIndex(entries, origin.position));
+	if (work.fromEntryId === null || work.toEntryId === null) return undefined;
+	const thresholds = reminderThresholds(usage.contextWindow);
+	const interval = reminderIntervalTokens(usage.boundaryTokens, thresholds.soft);
+	const pressure: ReminderPressure = usage.boundaryRemaining <= thresholds.urgent ? "urgent" : usage.boundaryRemaining <= thresholds.soft ? "filling" : "none";
+	// Entry IDs, unlike the initial window ID, stay the same in a forked session.
+	const earlier = entries.flatMap((entry) => entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE && isReminderDetails(entry.details) &&
+		entry.details.originEntryId === origin.position.entryId && entry.details.checkpointEntryId === origin.checkpointEntryId
+		? [{ id: entry.id, details: entry.details }] : []);
+	const last = earlier.at(-1);
+	const due = !last
+		? work.tokens >= interval || (pressure !== "none" && work.tokens >= interval / 2)
+		: (earlier.length === 1 && work.tokens >= last.details.newWorkTokens + interval / 4) ||
+			(pressure === "urgent" && earlier.every((reminder) => reminder.details.pressure !== "urgent"));
+	if (!due) return undefined;
+	const details: ReminderDetails = {
+		schemaVersion: LEDGER_SCHEMA_VERSION,
+		windowId: origin.windowId,
+		originEntryId: origin.position.entryId,
+		checkpointEntryId: origin.checkpointEntryId,
+		sequence: earlier.length,
+		pressure,
+		newWorkTokens: work.tokens,
+		intervalTokens: interval,
+		fromEntryId: work.fromEntryId,
+		toEntryId: work.toEntryId,
+		contextWindow: usage.contextWindow,
+		usedTokens: usage.tokens,
+		usageKind: usage.usageKind,
+		effectiveBoundaryTokens: usage.boundaryTokens,
+		nativeBoundaryMode: usage.nativeBoundaryMode,
+		configSource: usage.configSource,
 	};
-	if (delivery === "beforeAgentStart") return message;
-	const deliveryOptions = { deliverAs: "steer" as const };
-	pi.sendMessage(message, deliveryOptions);
-	return message;
+	return { type: "custom_message", customType: REMINDER_MESSAGE_TYPE, content: reminderText(details, last?.id), display: false, details };
 }
 
 function validationError(message: string): Error {
@@ -3057,7 +2768,6 @@ function saveAgentCheckpoint(pi: ExtensionAPI, ctx: ExtensionContext, state: Ses
 	const saved = appendCheckpoint(pi, ctx, state, data);
 	state.checkpoint = { entryId: saved.entryId, data };
 	state.delta = undefined;
-	state.pendingReminderReasons = [];
 	return saved;
 }
 
@@ -3089,7 +2799,7 @@ function diagnosticMessage(error: unknown): string {
 
 function deltaHistoryMaterial(entry: SessionEntry, contentEntryId = entry.id): { text?: string; filtered?: boolean; excluded?: HistoryExclusion } {
 	if (entry.type === "compaction" || entry.type === "model_change" || entry.type === "thinking_level_change" || entry.type === "label" || entry.type === "session_info" || entry.type === "context_edit" || entry.type === "usage" || (entry.type === "message" && entry.message.role === "system")) return { excluded: "structural-metadata" };
-	if ((entry.type === "custom" && [CHECKPOINT_ENTRY_TYPE, REMINDER_HANDOFF_ENTRY_TYPE].includes(entry.customType)) || (entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE)) return { excluded: "maintenance" };
+	if ((entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY_TYPE) || (entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE)) return { excluded: "maintenance" };
 	if (entry.type === "message") {
 		const message = entry.message;
 		if (message.role === "toolResult" && ["checkpoint", "get_context_remaining"].includes(message.toolName)) return { excluded: "maintenance" };
@@ -3286,23 +2996,6 @@ function buildCompactionDetails(
 	};
 }
 
-function reminderHandoffForState(state: SessionState): ReminderHandoffRecord | undefined {
-	const pendingReminderReasons = [...new Map(
-		state.pendingReminderReasons.map((reason) => [reason.key, reason]),
-	).values()];
-	const queuedReminderReasons = pendingReminderReasons.filter((reason) =>
-		reminderDeliveryKeys(reason).some((key) => state.queuedReminderKeys.has(key)),
-	);
-	const pending = pendingReminderReasons.filter((reason) => !queuedReminderReasons.includes(reason));
-	if (pending.length === 0 && queuedReminderReasons.length === 0) return undefined;
-	return {
-		schemaVersion: LEDGER_SCHEMA_VERSION,
-		kind: REMINDER_HANDOFF_ENTRY_TYPE,
-		pendingReminderReasons: pending,
-		queuedReminderReasons,
-	};
-}
-
 function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): void {
 	const settingsReader = options.settingsReader;
 	const states = new Map<string, SessionState>();
@@ -3320,15 +3013,6 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		return state;
 	};
 
-	pi.on("session_shutdown", async (event, ctx) => {
-		if (event.reason !== "reload") return;
-		const state = getState(ctx);
-		if (state.persistenceUncertain) return;
-		reconcileReminderQueue(state, ctx, false);
-		const handoff = reminderHandoffForState(state);
-		if (handoff) appendReminderHandoff(pi, ctx, state, handoff);
-	});
-
 	pi.on("session_start", async (_event, ctx) => {
 		const state = getState(ctx);
 		if (blockIfPersistenceUncertain(state, ctx)) return;
@@ -3338,22 +3022,12 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		if (!state.recoveryError) state.currentAgentRequest = request;
 	});
 
-	pi.on("before_agent_start", async (_event, ctx) => {
-		const state = getState(ctx);
-		if (blockIfPersistenceUncertain(state, ctx)) return;
-		if (!state.pendingNormalInput) return;
-		state.pendingNormalInput = false;
-		const reminder = deliverReminderReasons(pi, state, ctx, settingsReader, "beforeAgentStart");
-		return reminder ? { message: reminder } : undefined;
-	});
-
 	pi.on("context", async (event, ctx) => {
 		const state = getState(ctx);
 		const entries = ctx.sessionManager.getBranch();
 		hydrateState(state, entries, ctx, false);
 		state.currentAgentRequest = undefined;
 		if (blockIfPersistenceUncertain(state, ctx)) return { messages: [] };
-		reconcileReminderQueue(state, ctx, false);
 		if (state.recoveryError) {
 			notify(ctx, `Ledger Context recovery error: ${state.recoveryError}`, "error");
 			ctx.abort();
@@ -3363,49 +3037,38 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		return undefined;
 	});
 
-	pi.on("agent_start", async (_event, ctx) => {
-		const state = getState(ctx);
-		state.lastAgentStopReason = undefined;
-	});
+	const reminder = (ctx: ExtensionContext) => {
+		try {
+			const state = getState(ctx);
+			if (blockIfPersistenceUncertain(state, ctx)) return undefined;
+			return dueReminder(state, pi, ctx, settingsReader);
+		} catch (error) {
+			notify(ctx, `Ledger Context reminders disabled: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return undefined;
+		}
+	};
 
-	pi.on("agent_end", async (event, ctx) => {
-		const state = getState(ctx);
-		const assistant = [...event.messages].reverse().find((message) => message.role === "assistant");
-		state.lastAgentStopReason = assistant?.stopReason;
-	});
-
+	// After a tool batch the run continues. For a physical model, steering joins the history after the compaction that
+	// precedes the next model response, so the request stays out of the tail that compaction retains. A queued request
+	// waits behind earlier steering and counts as delivered.
 	pi.on("turn_end", async (event, ctx) => {
-		if (event.message.role !== "assistant" || event.toolResults.length === 0) return;
-		try {
-			const state = getState(ctx);
-			if (blockIfPersistenceUncertain(state, ctx)) return;
-			deliverReminderReasons(pi, state, ctx, settingsReader, "steer");
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			notify(ctx, `Ledger Context budget reminders disabled: ${message}`, "error");
-		}
+		if (event.outcome !== "completed" || event.toolResults.length === 0) return;
+		if (event.context.pendingMessages.some((message) => message.role === "custom" && message.customType === REMINDER_MESSAGE_TYPE)) return;
+		const draft = reminder(ctx);
+		if (draft) pi.sendMessage(draft, { deliverAs: "steer" });
 	});
 
-	pi.on("agent_settled", async (_event, ctx) => {
-		try {
-			const state = getState(ctx);
-			if (blockIfPersistenceUncertain(state, ctx)) return;
-			const normalSettlement = state.lastAgentStopReason === "stop";
-			reconcileReminderQueue(state, ctx, normalSettlement);
-			state.lastAgentStopReason = undefined;
-			deliverReminderReasons(pi, state, ctx, settingsReader, "defer");
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			notify(ctx, `Ledger Context budget reminders disabled: ${message}`, "error");
-		}
+	// A run ending without a tool batch gets one more turn for a repeated or urgent request; a first request waits for the next tool batch.
+	pi.on("agent_before_settle", async (event, ctx) => {
+		if (event.outcome !== "completed") return;
+		const draft = reminder(ctx);
+		if (!draft || (draft.details.sequence === 0 && draft.details.pressure !== "urgent")) return;
+		return { entries: [...event.entries, draft], continue: true };
 	});
 
-	pi.on("input", async (event, ctx) => {
+	pi.on("input", async (_event, ctx) => {
 		const state = getState(ctx);
 		if (blockIfPersistenceUncertain(state, ctx)) return { action: "handled" };
-		const qualifiesAsNormalInput =
-			(event.source === "interactive" || event.source === "rpc") && event.streamingBehavior === undefined && ctx.isIdle();
-		state.pendingNormalInput = qualifiesAsNormalInput;
 		return undefined;
 	});
 
