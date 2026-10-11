@@ -207,11 +207,27 @@ test("quote resolution respects request boundaries, edits, maintenance exclusion
 	await fixture.session.prompt("Save the snapshot.");
 	const checkpoint = checkpointEntries(manager.getBranch()).at(-1)!;
 	const data = checkpoint.data as any;
-	assert.deepEqual(data.sourceReferences.map((reference: any) => reference.matchCount), [1, 0, 0, 6, 0, 0]);
+	assert.deepEqual(data.sourceReferences.map((reference: any) => reference.matchCount), [1, 0, 0, 6, 1, 0]);
 	assert.deepEqual(data.sourceReferences[0].matches, [{ entryId: edited, editEntryId: edit, offset: 0 }]);
 	assert.deepEqual(data.sourceReferences[3].matches.map((match: any) => match.entryId), duplicates.slice(0, 4));
 	await fixture.session.reload();
 	assert.deepEqual((checkpointEntries(manager.getBranch()).at(-1)!.data as any).sourceReferences, data.sourceReferences);
+});
+
+test("source quotes match model-visible extension messages with context edits applied", async (t) => {
+	const fixture = await createFixture(false, [], 1, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const manager = fixture.sessionManager;
+	const hidden = manager.appendCustomMessageEntry("subagent-result", "hidden subagent finding", false);
+	const edited = manager.appendCustomMessageEntry("team-message", "original team phrase", true);
+	const edit = manager.appendContextEdit(edited, { content: "replaced team phrase" });
+	manager.appendCustomEntry("test/state", "extension state phrase");
+	fixture.faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Team evidence saved.",
+		sourceQuotes: ["hidden subagent finding", "replaced team phrase", "original team phrase", "extension state phrase"] })), fauxAssistantMessage("saved")]);
+	await fixture.session.prompt("Save the team evidence.");
+	const data = checkpointEntries(manager.getBranch()).at(-1)!.data as any;
+	assert.deepEqual(data.sourceReferences.map((reference: any) => reference.matches),
+		[[{ entryId: hidden, offset: 0 }], [{ entryId: edited, editEntryId: edit, offset: 0 }], [], []]);
 });
 
 test("delta reference footers are parsed, bounded to supplied sources and replaced with each cumulative ledger", async (t) => {
@@ -2079,6 +2095,45 @@ test("new work counts ordinary work while excluding maintenance entries", { time
 		assert.ok(index(details.fromEntryId) >= 0 && index(details.fromEntryId) <= index(mixedAssistantId));
 		assert.ok(![maintenanceResultId, maintenanceAssistantId].includes(details.toEntryId));
 		assert.match(String(reminders[0].content), /^Ledger Context reminder: \d+ tokens of new work since your last checkpoint[,.]/);
+	} finally {
+		session.dispose();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("new work counts extension messages and context-visible shell executions", { timeout: TEST_TIMEOUT_MS }, async () => {
+	// A 14400-token boundary with a 3200-token soft lead time gives a 3733-token interval.
+	const { root, faux, session, sessionManager } = await createFixture(true, [], 2_000, { contextWindow: 16_000, maxTokens: 512, reserveTokens: 0, compactionEnabled: false });
+	try {
+		faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "volume checkpoint" })), fauxAssistantMessage("volume checkpoint completed")]);
+		await session.prompt("save the volume checkpoint");
+		sessionManager.appendCustomMessageEntry("subagent-result", "s".repeat(8_000), false);
+		const bash = { role: "bashExecution" as const, command: "cat log", exitCode: 0, cancelled: false, truncated: false, timestamp: Date.now() };
+		sessionManager.appendMessage({ ...bash, output: "b".repeat(8_000) });
+		sessionManager.appendMessage({ ...bash, output: "x".repeat(40_000), excludeFromContext: true });
+		await toolBatchPrompt(session, faux, "cross the volume boundary");
+		const reminders = reminderEntries(sessionManager.getBranch());
+		assert.equal(reminders.length, 1);
+		const { newWorkTokens } = reminders[0].details as { newWorkTokens: number };
+		assert.ok(newWorkTokens >= 4_000 && newWorkTokens < 4_500, `visible work only: ${newWorkTokens}`);
+	} finally {
+		session.dispose();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("new work measures context-edited entries as the model sees them", { timeout: TEST_TIMEOUT_MS }, async () => {
+	// A 14400-token boundary with a 3200-token soft lead time gives a 3733-token interval; each original alone exceeds it.
+	const { root, faux, session, sessionManager } = await createFixture(true, [], 2_000, { contextWindow: 16_000, maxTokens: 512, reserveTokens: 0, compactionEnabled: false });
+	try {
+		faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "volume checkpoint" })), fauxAssistantMessage("volume checkpoint completed")]);
+		await session.prompt("save the volume checkpoint");
+		const omitted = sessionManager.appendCustomMessageEntry("team-message", "o".repeat(20_000), false);
+		sessionManager.appendContextEdit(omitted, null);
+		const replaced = sessionManager.appendCustomMessageEntry("team-message", "r".repeat(20_000), false);
+		sessionManager.appendContextEdit(replaced, { content: "short replacement summary" });
+		await toolBatchPrompt(session, faux, "stay below the volume boundary");
+		assert.equal(reminderEntries(sessionManager.getBranch()).length, 0);
 	} finally {
 		session.dispose();
 		rmSync(root, { recursive: true, force: true });

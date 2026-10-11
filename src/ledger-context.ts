@@ -743,7 +743,10 @@ function isMaintenanceToolCall(block: any): boolean {
 }
 
 function volumeMessagesForEntry(entry: SessionEntry): ContextMessage[] {
+	if (entry.type === "custom_message") return entry.customType === REMINDER_MESSAGE_TYPE ? [] : sessionEntryToContextMessages(entry) as ContextMessage[];
 	if (entry.type !== "message") return [];
+	// Pi's convertToLlm drops bash executions excluded from context.
+	if (entry.message.role === "bashExecution") return entry.message.excludeFromContext ? [] : sessionEntryToContextMessages(entry) as ContextMessage[];
 	const message = entry.message as MessageLike;
 	if (message.role === "user") return sessionEntryToContextMessages(entry) as ContextMessage[];
 	if (message.role === "toolResult") {
@@ -764,8 +767,10 @@ function volumeMeasurement(entries: SessionEntry[], startIndex: number): VolumeM
 	let tokens = 0;
 	let fromEntryId: string | null = null;
 	let toEntryId: string | null = null;
+	const edits = contextEdits(entries);
 	for (let index = Math.max(0, startIndex); index < entries.length; index++) {
-		const messages = volumeMessagesForEntry(entries[index]);
+		const effective = editedHistoryEntry(entries[index], edits.get(entries[index].id));
+		const messages = effective ? volumeMessagesForEntry(effective) : [];
 		if (messages.length === 0) continue;
 		tokens += estimateMessageTokens(messages);
 		fromEntryId ??= entries[index].id;
@@ -2338,7 +2343,7 @@ function hydrateState(state: SessionState, entries: SessionEntry[], ctx: Extensi
 		const validateReferenceSources = (references: SourceReference[], through: number) => {
 			for (const reference of references) for (const match of reference.matches) {
 				const source = entries[ancestor(match.entryId, through)];
-				if (source.type !== "message") throw new Error("invalid source reference entry");
+				if (source.type !== "message" && (source.type !== "custom_message" || source.customType === REMINDER_MESSAGE_TYPE)) throw new Error("invalid source reference entry");
 				if (match.editEntryId !== undefined) {
 					const edit = entries[ancestor(match.editEntryId, through)];
 					if (edit.type !== "context_edit" || edit.targetId !== match.entryId || edit.replacement === null) throw new Error("invalid source reference edit");
@@ -2576,6 +2581,10 @@ function validSourceReferences(value: unknown): value is SourceReference[] {
 /** Source quotes search original message content, with branch edits and maintenance traffic removed. */
 function sourceMaterial(entry: SessionEntry, edit?: ContextEditEntry): { entry: SessionEntry; text: string } | undefined {
 	const effective = editedHistoryEntry(entry, edit);
+	if (effective?.type === "custom_message" && effective.customType !== REMINDER_MESSAGE_TYPE) {
+		const text = contentText(effective.content, edit?.id ?? entry.id);
+		return text.trim() ? { entry: effective, text } : undefined;
+	}
 	if (!effective || effective.type !== "message") return undefined;
 	let message = effective.message;
 	if (message.role === "toolResult" && isMaintenanceToolName(message.toolName)) return undefined;
