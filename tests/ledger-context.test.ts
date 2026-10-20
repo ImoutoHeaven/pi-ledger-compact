@@ -148,12 +148,32 @@ test("checkpoint edits change the saved state, fold compaction changes and keep 
 	assert.match(quoted.ledger, /keep API v2\.[\s\S]*Tests passed on Linux\.\n\n## Folded compaction changes\nRelease started\.$/);
 	assert.deepEqual(quoted.sourceReferences.map((reference: any) => reference.quote), ["Release started."]);
 	assert.match(receipts().at(-1)!, /holds 2 "## Folded compaction changes" sections\. Make your next save a complete ledger that merges them/);
+	// Edits that change nothing, or no mode at all, say what to send.
+	const saves = checkpointEntries(manager.getBranch()).length;
+	await save({ edits: [{ oldText: "Release started.", newText: "Release started." }] }, { ledger: null } as never, { sourceQuotes: [] });
+	assert.equal(checkpointEntries(manager.getBranch()).length, saves);
+	const [unchanged, empty, emptyQuotes] = receipts().slice(-3);
+	assert.match(unchanged, /edits change nothing/);
+	assert.match(empty, /or sourceQuotes alone/);
+	assert.match(emptyQuotes, /or sourceQuotes alone/);
 	// SDK callers bypass the model-facing schema; a sparse edit list must not save an unchanged checkpoint.
 	const checkpointTool = session.getToolDefinition("checkpoint")!;
 	await assert.rejects(checkpointTool.execute("sparse-edits", { edits: new Array(1) } as never, undefined, undefined, { sessionManager: manager } as never), /edits must be a non-empty list/);
 	assert.equal((checkpointEntries(manager.getBranch()).at(-1)!.data as any).ledger, quoted.ledger);
 	await save({ ledger: "State.\r\n\r\n## Folded compaction changes\r\nA.\r\n\r\n## Folded compaction changes\r\nB." });
 	assert.match(receipts().at(-1)!, /holds 2 "## Folded compaction changes" sections/, "CRLF headings count as sections");
+	// Quotes alone keep the saved state, the compaction changes included, as a new baseline.
+	const stateBefore = (checkpointEntries(manager.getBranch()).at(-1)!.data as any).ledger;
+	manager.appendMessage({ role: "user", content: "Deploy finished.", timestamp: Date.now() });
+	manager.appendMessage(fauxAssistantMessage("deploy work ".repeat(100)));
+	ledgerFaux.setResponses([fauxAssistantMessage("Deploy finished.")]);
+	await session.compact();
+	await save({ ledger: "", sourceQuotes: ["Deploy finished."] });
+	const requoted = checkpointEntries(manager.getBranch()).at(-1)!.data as any;
+	assert.equal(requoted.ledger, `${stateBefore}\n\n## Folded compaction changes\nDeploy finished.`);
+	assert.deepEqual(requoted.sourceReferences.map((reference: any) => reference.quote), ["Deploy finished."]);
+	await session.reload();
+	assert.deepEqual(checkpointEntries(manager.getBranch()).at(-1)!.data, requoted);
 });
 
 test("a checkpoint saves when extensions finish binding while the request runs", async (t) => {

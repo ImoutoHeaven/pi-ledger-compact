@@ -4,7 +4,7 @@ Ledger Context 在 pi 会话日志中保存主 agent 的 checkpoint 和独立的
 
 ## 运行前提
 
-- 运行基线为 `@earendil-works/pi-coding-agent` 和 `@earendil-works/pi-ai` `>=1.1.0 <2.0.0`，要求 Node.js `>=22.19.0`；开发与验证使用 1.1.0。
+- 运行基线为 `@earendil-works/pi-coding-agent` 和 `@earendil-works/pi-ai` `>=1.1.0 <2.0.0`，要求 Node.js `>=22.19.0`；开发与验证使用 1.3.0。
 - 开启 pi 原生自动压缩以自动切换上下文窗口。pi 管理压缩阈值、会话日志、插入消息（steering）和后续消息（follow-up）队列，以及上下文溢出重试和压缩生命周期。
 - 每个会话配置一个压缩内容扩展。Ledger Context 为每个窗口提供压缩摘要和恢复引导。
 - 关闭原生自动压缩时，六个模型工具和手动 `/compact` 仍然可用。
@@ -32,7 +32,7 @@ pi install -l .
 
 使用 `checkpoint` 的 `ledger` 提交当前完整工作状态，可选的 `sourceQuotes` 提交从来源消息复制的原句，按恢复优先级排列并区分大小写。匹配将连续空白视为等价分隔符，并忽略引用首尾空白；文字、标点和词间边界保持字面含义。重要事实和约束直接写入 ledger。成功保存后替换后续压缩使用的基线及完整来源列表，省略 `sourceQuotes` 保存空列表；旧版本保留在历史中。
 
-也可以用 `edits: [{ oldText, newText }]` 代替 `ledger` 调用 `checkpoint`。编辑对象是已保存状态：最新 checkpoint ledger，存在当前压缩 delta 时其后接 `## Folded compaction changes` 与 delta 正文。每个 `oldText` 在该文本中恰好出现一次，所有编辑都匹配同一份原文且互不重叠；匹配失败时错误信息附带已保存状态的全文。编辑结果作为新的 checkpoint ledger，受相同大小限制，因此压缩后的保存会把 delta 并入 checkpoint。每次并入一次压缩增加一个区段；已保存的 ledger 含有多个区段时，回执要求下次保存提交一份完整 ledger，将这些区段合并进当前状态。使用 `edits` 时省略 `sourceQuotes` 会保留已保存的 checkpoint 引用及其后的 delta 引用，最多 8 条；提供时则替换。回执标明条目、ledger 大小、存储位置，以及各原句的 `matched`、`ambiguous` 或 `unmatched` 定位结果。Pi 控制压缩时机。
+也可以用 `edits: [{ oldText, newText }]` 代替 `ledger` 调用 `checkpoint`。编辑对象是已保存状态：最新 checkpoint ledger，存在当前压缩 delta 时其后接 `## Folded compaction changes` 与 delta 正文。每个 `oldText` 在该文本中恰好出现一次，所有编辑都匹配同一份原文且互不重叠；匹配失败时错误信息附带已保存状态的全文。编辑结果作为新的 checkpoint ledger，受相同大小限制，因此压缩后的保存会把 delta 并入 checkpoint。每次并入一次压缩增加一个区段；已保存的 ledger 含有多个区段时，回执要求下次保存提交一份完整 ledger，将这些区段合并进当前状态。使用 `edits` 时省略 `sourceQuotes` 会保留已保存的 checkpoint 引用及其后的 delta 引用，最多 8 条；提供时则替换。只提供非空 `sourceQuotes` 的调用会原样保存已保存状态，并换上新的引用。回执标明条目、ledger 大小、存储位置，以及各原句的 `matched`、`ambiguous` 或 `unmatched` 定位结果。Pi 控制压缩时机。
 
 原句在生成 checkpoint 的请求快照内定位，范围为当前分支的原始用户、助手、普通工具和扩展消息，并应用 context edit。每句记录匹配条目总数与按时间保留的前四个候选，包括 ID、编辑来源和首次命中位置。有歧义或未命中的引用随有效 ledger 保存。Agent 判断相关性，扩展提供字面定位信息。
 

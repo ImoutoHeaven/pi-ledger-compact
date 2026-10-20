@@ -113,7 +113,7 @@ const checkpointParameters = Type.Object({
 	sourceQuotes: optional(
 		Type.Array(Type.String({ minLength: 1, maxLength: MAX_SOURCE_QUOTE_LENGTH }), {
 			maxItems: MAX_SOURCE_REFERENCES,
-			description: "Exact phrases copied from earlier messages that locate key evidence, most important first. Case-sensitive; any whitespace run matches any other. Replaces the saved list; when omitted, ledger saves an empty list and edits keep the saved list. Unmatched phrases are reported and the save still succeeds.",
+			description: "Exact phrases copied from earlier messages that locate key evidence, most important first. Case-sensitive; any whitespace run matches any other. Replaces the saved list; when omitted, ledger saves an empty list and edits keep the saved list. Given alone, it keeps the saved state and replaces only the list. Unmatched phrases are reported and the save still succeeds.",
 		}),
 	),
 }, { additionalProperties: false });
@@ -2682,14 +2682,22 @@ function validateCheckpoint(
 	if (Object.keys(params).some((key) => key !== "ledger" && key !== "edits" && key !== "sourceQuotes")) throw validationError("unsupported checkpoint parameter");
 	// Callers that must fill every parameter send an empty ledger, or edits that change nothing, for the unused mode.
 	if (typeof params.ledger === "string" && params.ledger.trim() === "") params = { ...params, ledger: undefined };
+	const gaveEdits = Array.isArray(params.edits) && params.edits.length > 0;
 	if (Array.isArray(params.edits) && Array.from(params.edits).every((edit) => edit && typeof edit === "object" && edit.oldText === edit.newText)) params = { ...params, edits: undefined };
-	const editMode = params.edits !== undefined;
-	if (editMode === (params.ledger !== undefined)) throw validationError("provide either ledger (the complete state) or edits (changes to the saved state)");
+	// Non-empty quotes alone keep the saved state; an empty list is a strict caller's placeholder.
+	const quotesOnly = params.ledger === undefined && params.edits === undefined && Array.isArray(params.sourceQuotes) && params.sourceQuotes.length > 0;
+	const editMode = params.edits !== undefined || quotesOnly;
+	if (params.edits !== undefined && params.ledger !== undefined) throw validationError("provide either ledger (the complete state) or edits (changes to the saved state), not both");
+	if (!editMode && params.ledger === undefined) {
+		throw validationError(gaveEdits
+			? "edits change nothing: each oldText equals its newText; give edits that change the saved state, a complete ledger, or sourceQuotes alone to keep the saved state and replace its quotes"
+			: "provide ledger (the complete state), edits (changes to the saved state), or sourceQuotes alone (keeps the saved state and replaces its quotes)");
+	}
 	let ledger: string;
 	if (editMode) {
 		const base = savedStateText(state);
-		if (base === undefined) throw validationError("edits need a saved checkpoint or compaction changes; save a complete ledger first");
-		ledger = applyLedgerEdits(base, params.edits);
+		if (base === undefined) throw validationError(`${quotesOnly ? "sourceQuotes alone" : "edits"} need a saved checkpoint or compaction changes; save a complete ledger first`);
+		ledger = quotesOnly ? base : applyLedgerEdits(base, params.edits);
 	} else {
 		if (typeof params.ledger !== "string") throw validationError("ledger must be a non-empty string");
 		ledger = params.ledger;
@@ -2700,7 +2708,7 @@ function validateCheckpoint(
 	const estimatedLedgerTokens = ledgerTokenEstimate(ledger);
 	const capacityError = ledgerCapacityError(ledger, ledgerTokenLimit);
 	if (capacityError) {
-		throw validationError(editMode ? `${capacityError} after the edits (${estimatedLedgerTokens} estimated tokens); shorten it with more edits or save a complete ledger` : capacityError);
+		throw validationError(editMode ? `${capacityError} ${quotesOnly ? "in the saved state" : "after the edits"} (${estimatedLedgerTokens} estimated tokens); shorten it with more edits or save a complete ledger` : capacityError);
 	}
 	const sourceQuotes = params.sourceQuotes ?? [];
 	if (!Array.isArray(sourceQuotes) || sourceQuotes.length > MAX_SOURCE_REFERENCES || sourceQuotes.some((quote) => !validSourceSelector({ quote }))) {
