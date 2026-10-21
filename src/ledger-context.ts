@@ -482,8 +482,11 @@ interface SessionState {
 	checkpoint?: StoredCheckpoint;
 	delta?: StoredDelta;
 	currentAgentRequest?: { position: RequestHistoryPosition; recoveryBasis: RecoveryBasis | null };
-	/** The compaction the latest checkpoint call of this run asked for, at the boundary its mode names. */
-	pendingCompaction?: { toolCallId: string; mode: CompactMode };
+	/**
+	 * The compaction the latest checkpoint call of this run asked for, at the boundary its mode names. `proposed` names the
+	 * boundary draft that answered it: the compaction's window, or the note; the run's end checks that the branch holds it.
+	 */
+	pendingCompaction?: { toolCallId: string; mode: CompactMode; proposed?: { windowId: string } | "note" };
 	recoveryError?: string;
 	persistenceUncertain?: string;
 }
@@ -3038,6 +3041,17 @@ function compactionTooSmall(entries: SessionEntry[], cut: number, keepRecentToke
 	return estimateMessageTokens(removable) <= keepRecentTokens;
 }
 
+/** Why the compaction checkpoint call `toolCallId` asked for did not happen. */
+function compactionNote(toolCallId: string, reason: string): CustomMessageEntryDraft {
+	return {
+		type: "custom_message",
+		customType: COMPACTION_NOTE_TYPE,
+		content: `Ledger Context did not compact onto your checkpoint: ${reason}.`,
+		display: true,
+		details: { toolCallId },
+	};
+}
+
 function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): void {
 	const settingsReader = options.settingsReader;
 	const states = new Map<string, SessionState>();
@@ -3098,16 +3112,19 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 	const checkpointCompaction = (event: TurnEndEvent | AgentBeforeSettleEvent, ctx: ExtensionContext, mode: CompactMode) => {
 		const state = getState(ctx);
 		const pending = state.pendingCompaction;
-		if (!pending || pending.mode !== mode) return undefined;
+		if (!pending || pending.proposed || pending.mode !== mode) return undefined;
 		if (event.type === "turn_end" && !event.toolResults.some((result) => result.toolCallId === pending.toolCallId)) return undefined;
-		state.pendingCompaction = undefined;
-		if (event.outcome !== "completed" || ctx.signal?.aborted || blockIfPersistenceUncertain(state, ctx)) return undefined;
-		const skip = (reason: string): SessionBoundaryDraft[] => [...event.entries, {
-			type: "custom_message",
-			customType: COMPACTION_NOTE_TYPE,
-			content: `Ledger Context did not compact onto your checkpoint: ${reason}.`,
-			display: true,
-		}];
+		if (blockIfPersistenceUncertain(state, ctx)) {
+			state.pendingCompaction = undefined;
+			return undefined;
+		}
+		const skip = (reason: string): SessionBoundaryDraft[] => {
+			pending.proposed = "note";
+			return [...event.entries, compactionNote(pending.toolCallId, reason)];
+		};
+		if (event.outcome !== "completed") return skip(event.outcome === "aborted" ? "the run was aborted" : "the model request failed");
+		// Set at a turn boundary when an earlier handler stopped the run.
+		if (ctx.signal?.aborted) return skip("the run was stopped at this boundary");
 		const entries = ctx.sessionManager.getBranch();
 		hydrateState(state, entries, ctx, false);
 		if (state.recoveryError) return skip(state.recoveryError);
@@ -3132,6 +3149,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 			const availableTokens = knownLimit(limits.model?.contextWindow) - requestFixedTokens(pi, ctx) - budgets.outputReserveTokens;
 			const requiredTokens = ledgerTokenEstimate(summary) + keptTokens;
 			if (requiredTokens > availableTokens) return skip(`the recovery summary and the messages kept from the checkpoint call on need ${requiredTokens} tokens, above the ${availableTokens}-token budget`);
+			pending.proposed = { windowId: details.windowId };
 			return [...event.entries, { type: "compaction" as const, summary, firstKeptEntryId, details }];
 		} catch (error) {
 			return skip(error instanceof Error ? error.message : String(error));
@@ -3166,9 +3184,20 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		return undefined;
 	});
 
-	// A compaction a checkpoint asked for belongs to its run.
+	// A compaction a checkpoint asked for belongs to its run. One the run never reached, or whose draft a later handler
+	// dropped, gets its note here, for the next request.
 	pi.on("agent_settled", async (_event, ctx) => {
-		getState(ctx).pendingCompaction = undefined;
+		const state = getState(ctx);
+		const pending = state.pendingCompaction;
+		state.pendingCompaction = undefined;
+		if (!pending || state.recoveryError || state.persistenceUncertain) return;
+		const proposed = pending.proposed;
+		const committed = proposed && ctx.sessionManager.getBranch().some((entry) => proposed === "note"
+			? entry.type === "custom_message" && entry.customType === COMPACTION_NOTE_TYPE && (entry.details as { toolCallId?: unknown } | undefined)?.toolCallId === pending.toolCallId
+			: entry.type === "compaction" && (entry.details as { windowId?: unknown } | undefined)?.windowId === proposed.windowId);
+		if (committed) return;
+		const { type: _type, ...note } = compactionNote(pending.toolCallId, proposed ? "the boundary entries that carried it were dropped" : "the run ended before its compaction point");
+		pi.sendMessage(note, { triggerTurn: false });
 	});
 
 	pi.on("session_tree", async (_event, ctx) => {

@@ -20,6 +20,7 @@ import {
 	sessionEntryToContextMessages,
 	type ExtensionAPI,
 	type ExtensionError,
+	type SessionBoundaryDraft,
 	type SessionEntry,
 	type ToolDefinition,
 	type CreateAgentSessionRuntimeFactory,
@@ -764,6 +765,8 @@ async function createFixture(
 		settingsReader?: LedgerContextSettingsReader | null;
 		requestOptionsReader?: LedgerContextOptions["requestOptionsReader"];
 		modelInput?: ("text" | "image")[];
+		/** Extensions loaded before Ledger Context, whose boundary handlers run first. */
+		earlierExtensions?: Array<(pi: ExtensionAPI) => void>;
 	} = {},
 ) {
 	const root = mkdtempSync(join(tmpdir(), "pi-ledger-context-"));
@@ -810,7 +813,7 @@ async function createFixture(
 		agentDir,
 		settingsManager,
 		noExtensions: true,
-		extensionFactories: [ledgerExtension, ...extraExtensions],
+		extensionFactories: [...(options.earlierExtensions ?? []), ledgerExtension, ...extraExtensions],
 	});
 	await resourceLoader.reload();
 
@@ -6732,6 +6735,150 @@ test("checkpoint compact skips small sessions, needs new state, follows the late
 	assert.equal(note.type === "custom_message" && note.customType, COMPACTION_NOTE_TYPE);
 	assert.match(JSON.stringify(note), /did not compact onto your checkpoint: a context edit after the checkpoint call/);
 	assert.equal(ledgerFaux.state.callCount, 0);
+});
+
+function compactionNotes(entries: SessionEntry[]) {
+	return entries.filter((entry): entry is Extract<SessionEntry, { type: "custom_message" }> => entry.type === "custom_message" && entry.customType === COMPACTION_NOTE_TYPE);
+}
+
+/** Another extension's boundary messages: one after the first tool batch, and one before settling that continues the run once. */
+function boundaryMessages(pi: ExtensionAPI) {
+	let turn = false;
+	let settle = false;
+	const message = (content: string) => ({ type: "custom_message" as const, customType: "other-extension", content, display: true });
+	pi.on("turn_end", async (event) => {
+		if (turn || !event.toolResults.length) return;
+		turn = true;
+		return { entries: [...event.entries, message("other extension turn message")] };
+	});
+	pi.on("agent_before_settle", async (event) => {
+		if (settle) return;
+		settle = true;
+		return { entries: [...event.entries, message("other extension settle message")], continue: true };
+	});
+}
+
+for (const order of ["before", "after"] as const) {
+	for (const mode of ["continue", "stop"] as const) {
+		test(`checkpoint compact ${mode} keeps boundary messages of an extension loaded ${order} it`, async (t) => {
+			const fixture = await createFixture(true, order === "after" ? [boundaryMessages] : [], 64, {
+				compactionEnabled: false,
+				earlierExtensions: order === "before" ? [boundaryMessages] : [],
+			});
+			t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+			const { session, sessionManager: manager, faux } = fixture;
+			manager.appendMessage({ role: "user", content: "old evidence ".repeat(400), timestamp: Date.now() });
+			manager.appendMessage(fauxAssistantMessage("old answer"));
+			const contexts: string[] = [];
+			const capture = (text: string) => (context: Context) => { contexts.push(JSON.stringify(context.messages)); return fauxAssistantMessage(text); };
+			faux.setResponses([
+				fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Handoff with other messages.", compact: mode })),
+				capture("reply after the tool batch"),
+				capture("reply after the settle message"),
+			]);
+			const errorsBefore = extensionErrors.length;
+			await session.prompt("Hand off.");
+			const branch = manager.getBranch();
+			const compaction = latestCompaction(branch);
+			assert.equal(compaction.firstKeptEntryId, checkpointCallEntry(branch).id);
+			assert.deepEqual(compactionNotes(branch), []);
+			const last = contexts.at(-1)!;
+			assert.match(last, /Ledger Context Recovery/);
+			assert.match(last, /other extension turn message/);
+			assert.match(last, /other extension settle message/);
+			assert.doesNotMatch(last, /old evidence/);
+			await session.reload();
+			faux.setResponses([fauxAssistantMessage("resumed")]);
+			await session.prompt("Continue.");
+			assert.deepEqual(extensionErrors.slice(errorsBefore), []);
+		});
+	}
+}
+
+// A draft that targets no entry makes Pi drop every draft of that boundary.
+const invalidDraft = { type: "context_edit" as const, targetId: "missing-entry", replacement: null };
+
+for (const answer of ["compaction", "note"] as const) {
+	test(`a checkpoint compaction whose ${answer} draft a later handler drops gets one note when the run settles`, async (t) => {
+		const drop = async (event: { entries: SessionBoundaryDraft[] }) => {
+			if (!event.entries.some((draft) => draft.type === "compaction" || (draft.type === "custom_message" && draft.customType === COMPACTION_NOTE_TYPE))) return;
+			return { entries: [...event.entries, invalidDraft] };
+		};
+		const dropBatch = (pi: ExtensionAPI) => answer === "compaction" ? pi.on("turn_end", drop) : pi.on("agent_before_settle", drop);
+		// The note case: the final reply leaves no room for the kept messages, so Ledger Context answers with a note.
+		const fixture = await createFixture(false, [dropBatch], 64, { compactionEnabled: false, ...(answer === "note" ? { contextWindow: 30_000 } : {}) });
+		t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+		const { session, sessionManager: manager, faux } = fixture;
+		manager.appendMessage({ role: "user", content: "old evidence ".repeat(400), timestamp: Date.now() });
+		manager.appendMessage(fauxAssistantMessage("old answer"));
+		faux.setResponses(answer === "compaction"
+			? [fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Handoff.", compact: "continue" })), fauxAssistantMessage("kept working")]
+			: [fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Handoff.", compact: "stop" })), fauxAssistantMessage("long final reply ".repeat(8_000))]);
+		const errorsBefore = extensionErrors.length;
+		await session.prompt("Hand off.");
+		assert.deepEqual(extensionErrors.splice(errorsBefore).map((error) => error.error), ["Invalid boundary entries: Entry missing-entry not found"]);
+		const branch = manager.getBranch();
+		assert.equal(branch.some((entry) => entry.type === "compaction"), false);
+		const notes = compactionNotes(branch);
+		assert.equal(notes.length, 1);
+		assert.equal(branch.at(-1), notes[0]);
+		assert.match(String(notes[0].content), /did not compact onto your checkpoint: the boundary entries that carried it were dropped/);
+		assert.equal((notes[0].details as { toolCallId?: string }).toolCallId, (checkpointReceipts(branch).at(-1)!.message as any).toolCallId);
+	});
+}
+
+test("a checkpoint compaction the run never reaches, or that another extension stops at its boundary, gets a note", async (t) => {
+	// Loaded first, so Ledger Context finds the run stopped at the same boundary.
+	const stopAtBoundary = (pi: ExtensionAPI) => pi.on("turn_end", async (event, ctx) => { if (event.toolResults.length) ctx.abort(); });
+	const stopped = await createFixture(false, [], 64, { compactionEnabled: false, earlierExtensions: [stopAtBoundary] });
+	t.after(() => { stopped.session.dispose(); rmSync(stopped.root, { recursive: true, force: true }); });
+	stopped.sessionManager.appendMessage({ role: "user", content: "old evidence ".repeat(400), timestamp: Date.now() });
+	stopped.faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Handoff.", compact: "continue" })), fauxAssistantMessage("unreachable")]);
+	await stopped.session.prompt("Hand off.");
+	const stoppedBranch = stopped.sessionManager.getBranch();
+	assert.equal(stoppedBranch.some((entry) => entry.type === "compaction"), false);
+	assert.deepEqual(compactionNotes(stoppedBranch).map((note) => note.content), ["Ledger Context did not compact onto your checkpoint: the run was stopped at this boundary."]);
+
+	// A stop-mode compaction waits for the run to settle; an abort after the tool batch skips that boundary.
+	const aborted = await createFixture(false, [stopAtBoundary], 64, { compactionEnabled: false });
+	t.after(() => { aborted.session.dispose(); rmSync(aborted.root, { recursive: true, force: true }); });
+	aborted.sessionManager.appendMessage({ role: "user", content: "old evidence ".repeat(400), timestamp: Date.now() });
+	aborted.faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Handoff.", compact: "stop" })), fauxAssistantMessage("unreachable")]);
+	await aborted.session.prompt("Hand off.");
+	const abortedBranch = aborted.sessionManager.getBranch();
+	assert.equal(abortedBranch.some((entry) => entry.type === "compaction"), false);
+	assert.deepEqual(compactionNotes(abortedBranch).map((note) => note.content), ["Ledger Context did not compact onto your checkpoint: the run ended before its compaction point."]);
+	assert.equal(abortedBranch.at(-1)!.type, "custom_message");
+});
+
+test("a stop compaction commits when another extension aborts the run before it settles, and a failed final reply gets a note", async (t) => {
+	// Pi commits the drafts of agent_before_settle before it honours an abort requested there.
+	const abortAtSettle = (pi: ExtensionAPI) => pi.on("agent_before_settle", async (_event, ctx) => { ctx.abort(); });
+	for (const order of ["before", "after"] as const) {
+		const fixture = await createFixture(false, order === "after" ? [abortAtSettle] : [], 64, {
+			compactionEnabled: false,
+			earlierExtensions: order === "before" ? [abortAtSettle] : [],
+		});
+		t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+		fixture.sessionManager.appendMessage({ role: "user", content: "old evidence ".repeat(400), timestamp: Date.now() });
+		fixture.faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Handoff.", compact: "stop" })), fauxAssistantMessage("final reply")]);
+		await fixture.session.prompt("Hand off.");
+		const branch = fixture.sessionManager.getBranch();
+		assert.equal(latestCompaction(branch).firstKeptEntryId, checkpointCallEntry(branch).id, order);
+		assert.deepEqual(compactionNotes(branch), [], order);
+	}
+
+	const failing = await createFixture(false, [], 64, { compactionEnabled: false });
+	t.after(() => { failing.session.dispose(); rmSync(failing.root, { recursive: true, force: true }); });
+	failing.sessionManager.appendMessage({ role: "user", content: "old evidence ".repeat(400), timestamp: Date.now() });
+	failing.faux.setResponses([
+		fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Handoff.", compact: "stop" })),
+		fauxAssistantMessage("", { stopReason: "error", errorMessage: "401 authentication failed" }),
+	]);
+	await failing.session.prompt("Hand off.").catch(() => undefined);
+	const branch = failing.sessionManager.getBranch();
+	assert.equal(branch.some((entry) => entry.type === "compaction"), false);
+	assert.deepEqual(compactionNotes(branch).map((note) => note.content), ["Ledger Context did not compact onto your checkpoint: the model request failed."]);
 });
 
 test("tool prompt text names its tool, stays within the static budget, declares null for omitted parameters, and keeps the tools out of script calls", async (t) => {

@@ -38,7 +38,7 @@ pi install -l .
 
 以 `ledger` 或 `edits` 保存时加上 `compact: "continue"` 或 `compact: "stop"`，会同时把上下文压缩到新 checkpoint 上；只提供 `sourceQuotes` 时拒绝 `compact`。`continue` 在包含这次调用的工具批次结束后立即压缩，run 继续进行。`stop` 在 run 结束前的边界、agent 给出最终回复之后压缩；之后 run 结束，除非 Pi 或其他扩展让它继续。压缩从包含 checkpoint 调用的助手消息起原样保留分支。checkpoint 涵盖该消息之前的全部内容，因此不生成 delta，下一个窗口的 delta 会涵盖保留的消息。Pi 以边界条目提交这次压缩：run 不经中止继续进行，也不触发 Pi 的压缩事件。
 
-回执标明 `Compaction scheduled`；调用之前的上下文（不含最近一次恢复摘要）不超过 Pi 的 `keepRecentTokens` 时，标明 `Nothing to compact (session too small)`。同一 run 中以最后一次保存为准：之后不带 `compact` 的保存会取消待执行的请求，在其边界之前中止则使请求作废。更新的压缩、之后对 checkpoint 已涵盖历史的 context edit，或恢复摘要加保留消息超出模型预算时，跳过这次压缩，并以 `ledger-context/compaction-note` 消息说明原因。其余压缩都由 Pi 发起。
+回执标明 `Compaction scheduled`；调用之前的上下文（不含最近一次恢复摘要）不超过 Pi 的 `keepRecentTokens` 时，标明 `Nothing to compact (session too small)`。同一 run 中以最后一次保存为准：之后不带 `compact` 的保存会取消待执行的请求，不留说明。切换会话和树导航也会丢弃该请求。其余未执行压缩的情况，都由当前分支上的 `ledger-context/compaction-note` 消息向下一次请求说明原因：run 被中止或模型请求失败、其他扩展在 `turn_end` 边界停止 run、run 在其边界之前结束、其他处理器丢弃了边界条目、更新的压缩、之后对 checkpoint 已涵盖历史的 context edit，或恢复摘要加保留消息超出模型预算。在 `agent_before_settle` 期间请求的中止保留边界条目，因此 `stop` 压缩仍会提交。其余压缩都由 Pi 发起。
 
 原句在生成 checkpoint 的请求快照内定位，范围为当前分支的原始用户、助手、普通工具和扩展消息，并应用 context edit。每句记录匹配条目总数与按时间保留的前四个候选，包括 ID、编辑来源和首次命中位置。有歧义或未命中的引用随有效 ledger 保存。Agent 判断相关性，扩展提供字面定位信息。
 
