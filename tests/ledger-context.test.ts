@@ -43,7 +43,7 @@ import {
 import { stream as streamResponses, streamSimple as streamSimpleResponses } from "@earendil-works/pi-ai/api/openai-responses";
 import { stream as streamCompletions } from "@earendil-works/pi-ai/api/openai-completions";
 import { stream as streamAnthropic } from "@earendil-works/pi-ai/api/anthropic-messages";
-import { CHECKPOINT_ENTRY_TYPE, REMINDER_MESSAGE_TYPE, createLedgerContext, type LedgerContextOptions, type LedgerContextSettingsReader, type LedgerCompactionDetails } from "../src/ledger-context.ts";
+import { CHECKPOINT_ENTRY_TYPE, COMPACTION_NOTE_TYPE, REMINDER_MESSAGE_TYPE, createLedgerContext, type LedgerContextOptions, type LedgerContextSettingsReader, type LedgerCompactionDetails } from "../src/ledger-context.ts";
 
 const TEST_TIMEOUT_MS = 5_000;
 const extensionErrors: ExtensionError[] = [];
@@ -6561,6 +6561,179 @@ test("complete history outputs fit a budget equal to their own size", async (t) 
 	}
 });
 
+function checkpointCallEntry(entries: SessionEntry[]): Extract<SessionEntry, { type: "message" }> {
+	const entry = messageEntries(entries).filter((candidate) => candidate.message.role === "assistant" &&
+		candidate.message.content.some((block) => block.type === "toolCall" && block.name === "checkpoint")).at(-1);
+	assert.ok(entry);
+	return entry;
+}
+
+function checkpointReceipts(entries: SessionEntry[]): Array<Extract<SessionEntry, { type: "message" }>> {
+	return messageEntries(entries).filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "checkpoint");
+}
+
+test("checkpoint compact continue compacts onto the checkpoint after its tool batch, keeps working and survives reload", async (t) => {
+	// An extension that appends during the boundary moves the leaf before Pi commits the compaction.
+	const probe = (pi: ExtensionAPI) => pi.on("turn_end", async () => { pi.appendEntry("boundary-probe", {}); });
+	const fixture = await createFixture(true, [probe], 64, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager: manager, faux, ledgerFaux } = fixture;
+	manager.appendMessage({ role: "user", content: "old evidence ".repeat(400), timestamp: Date.now() });
+	manager.appendMessage(fauxAssistantMessage("old answer"));
+	let nextContext = "";
+	faux.setResponses([
+		fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Handoff: finish the parser task.", compact: "continue" })),
+		(context) => { nextContext = JSON.stringify(context.messages); return fauxAssistantMessage("continued after compaction"); },
+	]);
+	await session.prompt("Hand off and keep working.");
+	const branch = manager.getBranch();
+	const compaction = latestCompaction(branch);
+	const call = checkpointCallEntry(branch);
+	const receipt = checkpointReceipts(branch).at(-1)!;
+	assert.equal(compaction.firstKeptEntryId, call.id);
+	assert.equal((compaction.details as LedgerCompactionDetails).delta.status, "empty");
+	assert.equal((compaction.details as LedgerCompactionDetails).checkpointEntryId, checkpointEntries(branch).at(-1)!.id);
+	assert.notEqual(compaction.parentId, (compaction.details as LedgerCompactionDetails).sourceBranchTip);
+	assert.match(compaction.summary, /Handoff: finish the parser task\./);
+	assert.match(toolResultText(receipt), /Compaction scheduled: .*right after this tool batch/);
+	assert.deepEqual((receipt.message as any).details.compaction, { mode: "continue", status: "scheduled" });
+	assert.ok(branch.indexOf(receipt) < branch.indexOf(compaction));
+	assert.equal(messageEntries(branch).at(-1)!.message.role, "assistant");
+	assert.ok(branch.indexOf(compaction) < branch.indexOf(messageEntries(branch).at(-1)!));
+	assert.equal(ledgerFaux.state.callCount, 0);
+	assert.equal(faux.state.callCount, 2);
+	assert.match(nextContext, /Ledger Context Recovery/);
+	assert.match(nextContext, /Compaction scheduled/);
+	assert.doesNotMatch(nextContext, /old evidence/);
+	await session.reload();
+	const errorsBefore = extensionErrors.length;
+	faux.setResponses([fauxAssistantMessage("resumed")]);
+	await session.prompt("Continue.");
+	assert.deepEqual(extensionErrors.slice(errorsBefore), []);
+	assert.match(JSON.stringify(messageEntries(manager.getBranch()).at(-1)!.message), /"resumed"/);
+});
+
+test("checkpoint compact stop compacts after the final reply and ends the run", async (t) => {
+	const fixture = await createFixture(false, [], 64, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager: manager, faux, ledgerFaux } = fixture;
+	manager.appendMessage({ role: "user", content: "old evidence ".repeat(400), timestamp: Date.now() });
+	manager.appendMessage(fauxAssistantMessage("old answer"));
+	faux.setResponses([
+		fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Handoff: wait for review.", compact: "stop" })),
+		fauxAssistantMessage("final reply before compaction"),
+	]);
+	await session.prompt("Hand off and stop.");
+	const branch = manager.getBranch();
+	const compaction = latestCompaction(branch);
+	assert.equal(branch.at(-1), compaction);
+	assert.equal(compaction.firstKeptEntryId, checkpointCallEntry(branch).id);
+	assert.equal((compaction.details as LedgerCompactionDetails).delta.status, "empty");
+	assert.match(toolResultText(checkpointReceipts(branch).at(-1)!), /Compaction scheduled: .*when you end your turn/);
+	assert.equal(faux.state.callCount, 2);
+	assert.equal(ledgerFaux.state.callCount, 0);
+	let nextContext = "";
+	faux.setResponses([(context) => { nextContext = JSON.stringify(context.messages); return fauxAssistantMessage("next run"); }]);
+	await session.prompt("Review is done.");
+	assert.match(nextContext, /Handoff: wait for review\./);
+	assert.match(nextContext, /final reply before compaction/);
+	assert.doesNotMatch(nextContext, /old evidence/);
+});
+
+test("checkpoint compact counts only the conversation before the call toward the small-session floor", async (t) => {
+	// The system prompt alone exceeds this keepRecentTokens, and it stays after compaction.
+	const fixture = await createFixture(false, [], 8, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	fixture.faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Small.", compact: "continue" })), fauxAssistantMessage("done")]);
+	await fixture.session.prompt("x");
+	assert.match(toolResultText(checkpointReceipts(fixture.sessionManager.getBranch()).at(-1)!), /Nothing to compact \(session too small\)/);
+	assert.equal(fixture.sessionManager.getBranch().some((entry) => entry.type === "compaction"), false);
+});
+
+test("a failed append of a checkpoint compaction blocks later requests and keeps the durable checkpoint", async (t) => {
+	let log = "";
+	// Replacing the session file with a directory makes Pi's append of the compaction entry fail.
+	const breakLog = (pi: ExtensionAPI) => pi.on("turn_end", (event) => {
+		if (!event.entries.some((draft) => draft.type === "compaction")) return;
+		log = fixture.sessionManager.getSessionFile()!;
+		renameSync(log, `${log}.saved`);
+		mkdirSync(log);
+	});
+	const fixture = await createFixture(true, [breakLog], 64, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager: manager, faux } = fixture;
+	manager.appendMessage({ role: "user", content: "old evidence ".repeat(400), timestamp: Date.now() });
+	manager.appendMessage(fauxAssistantMessage("old answer"));
+	faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Durable handoff.", compact: "continue" })), fauxAssistantMessage("unreachable")]);
+	await session.prompt("Hand off.").catch(() => undefined);
+	assert.ok(log);
+	rmSync(log, { recursive: true, force: true });
+	renameSync(`${log}.saved`, log);
+	const calls = faux.state.callCount;
+	await session.prompt("Resume without reopening.").catch(() => undefined);
+	assert.equal(faux.state.callCount, calls);
+	const durable = SessionManager.open(log).getBranch();
+	assert.equal(durable.some((entry) => entry.type === "compaction"), false);
+	assert.equal((checkpointEntries(durable).at(-1)!.data as any).ledger, "Durable handoff.");
+});
+
+test("checkpoint compact declines when the messages kept from the checkpoint call on do not fit", async (t) => {
+	const fixture = await createFixture(false, [], 64, { compactionEnabled: false, contextWindow: 30_000 });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager: manager, faux } = fixture;
+	manager.appendMessage({ role: "user", content: "old evidence ".repeat(400), timestamp: Date.now() });
+	faux.setResponses([
+		fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Handoff.", compact: "stop" })),
+		fauxAssistantMessage("long final reply ".repeat(8_000)),
+	]);
+	await session.prompt("Hand off.");
+	const branch = manager.getBranch();
+	assert.equal(branch.some((entry) => entry.type === "compaction"), false);
+	assert.match(JSON.stringify(branch.at(-1)), /messages kept from the checkpoint call on need \d+ tokens, above the \d+-token budget/);
+});
+
+test("checkpoint compact skips small sessions, needs new state, follows the latest save and yields to later history edits", async (t) => {
+	const small = await createFixture(false, [], 20_000, { compactionEnabled: false });
+	t.after(() => { small.session.dispose(); rmSync(small.root, { recursive: true, force: true }); });
+	small.faux.setResponses([
+		fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Small state.", compact: "continue" })),
+		fauxAssistantMessage(fauxToolCall("checkpoint", { sourceQuotes: ["Small"], compact: "stop" })),
+		fauxAssistantMessage("done"),
+	]);
+	await small.session.prompt("Small task.");
+	const [skipped, rejected] = checkpointReceipts(small.sessionManager.getBranch());
+	assert.match(toolResultText(skipped), /Compaction skipped: Nothing to compact \(session too small\)\./);
+	assert.deepEqual((skipped.message as any).details.compaction, { mode: "continue", status: "session-too-small" });
+	assert.equal((rejected.message as any).isError, true);
+	assert.match(toolResultText(rejected), /compact needs a ledger or edits/);
+	assert.equal(small.sessionManager.getBranch().some((entry) => entry.type === "compaction"), false);
+
+	const fixture = await createFixture(false, [], 64, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager: manager, faux, ledgerFaux } = fixture;
+	const old = manager.appendMessage({ role: "user", content: "old evidence ".repeat(400), timestamp: Date.now() });
+	manager.appendMessage(fauxAssistantMessage("old answer"));
+	faux.setResponses([
+		fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "First handoff.", compact: "stop" })),
+		fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Second state, no handoff." })),
+		fauxAssistantMessage("kept working"),
+	]);
+	await session.prompt("Change of plan.");
+	assert.equal(manager.getBranch().some((entry) => entry.type === "compaction"), false);
+
+	faux.setResponses([
+		fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Third handoff.", compact: "stop" })),
+		() => { manager.appendContextEdit(old, null); return fauxAssistantMessage("final reply"); },
+	]);
+	await session.prompt("Hand off.");
+	const branch = manager.getBranch();
+	assert.equal(branch.some((entry) => entry.type === "compaction"), false);
+	const note = branch.at(-1)!;
+	assert.equal(note.type === "custom_message" && note.customType, COMPACTION_NOTE_TYPE);
+	assert.match(JSON.stringify(note), /did not compact onto your checkpoint: a context edit after the checkpoint call/);
+	assert.equal(ledgerFaux.state.callCount, 0);
+});
+
 test("tool prompt text names its tool, stays within the static budget, declares null for omitted parameters, and keeps the tools out of script calls", async (t) => {
 	const fixture = await createFixture(false, [], 64, { compactionEnabled: false, extraToolNames: ["history_list_items", "history_list_windows", "get_context_remaining"] });
 	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
@@ -6573,7 +6746,7 @@ test("tool prompt text names its tool, stays within the static budget, declares 
 		for (const guideline of tool.promptGuidelines ?? []) assert.ok(guideline.startsWith(`${tool.name}: `), guideline);
 		chars += tool.description.length + (tool.promptGuidelines ?? []).join("").length + JSON.stringify(tool.parameters).length;
 	}
-	assert.ok(chars <= 15_000, `static tool prompt text grew to ${chars} characters`);
+	assert.ok(chars <= 15_500, `static tool prompt text grew to ${chars} characters`);
 	// Strict function calling requires every parameter; a model can leave one out only if its schema admits null.
 	const rejectsNull: string[] = [];
 	const visit = (schema: any, path: string, optional: boolean) => {

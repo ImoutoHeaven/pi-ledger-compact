@@ -5,12 +5,13 @@ import {
 	SessionManager,
 	SettingsManager,
 	buildSessionProjection,
+	DEFAULT_COMPACTION_SETTINGS,
 	convertToLlm,
 	estimateTokens,
 	getAgentDir,
 	sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
-import type { ContextEditEntry, CustomMessageEntryDraft, ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { AgentBeforeSettleEvent, ContextEditEntry, CustomMessageEntryDraft, ExtensionAPI, ExtensionContext, SessionBoundaryDraft, SessionEntry, TurnEndEvent } from "@earendil-works/pi-coding-agent";
 
 export const CHECKPOINT_ENTRY_TYPE = "ledger-context/checkpoint";
 export const COMPACTION_DETAILS_KIND = "ledger-context";
@@ -24,6 +25,7 @@ export const DEFAULT_DELTA_TOKEN_LIMIT = 2_048;
 export const DEFAULT_HISTORY_READ_TOKEN_LIMIT = 2_048;
 export const DEFAULT_OUTPUT_RESERVE_TOKEN_LIMIT = 16_384;
 export const REMINDER_MESSAGE_TYPE = "ledger-context/reminder";
+export const COMPACTION_NOTE_TYPE = "ledger-context/compaction-note";
 export const DEFAULT_SOFT_REMINDER_TOKEN_LIMIT = 32_768;
 export const DEFAULT_URGENT_REMINDER_TOKEN_LIMIT = 16_384;
 export const MAX_HISTORY_SEARCH_QUERY_LENGTH = 8_192;
@@ -116,6 +118,9 @@ const checkpointParameters = Type.Object({
 			description: "Exact phrases copied from earlier messages that locate key evidence, most important first. Case-sensitive; any whitespace run matches any other. Replaces the saved list; when omitted, ledger saves an empty list and edits keep the saved list. Given alone, it keeps the saved state and replaces only the list. Unmatched phrases are reported and the save still succeeds.",
 		}),
 	),
+	compact: optional(StringEnum(["continue", "stop"] as const, {
+		description: "Also compact your context onto this save (with ledger or edits): continue right after this tool batch, or stop after your final reply.",
+	})),
 }, { additionalProperties: false });
 
 const HISTORY_KINDS = ["user_input", "assistant_text", "tool_call", "tool_result", "checkpoint", "compaction_delta", "metadata"] as const;
@@ -180,6 +185,7 @@ const historyReadParameters = Type.Object({
 }, { additionalProperties: false });
 
 type CheckpointParameters = WithoutNulls<Static<typeof checkpointParameters>>;
+type CompactMode = NonNullable<CheckpointParameters["compact"]>;
 type HistoryReadParameters = WithoutNulls<Static<typeof historyReadParameters>>;
 type HistoryListItemsParameters = WithoutNulls<Static<typeof historyListItemsParameters>>;
 type HistoryListWindowsParameters = WithoutNulls<Static<typeof historyListWindowsParameters>>;
@@ -424,6 +430,8 @@ export interface CheckpointReceiptDetails extends AgentCheckpoint {
 	ledgerBytes: number;
 	ledgerTokenLimit: number;
 	ledgerByteLimit: number;
+	/** The compaction this save asked for: scheduled, or skipped because nothing before this call would be compacted. */
+	compaction?: { mode: CompactMode; status: "scheduled" | "session-too-small" };
 	handoff: "active-baseline";
 	historyTools: "history_read known entryId first; history_search then history_read for unknown entries; continue with nextCursor/nextOffset on this branch";
 }
@@ -474,6 +482,8 @@ interface SessionState {
 	checkpoint?: StoredCheckpoint;
 	delta?: StoredDelta;
 	currentAgentRequest?: { position: RequestHistoryPosition; recoveryBasis: RecoveryBasis | null };
+	/** The compaction the latest checkpoint call of this run asked for, at the boundary its mode names. */
+	pendingCompaction?: { toolCallId: string; mode: CompactMode };
 	recoveryError?: string;
 	persistenceUncertain?: string;
 }
@@ -2081,7 +2091,7 @@ function contextRemainingResult(pi: ExtensionAPI, ctx: ExtensionContext, state: 
 	};
 	const text = usage ? [
 		`tokensUntilBoundary: ${details.tokensUntilBoundary} (safety boundary at ${details.effectiveBoundaryTokens} of ${details.contextWindowTokens} tokens; Pi automatic compaction: ${details.nativeCompactionMode === "native" ? "on" : details.nativeCompactionMode === "disabled" ? "off" : "unknown"})`,
-		`used: ${details.usedTokens} tokens (${details.usageKind === "pi-context-usage" ? "reported by Pi" : "estimated"}); model headroom: ${details.modelRemainingTokens} tokens`,
+		`used: ${details.usedTokens} tokens, ${Math.round((100 * usage.tokens) / usage.contextWindow)}% of the model window (${details.usageKind === "pi-context-usage" ? "reported by Pi" : "estimated"}); model headroom: ${details.modelRemainingTokens} tokens`,
 		`new work since the latest checkpoint or compaction: ${newWorkTokens} tokens`,
 	].join("\n") : "Context usage is unavailable for the current model.";
 	return { content: [{ type: "text" as const, text }], details };
@@ -2378,9 +2388,8 @@ function hydrateState(state: SessionState, entries: SessionEntry[], ctx: Extensi
 			if (!isLedgerCompactionDetails(entry.details)) throw new Error(`compaction ${entry.id} has incompatible or invalid schema; expected schema ${LEDGER_SCHEMA_VERSION}`);
 			const details = entry.details;
 			position(details.snapshotPosition, index);
-			ancestor(details.sourceBranchTip, index);
-			ancestor(details.firstKeptEntryId, index);
-			if (details.firstKeptEntryId !== entry.firstKeptEntryId || details.sourceBranchTip !== entry.parentId) throw new Error(`compaction ${entry.id} provenance disagrees with its native retained boundary or source parent`);
+			// Boundary entries that Pi commits before the compaction, such as other extensions' drafts, sit between the source tip and the compaction inside the retained range.
+			if (details.firstKeptEntryId !== entry.firstKeptEntryId || ancestor(details.sourceBranchTip, index) < ancestor(details.firstKeptEntryId, index)) throw new Error(`compaction ${entry.id} provenance disagrees with its native retained boundary or source tip`);
 			if (details.checkpointEntryId !== (state.checkpoint?.entryId ?? null)) throw new Error("compaction checkpoint does not match its branch baseline");
 			const delta = deltaForCompaction(entry, entries);
 			if (delta) {
@@ -2455,7 +2464,7 @@ function renderBootstrap(
 	const references = [...(checkpoint?.data.sourceReferences ?? []), ...(delta?.sourceReferences ?? [])];
 	const later = pendingHistoryRange(entries.slice(0, positionStartIndex(entries, details.snapshotPosition)), { entryId: after, branchDepth: 0 });
 	const failed = slot.status === "stale" || slot.status === "unavailable";
-	const deltaBody = delta?.ledger ?? (slot.status === "unavailable" ? "(none)" : "No changes after the checkpoint were found.");
+	const deltaBody = delta?.ledger ?? (slot.status === "unavailable" ? "(none)" : "No changes after the checkpoint needed a summary.");
 	return [
 		"# Ledger Context Recovery",
 		"The earlier conversation was compacted. Resume from your checkpoint plus the changes listed after it; the messages after this summary are kept verbatim.",
@@ -2679,7 +2688,7 @@ function validateCheckpoint(
 	entries: SessionEntry[],
 ): { data: AgentCheckpoint; estimatedLedgerTokens: number; ledgerBytes: number; ledgerTokenLimit: number } {
 	if (!params || typeof params !== "object") throw validationError("parameters must be an object");
-	if (Object.keys(params).some((key) => key !== "ledger" && key !== "edits" && key !== "sourceQuotes")) throw validationError("unsupported checkpoint parameter");
+	if (Object.keys(params).some((key) => key !== "ledger" && key !== "edits" && key !== "sourceQuotes" && key !== "compact")) throw validationError("unsupported checkpoint parameter");
 	// Callers that must fill every parameter send an empty ledger, or edits that change nothing, for the unused mode.
 	if (typeof params.ledger === "string" && params.ledger.trim() === "") params = { ...params, ledger: undefined };
 	const gaveEdits = Array.isArray(params.edits) && params.edits.length > 0;
@@ -2687,6 +2696,7 @@ function validateCheckpoint(
 	// Non-empty quotes alone keep the saved state; an empty list is a strict caller's placeholder.
 	const quotesOnly = params.ledger === undefined && params.edits === undefined && Array.isArray(params.sourceQuotes) && params.sourceQuotes.length > 0;
 	const editMode = params.edits !== undefined || quotesOnly;
+	if (quotesOnly && params.compact !== undefined) throw validationError("compact needs a ledger or edits that update the saved state; sourceQuotes alone keep it unchanged");
 	if (params.edits !== undefined && params.ledger !== undefined) throw validationError("provide either ledger (the complete state) or edits (changes to the saved state), not both");
 	if (!editMode && params.ledger === undefined) {
 		throw validationError(gaveEdits
@@ -3013,6 +3023,21 @@ function buildCompactionDetails(
 	};
 }
 
+/** The assistant entry holding a checkpoint call: a checkpoint's own compaction keeps the branch from there. */
+function toolCallEntryIndex(entries: SessionEntry[], toolCallId: string): number {
+	for (let index = entries.length - 1; index >= 0; index--) if (messageToolCallIds(entries[index]).includes(toolCallId)) return index;
+	return -1;
+}
+
+/** Like Pi's "session too small": the conversation before the cut, without the system prompt and latest summary, fits what Pi keeps verbatim anyway. */
+function compactionTooSmall(entries: SessionEntry[], cut: number, keepRecentTokens: number): boolean {
+	if (cut < 0) return true;
+	const projected = buildSessionProjection(entries).entries;
+	const end = projected.findIndex((entry) => entry.sourceEntry.id === entries[cut].id);
+	const removable = projected.slice(0, Math.max(end, 0)).filter((entry) => entry.sourceEntry.type !== "compaction").flatMap((entry) => entry.messages).filter((message) => message.role !== "system");
+	return estimateMessageTokens(removable) <= keepRecentTokens;
+}
+
 function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): void {
 	const settingsReader = options.settingsReader;
 	const states = new Map<string, SessionState>();
@@ -3035,6 +3060,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		if (blockIfPersistenceUncertain(state, ctx)) return;
 		// Hosts may bind extensions while the first request is already running; its snapshot stays valid.
 		const request = state.currentAgentRequest;
+		state.pendingCompaction = undefined;
 		hydrateState(state, ctx.sessionManager.getBranch(), ctx);
 		if (!state.recoveryError) state.currentAgentRequest = request;
 	});
@@ -3065,10 +3091,59 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		}
 	};
 
+	/**
+	 * The compaction a checkpoint call asked for, as a boundary entry: the run goes on without an abort. The checkpoint covers
+	 * everything before its call and the branch is kept verbatim from the call on, so no delta is generated.
+	 */
+	const checkpointCompaction = (event: TurnEndEvent | AgentBeforeSettleEvent, ctx: ExtensionContext, mode: CompactMode) => {
+		const state = getState(ctx);
+		const pending = state.pendingCompaction;
+		if (!pending || pending.mode !== mode) return undefined;
+		if (event.type === "turn_end" && !event.toolResults.some((result) => result.toolCallId === pending.toolCallId)) return undefined;
+		state.pendingCompaction = undefined;
+		if (event.outcome !== "completed" || ctx.signal?.aborted || blockIfPersistenceUncertain(state, ctx)) return undefined;
+		const skip = (reason: string): SessionBoundaryDraft[] => [...event.entries, {
+			type: "custom_message",
+			customType: COMPACTION_NOTE_TYPE,
+			content: `Ledger Context did not compact onto your checkpoint: ${reason}.`,
+			display: true,
+		}];
+		const entries = ctx.sessionManager.getBranch();
+		hydrateState(state, entries, ctx, false);
+		if (state.recoveryError) return skip(state.recoveryError);
+		const cut = toolCallEntryIndex(entries, pending.toolCallId);
+		const checkpointIndex = state.checkpoint ? entries.findIndex((entry) => entry.id === state.checkpoint!.entryId) : -1;
+		if (cut < 0 || checkpointIndex <= cut) return skip("its checkpoint is no longer the latest one on this branch");
+		// A later compaction already removed history; cutting at the checkpoint call again would bring it back.
+		if ([...entries.slice(cut), ...event.entries].some((entry) => entry.type === "compaction")) return skip("Already compacted");
+		const compacted = new Set(entries.slice(0, cut).map((entry) => entry.id));
+		if ([...entries.slice(cut), ...event.entries].some((entry) => entry.type === "context_edit" && compacted.has(entry.targetId))) {
+			return skip("a context edit after the checkpoint call changes history the checkpoint covers; save a checkpoint that includes it");
+		}
+		try {
+			const limits = limitsModel(ctx);
+			const budgets = contentBudgets(limits.model?.contextWindow ?? 0);
+			const firstKeptEntryId = entries[cut].id;
+			const details = buildCompactionDetails(state, entries, firstKeptEntryId, `window:${ctx.sessionManager.getSessionId()}:${randomUUID()}`, { status: "empty" }, requestPositionForContext(entries));
+			const summary = renderBootstrap(entries, state, details, budgets);
+			// The preview projection holds the drafts before this one; everything from the checkpoint call on stays in context.
+			const preview = event.context.contextEntries;
+			const keptTokens = estimateMessageTokens(preview.slice(Math.max(0, preview.findIndex((entry) => entry.sourceEntry.id === firstKeptEntryId))).flatMap((entry) => entry.messages));
+			const availableTokens = knownLimit(limits.model?.contextWindow) - requestFixedTokens(pi, ctx) - budgets.outputReserveTokens;
+			const requiredTokens = ledgerTokenEstimate(summary) + keptTokens;
+			if (requiredTokens > availableTokens) return skip(`the recovery summary and the messages kept from the checkpoint call on need ${requiredTokens} tokens, above the ${availableTokens}-token budget`);
+			return [...event.entries, { type: "compaction" as const, summary, firstKeptEntryId, details }];
+		} catch (error) {
+			return skip(error instanceof Error ? error.message : String(error));
+		}
+	};
+
 	// After a tool batch the run continues. For a physical model, steering joins the history after the compaction that
 	// precedes the next model response, so the request stays out of the tail that compaction retains. A queued request
 	// waits behind earlier steering and counts as delivered.
 	pi.on("turn_end", async (event, ctx) => {
+		const compaction = checkpointCompaction(event, ctx, "continue");
+		if (compaction) return { entries: compaction };
 		if (event.outcome !== "completed" || event.toolResults.length === 0) return;
 		if (event.context.pendingMessages.some((message) => message.role === "custom" && message.customType === REMINDER_MESSAGE_TYPE)) return;
 		const draft = reminder(ctx);
@@ -3077,6 +3152,8 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 
 	// A run ending without a tool batch gets one more turn for a repeated or urgent request; a first request waits for the next tool batch.
 	pi.on("agent_before_settle", async (event, ctx) => {
+		const compaction = checkpointCompaction(event, ctx, "stop");
+		if (compaction) return { entries: compaction };
 		if (event.outcome !== "completed") return;
 		const draft = reminder(ctx);
 		if (!draft || (draft.details.sequence === 0 && draft.details.pressure !== "urgent")) return;
@@ -3089,8 +3166,14 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		return undefined;
 	});
 
+	// A compaction a checkpoint asked for belongs to its run.
+	pi.on("agent_settled", async (_event, ctx) => {
+		getState(ctx).pendingCompaction = undefined;
+	});
+
 	pi.on("session_tree", async (_event, ctx) => {
 		const state = getState(ctx);
+		state.pendingCompaction = undefined;
 		if (blockIfPersistenceUncertain(state, ctx)) return;
 		hydrateState(state, ctx.sessionManager.getBranch(), ctx);
 	});
@@ -3116,7 +3199,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		executionMode: "sequential",
 		// Maintenance detection reads model-issued calls; script calls would hide checkpoints and history output as ordinary work.
 		exposure: "model-only",
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
 			const state = getState(ctx);
 			if (blockIfPersistenceUncertain(state, ctx)) {
 				throw new Error(
@@ -3124,8 +3207,22 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 				);
 			}
 			const entries = ctx.sessionManager.getBranch();
-			const validated = validateCheckpoint(preparedParameters(params, validationError), state, entries);
+			const input = preparedParameters(params, validationError);
+			const validated = validateCheckpoint(input, state, entries);
 			const saved = saveAgentCheckpoint(pi, ctx, state, validated.data);
+			// The latest save decides: one without compact cancels the compaction an earlier save of this run asked for.
+			state.pendingCompaction = undefined;
+			let compaction: CheckpointReceiptDetails["compaction"];
+			if (input.compact) {
+				const keepRecentTokens = nativeCompactionSettings(ctx, settingsReader).compaction?.keepRecentTokens ?? DEFAULT_COMPACTION_SETTINGS.keepRecentTokens;
+				const tooSmall = compactionTooSmall(entries, toolCallEntryIndex(entries, toolCallId), keepRecentTokens);
+				compaction = { mode: input.compact, status: tooSmall ? "session-too-small" : "scheduled" };
+				if (!tooSmall) state.pendingCompaction = { toolCallId, mode: input.compact };
+			}
+			const compactionText = !compaction ? ""
+				: compaction.status === "session-too-small" ? "Compaction skipped: Nothing to compact (session too small)."
+				: compaction.mode === "continue" ? "Compaction scheduled: your context is compacted onto this checkpoint right after this tool batch; then continue the task."
+				: "Compaction scheduled: your context is compacted onto this checkpoint when you end your turn; give your final reply now.";
 			const details: CheckpointReceiptDetails = {
 				...validated.data,
 				checkpointEntryId: saved.entryId,
@@ -3135,6 +3232,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 				ledgerBytes: validated.ledgerBytes,
 				ledgerTokenLimit: validated.ledgerTokenLimit,
 				ledgerByteLimit: LEDGER_BYTE_LIMIT,
+				...(compaction ? { compaction } : {}),
 				handoff: "active-baseline",
 				historyTools: "history_read known entryId first; history_search then history_read for unknown entries; continue with nextCursor/nextOffset on this branch",
 			};
@@ -3149,6 +3247,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 							`Ledger size: ${validated.estimatedLedgerTokens} of ${validated.ledgerTokenLimit} estimated tokens. Stored in: ${scopeText}.`,
 							sourceReferenceReceipt(validated.data.sourceReferences),
 							foldedSections > 1 ? `This checkpoint holds ${foldedSections} "${FOLDED_CHANGES_HEADING}" sections. Make your next save a complete ledger that merges them into the current state and drops what they replaced.` : "",
+							compactionText,
 						].filter(Boolean).join("\n"),
 					},
 				],
