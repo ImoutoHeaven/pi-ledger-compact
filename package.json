@@ -1,6 +1,6 @@
 {
   "name": "pi-better-compact",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "type": "module",
   "description": "A pi extension that preserves working state across native context compaction",
   "main": "src/ledger-context.ts",
@@ -10,7 +10,8 @@
   ],
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test tests/ledger-context.test.ts"
+    "test": "node --experimental-strip-types --test tests/ledger-context.test.ts",
+    "test:docker": "bash tests/docker.sh"
   },
   "keywords": [
     "pi-package",
@@ -40,8 +41,8 @@
     "@earendil-works/pi-ai": ">=1.1.0 <2.0.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "1.3.0",
-    "@earendil-works/pi-ai": "1.3.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-ai": "1.4.0",
     "@types/node": "^22.19.19",
     "typescript": "^5.9.3"
   }
