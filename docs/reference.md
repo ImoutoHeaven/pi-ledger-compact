@@ -37,8 +37,15 @@ Saves the active recovery baseline on the current branch:
     tool batch and continues the run.
   - `"stop"` commits a boundary compaction at `agent_before_settle` after the
     final reply.
-  - The compaction keeps the branch verbatim from the assistant entry containing
-    the `checkpoint` call, so no delta is generated for that cut.
+  - The checkpoint covers everything before its call, so no delta is generated
+    for that cut. When the `checkpoint` call is the only tool call in its
+    assistant message, the call and its receipt leave with the earlier history:
+    the new window holds the recovery summary (which says the checkpoint asked
+    for it) and the entries after the receipt, such as the final reply in
+    `"stop"` mode, so the ledger appears once. When other tool calls share the
+    message, the branch is kept from that message on, with their results.
+  - Entries that other extensions propose at the same boundary join the new
+    window.
   - If removable tokens before the cut fit within Pi's `keepRecentTokens`, the
     receipt reports `Compaction skipped: Nothing to compact (session too small).`
     A later `checkpoint` save in the same run without `compact` cancels an
@@ -143,7 +150,7 @@ When Pi fires `session_before_compact` (automatic threshold, overflow, or manual
    earlier delta. If the recovery bootstrap itself exceeds the available context
    budget, the compaction is cancelled so existing history stays intact.
 
-## 3. Checkpoint Reminders and Boundaries
+## 3. Checkpoint Reminders, Usage Notices, and Boundaries
 
 With model window `W`, extension output reserve `O`, and Pi native
 `compaction.reserveTokens` `R`:
@@ -159,11 +166,22 @@ With model window `W`, extension output reserve `O`, and Pi native
   repeats once after `+0.25` interval, and once more upon reaching
   `B - urgentLead`. At `turn_end`, reminders queue via `deliverAs: "steer"`; at
   `agent_before_settle`, a repeated or urgent reminder continues the run for one
-  turn.
+  turn. Each reminder also states the context use: used tokens against `W` and
+  the tokens left before `B`.
+- **Usage notices**: After a tool batch with no reminder due or queued, and no
+  native compaction due before the next request, a one-line
+  `ledger-context/usage` notice reports the same context use, plus new work
+  since the latest checkpoint or compaction, once the used tokens reach a step
+  of `LEDGER_CONTEXT_USAGE_NOTICE_PERCENT` of `W` that the current window has
+  not shown yet. Usage notices, reminders, and `get_context_remaining` results all
+  count as shown; a jump over several steps gives one notice, and a new window
+  starts over. Notices queue via `deliverAs: "steer"`, never continue a run,
+  and stay out of new work, deltas, and `sourceQuotes`, as reminders do.
 
 ## 4. Environment Variables
 
-All `LEDGER_CONTEXT_*` variables must be positive safe integers
+`LEDGER_CONTEXT_USAGE_NOTICE_PERCENT` is an integer from `0` to `100`; every
+other `LEDGER_CONTEXT_*` variable must be a positive safe integer
 (`LEDGER_CONTEXT_URGENT_TOKENS < LEDGER_CONTEXT_REMINDER_TOKENS`).
 
 | Variable | Default | Purpose |
@@ -174,6 +192,7 @@ All `LEDGER_CONTEXT_*` variables must be positive safe integers
 | `LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS` | `max(1, floor(min(W * 0.10, 16384)))` | Context headroom `O` reserved for boundary calculation, reminders, and recovery summaries |
 | `LEDGER_CONTEXT_REMINDER_TOKENS` | `max(2, floor(min(W * 0.20, 32768)))` | Soft reminder lead time before `B` |
 | `LEDGER_CONTEXT_URGENT_TOKENS` | `max(1, min(softDefault - 1, floor(min(W * 0.10, 16384))))` | Urgent reminder lead time before `B` |
+| `LEDGER_CONTEXT_USAGE_NOTICE_PERCENT` | `5` | Step of usage notices in percent of `W`; `0` turns them off |
 
 ## 5. SDK Host Integration
 

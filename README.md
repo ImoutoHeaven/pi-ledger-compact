@@ -31,6 +31,10 @@ The extension registers six tools for the main agent:
 - `get_context_remaining`: reports context usage, new work since the latest
   checkpoint or compaction, and `tokensUntilBoundary`.
 
+After a tool batch, a one-line notice reports context use and new work each
+time the context reaches another 5% of the model window; checkpoint reminders
+state the context use too.
+
 Example arguments for the agent's `checkpoint` tool:
 
 ```json
@@ -49,7 +53,12 @@ Example arguments for the agent's `checkpoint` tool:
   to `65536` UTF-8 bytes and `LEDGER_CONTEXT_LEDGER_TOKENS`, default `4096`) or
   disjoint `edits` against the saved checkpoint plus any `## Folded compaction changes`
   delta. `compact: "continue"` compacts after the current tool batch; `"stop"`
-  compacts after the final reply before settling.
+  compacts after the final reply before settling. When the `checkpoint` call is
+  the only tool call of its message, the call and its receipt stay out of the
+  new window, so the ledger appears there once, in the recovery summary; what
+  follows the receipt, such as the final reply in `"stop"` mode, stays.
+- **Usage notices**: `LEDGER_CONTEXT_USAGE_NOTICE_PERCENT` sets their step in
+  percent of the model window (default `5`); `0` turns them off.
 - **Schema and failure safety**: Recovery records require schema version `6`
   (no automatic migration). Delta generation failures or input capacity overflows
   preserve the saved checkpoint and earlier matching delta.

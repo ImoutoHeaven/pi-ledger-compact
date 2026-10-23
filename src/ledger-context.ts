@@ -25,6 +25,8 @@ export const DEFAULT_DELTA_TOKEN_LIMIT = 2_048;
 export const DEFAULT_HISTORY_READ_TOKEN_LIMIT = 2_048;
 export const DEFAULT_OUTPUT_RESERVE_TOKEN_LIMIT = 16_384;
 export const REMINDER_MESSAGE_TYPE = "ledger-context/reminder";
+export const USAGE_MESSAGE_TYPE = "ledger-context/usage";
+export const DEFAULT_USAGE_NOTICE_PERCENT = 5;
 export const COMPACTION_NOTE_TYPE = "ledger-context/compaction-note";
 export const DEFAULT_SOFT_REMINDER_TOKEN_LIMIT = 32_768;
 export const DEFAULT_URGENT_REMINDER_TOKEN_LIMIT = 16_384;
@@ -386,8 +388,9 @@ function recoveryHistory(entries: SessionEntry[]) {
 	}
 	const excluded = new Map<string, HistoryExclusion>();
 	for (const entry of entries) {
+		// Maintenance a checkpoint compaction dropped, such as its own call and receipt, is no missing evidence.
 		if (!effective.has(entry.id)) {
-			excluded.set(entry.id, edits.get(entry.id)?.replacement === null ? "context-omitted" : "inactive-context");
+			excluded.set(entry.id, edits.get(entry.id)?.replacement === null ? "context-omitted" : (deltaHistoryMaterial(entry).excluded ?? "inactive-context"));
 		}
 	}
 	return { entries: entries.flatMap((entry) => effective.get(entry.id) ?? []), edits, excluded };
@@ -448,7 +451,8 @@ export interface LedgerCompactionDetails {
 	sourceWindowId: string;
 	checkpointEntryId: string | null;
 	sourceBranchTip: string | null;
-	firstKeptEntryId: string;
+	/** Null for a checkpoint compaction that keeps no earlier entry; Pi then stores the compaction's own ID. */
+	firstKeptEntryId: string | null;
 	snapshotPosition: RequestHistoryPosition;
 	delta: DeltaSlot;
 	previousCheckpointEntryId?: string | null;
@@ -732,6 +736,27 @@ function reminderUsage(pi: ExtensionAPI, ctx: ExtensionContext, settingsReader?:
 	};
 }
 
+/** Ledger notices: checkpoint reminders and usage notices, which stay out of ledgers, deltas, source quotes and new work. */
+function isLedgerNotice(customType: string): boolean {
+	return customType === REMINDER_MESSAGE_TYPE || customType === USAGE_MESSAGE_TYPE;
+}
+
+/** The step of usage notices in percent of the model window; 0 turns them off. */
+function usageNoticePercent(): number {
+	const name = "LEDGER_CONTEXT_USAGE_NOTICE_PERCENT";
+	const raw = process.env[name];
+	if (raw === undefined) return DEFAULT_USAGE_NOTICE_PERCENT;
+	if (!/^\d+$/.test(raw) || Number(raw) > 100) throw new Error(`${name} must be an integer from 0 to 100`);
+	return Number(raw);
+}
+
+/** What a model reads about its context use: tokens in context against the model window, and the room left before the boundary. */
+function usageText(usage: { usedTokens: number; contextWindow: number; effectiveBoundaryTokens: number; usageKind: ReminderUsage["usageKind"] }): string {
+	const percent = Math.round((100 * usage.usedTokens) / usage.contextWindow);
+	const estimated = usage.usageKind === "pi-context-usage" ? "" : ", estimated";
+	return `${usage.usedTokens} of ${usage.contextWindow} tokens (${percent}%${estimated}); ${Math.max(0, usage.effectiveBoundaryTokens - usage.usedTokens)} until the compaction boundary`;
+}
+
 function reminderText(details: ReminderDetails, previousReminderEntryId: string | undefined): string {
 	const pressure = details.pressure === "urgent" ? ", and the context is nearly full" : details.pressure === "filling" ? ", and the context is filling up" : "";
 	const work = `${details.newWorkTokens} tokens of new work since your last checkpoint${pressure}`;
@@ -739,6 +764,7 @@ function reminderText(details: ReminderDetails, previousReminderEntryId: string 
 		previousReminderEntryId
 			? `Ledger Context reminder (repeating ${historyEntryReference(previousReminderEntryId)}): ${work}.`
 			: `Ledger Context reminder: ${work}.`,
+		`Context: ${usageText(details)}.`,
 		"Call the checkpoint tool once now, then continue the task.",
 		CHECKPOINT_LEDGER_GUIDELINES,
 		`This notice is for window ${details.windowId} with checkpoint ${details.checkpointEntryId ?? "none"}; any later checkpoint or compaction fulfils it. Leave the notice itself out of the ledger and sourceQuotes.`,
@@ -756,7 +782,7 @@ function isMaintenanceToolCall(block: any): boolean {
 }
 
 function volumeMessagesForEntry(entry: SessionEntry): ContextMessage[] {
-	if (entry.type === "custom_message") return entry.customType === REMINDER_MESSAGE_TYPE ? [] : sessionEntryToContextMessages(entry) as ContextMessage[];
+	if (entry.type === "custom_message") return isLedgerNotice(entry.customType) ? [] : sessionEntryToContextMessages(entry) as ContextMessage[];
 	if (entry.type !== "message") return [];
 	// Pi's convertToLlm drops bash executions excluded from context.
 	if (entry.message.role === "bashExecution") return entry.message.excludeFromContext ? [] : sessionEntryToContextMessages(entry) as ContextMessage[];
@@ -2228,7 +2254,7 @@ function isLedgerCompactionDetails(value: unknown): value is LedgerCompactionDet
 	const input = value as Record<string, unknown>;
 	if (input.schemaVersion !== LEDGER_SCHEMA_VERSION || input.kind !== COMPACTION_DETAILS_KIND) return false;
 	const id = (value: unknown) => typeof value === "string" && value.length > 0;
-	if (!id(input.windowId) || !id(input.sourceWindowId) || !id(input.firstKeptEntryId)) return false;
+	if (!id(input.windowId) || !id(input.sourceWindowId) || (input.firstKeptEntryId !== null && !id(input.firstKeptEntryId))) return false;
 	if (input.checkpointEntryId !== null && !id(input.checkpointEntryId)) return false;
 	if (input.sourceBranchTip !== null && !id(input.sourceBranchTip)) return false;
 	if (!parseRequestPosition(input.snapshotPosition)) return false;
@@ -2356,7 +2382,7 @@ function hydrateState(state: SessionState, entries: SessionEntry[], ctx: Extensi
 		const validateReferenceSources = (references: SourceReference[], through: number) => {
 			for (const reference of references) for (const match of reference.matches) {
 				const source = entries[ancestor(match.entryId, through)];
-				if (source.type !== "message" && (source.type !== "custom_message" || source.customType === REMINDER_MESSAGE_TYPE)) throw new Error("invalid source reference entry");
+				if (source.type !== "message" && (source.type !== "custom_message" || isLedgerNotice(source.customType))) throw new Error("invalid source reference entry");
 				if (match.editEntryId !== undefined) {
 					const edit = entries[ancestor(match.editEntryId, through)];
 					if (edit.type !== "context_edit" || edit.targetId !== match.entryId || edit.replacement === null) throw new Error("invalid source reference edit");
@@ -2392,7 +2418,9 @@ function hydrateState(state: SessionState, entries: SessionEntry[], ctx: Extensi
 			const details = entry.details;
 			position(details.snapshotPosition, index);
 			// Boundary entries that Pi commits before the compaction, such as other extensions' drafts, sit between the source tip and the compaction inside the retained range.
-			if (details.firstKeptEntryId !== entry.firstKeptEntryId || ancestor(details.sourceBranchTip, index) < ancestor(details.firstKeptEntryId, index)) throw new Error(`compaction ${entry.id} provenance disagrees with its native retained boundary or source tip`);
+			const keptFrom = details.firstKeptEntryId ?? entry.id;
+			const tip = ancestor(details.sourceBranchTip, index);
+			if (keptFrom !== entry.firstKeptEntryId || (details.firstKeptEntryId !== null && tip < ancestor(details.firstKeptEntryId, index))) throw new Error(`compaction ${entry.id} provenance disagrees with its native retained boundary or source tip`);
 			if (details.checkpointEntryId !== (state.checkpoint?.entryId ?? null)) throw new Error("compaction checkpoint does not match its branch baseline");
 			const delta = deltaForCompaction(entry, entries);
 			if (delta) {
@@ -2452,6 +2480,8 @@ function renderBootstrap(
 	details: LedgerCompactionDetails,
 	budgets: ContentBudgets,
 	customInstructions?: string,
+	/** The mode of the checkpoint call that asked for this compaction. */
+	requested?: CompactMode,
 ): string {
 	const checkpoint = state.checkpoint;
 	const slot = details.checkpointEntryId === (checkpoint?.entryId ?? null) ? details.delta : { status: "empty" } as const;
@@ -2482,6 +2512,8 @@ function renderBootstrap(
 		...(customInstructions?.trim() ? ["", "## Compaction focus", customInstructions.trim()] : []),
 		"",
 		"## How to use this",
+		...(requested === "continue" ? ["- Your checkpoint call asked for this compaction right after its tool batch: continue the task from the checkpoint."]
+			: requested === "stop" ? ["- Your checkpoint call asked for this compaction when you ended your turn."] : []),
 		"- The checkpoint is your saved state and the changes update it; checkpoint items stay valid unless a change replaces them.",
 		"- Later user corrections and actual tool results override saved state. Verify before repeating any action with side effects.",
 		`- Events after the saved state: ${later.fromEntryId && later.toEntryId ? `entries ${later.fromEntryId} to ${later.toEntryId}` : "none"}.`,
@@ -2564,6 +2596,67 @@ function dueReminder(
 	return { type: "custom_message", customType: REMINDER_MESSAGE_TYPE, content: reminderText(details, last?.id), display: false, details };
 }
 
+interface UsageDetails {
+	schemaVersion: typeof LEDGER_SCHEMA_VERSION;
+	windowId: string;
+	stepPercent: number;
+	contextWindow: number;
+	usedTokens: number;
+	usageKind: ReminderUsage["usageKind"];
+	effectiveBoundaryTokens: number;
+	newWorkTokens: number;
+}
+
+/** The context use, as used and window tokens, that the current window already showed: in notices, reminders and get_context_remaining results. */
+function shownUsage(entries: SessionEntry[]): Array<[number, number]> {
+	const shown: Array<[number, number]> = [];
+	const add = (used: unknown, window: unknown) => {
+		if (Number.isFinite(used) && Number.isFinite(window) && (window as number) > 0) shown.push([used as number, window as number]);
+	};
+	const compaction = latestBranchCompaction(entries);
+	for (const entry of compaction ? entries.slice(entries.indexOf(compaction) + 1) : entries) {
+		const details = (entry.type === "custom_message" && isLedgerNotice(entry.customType) ? entry.details
+			: entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "get_context_remaining" ? entry.message.details : undefined) as
+			Record<string, unknown> | undefined;
+		if (details) add(details.usedTokens, details.contextWindow ?? details.contextWindowTokens);
+	}
+	return shown;
+}
+
+/**
+ * The usage notice due now, if any: once the context reaches a new step of the model window that the current window has not
+ * shown yet. A jump over several steps gives one notice.
+ */
+function dueUsageNotice(
+	state: SessionState,
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	settingsReader: LedgerContextSettingsReader | undefined,
+): CustomMessageEntryDraft & { details: UsageDetails } | undefined {
+	const step = usageNoticePercent();
+	if (step === 0) return undefined;
+	const usage = reminderUsage(pi, ctx, settingsReader);
+	// The compaction that Pi runs before the next model request changes the usage anyway.
+	if (!usage || usage.nativeCompactionDue) return undefined;
+	const level = (used: number, window: number) => Math.floor((100 * used) / window / step);
+	const current = level(usage.tokens, usage.contextWindow);
+	const entries = ctx.sessionManager.getBranch();
+	if (current < 1 || shownUsage(entries).some(([used, window]) => level(used, window) >= current)) return undefined;
+	const origin = volumeOrigin(state, entries);
+	const details: UsageDetails = {
+		schemaVersion: LEDGER_SCHEMA_VERSION,
+		windowId: origin.windowId,
+		stepPercent: step,
+		contextWindow: usage.contextWindow,
+		usedTokens: usage.tokens,
+		usageKind: usage.usageKind,
+		effectiveBoundaryTokens: usage.boundaryTokens,
+		newWorkTokens: volumeMeasurement(entries, positionStartIndex(entries, origin.position)).tokens,
+	};
+	const content = `Ledger Context usage: ${usageText(details)}; ${details.newWorkTokens} tokens of new work since your last checkpoint or compaction.`;
+	return { type: "custom_message", customType: USAGE_MESSAGE_TYPE, content, display: false, details };
+}
+
 function validationError(message: string): Error {
 	return new Error(`checkpoint validation failed: ${message}`);
 }
@@ -2593,7 +2686,7 @@ function validSourceReferences(value: unknown): value is SourceReference[] {
 /** Source quotes search original message content, with branch edits and maintenance traffic removed. */
 function sourceMaterial(entry: SessionEntry, edit?: ContextEditEntry): { entry: SessionEntry; text: string } | undefined {
 	const effective = editedHistoryEntry(entry, edit);
-	if (effective?.type === "custom_message" && effective.customType !== REMINDER_MESSAGE_TYPE) {
+	if (effective?.type === "custom_message" && !isLedgerNotice(effective.customType)) {
 		const text = contentText(effective.content, edit?.id ?? entry.id);
 		return text.trim() ? { entry: effective, text } : undefined;
 	}
@@ -2829,7 +2922,7 @@ function diagnosticMessage(error: unknown): string {
 
 function deltaHistoryMaterial(entry: SessionEntry, contentEntryId = entry.id): { text?: string; filtered?: boolean; excluded?: HistoryExclusion } {
 	if (entry.type === "compaction" || entry.type === "model_change" || entry.type === "thinking_level_change" || entry.type === "label" || entry.type === "session_info" || entry.type === "context_edit" || entry.type === "usage" || (entry.type === "message" && entry.message.role === "system")) return { excluded: "structural-metadata" };
-	if ((entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY_TYPE) || (entry.type === "custom_message" && entry.customType === REMINDER_MESSAGE_TYPE)) return { excluded: "maintenance" };
+	if ((entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY_TYPE) || (entry.type === "custom_message" && isLedgerNotice(entry.customType))) return { excluded: "maintenance" };
 	if (entry.type === "message") {
 		const message = entry.message;
 		if (message.role === "toolResult" && ["checkpoint", "get_context_remaining"].includes(message.toolName)) return { excluded: "maintenance" };
@@ -3003,7 +3096,7 @@ async function generateCompactionDelta(
 function buildCompactionDetails(
 	state: SessionState,
 	entries: SessionEntry[],
-	firstKeptEntryId: string,
+	firstKeptEntryId: string | null,
 	windowId: string,
 	delta: DeltaSlot,
 	snapshotPosition: RequestHistoryPosition,
@@ -3105,9 +3198,22 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		}
 	};
 
+	const usageNotice = (ctx: ExtensionContext) => {
+		try {
+			const state = getState(ctx);
+			if (blockIfPersistenceUncertain(state, ctx)) return undefined;
+			return dueUsageNotice(state, pi, ctx, settingsReader);
+		} catch (error) {
+			notify(ctx, `Ledger Context usage notices disabled: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return undefined;
+		}
+	};
+
 	/**
 	 * The compaction a checkpoint call asked for, as a boundary entry: the run goes on without an abort. The checkpoint covers
-	 * everything before its call and the branch is kept verbatim from the call on, so no delta is generated.
+	 * everything before its call, so no delta is generated. A call alone in its message is dropped with its result, which keeps
+	 * the ledger out of the new window twice; a call beside others keeps the branch from its message on, for their results.
+	 * The compaction goes first among the boundary's entries, so those that earlier handlers proposed join the new window.
 	 */
 	const checkpointCompaction = (event: TurnEndEvent | AgentBeforeSettleEvent, ctx: ExtensionContext, mode: CompactMode) => {
 		const state = getState(ctx);
@@ -3140,17 +3246,22 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		try {
 			const limits = limitsModel(ctx);
 			const budgets = contentBudgets(limits.model?.contextWindow ?? 0);
-			const firstKeptEntryId = entries[cut].id;
+			const alone = messageToolCallIds(entries[cut]).length === 1;
+			const result = alone ? entries.findIndex((entry, index) => index > cut && messageToolResultId(entry) === pending.toolCallId) : -1;
+			const firstKeptEntryId = result < 0 ? entries[cut].id : (entries[result + 1]?.id ?? null);
 			const details = buildCompactionDetails(state, entries, firstKeptEntryId, `window:${ctx.sessionManager.getSessionId()}:${randomUUID()}`, { status: "empty" }, requestPositionForContext(entries));
-			const summary = renderBootstrap(entries, state, details, budgets);
-			// The preview projection holds the drafts before this one; everything from the checkpoint call on stays in context.
+			const summary = renderBootstrap(entries, state, details, budgets, undefined, pending.mode);
+			// The preview projection holds the earlier drafts after the branch; they stay in context with the kept entries.
 			const preview = event.context.contextEntries;
-			const keptTokens = estimateMessageTokens(preview.slice(Math.max(0, preview.findIndex((entry) => entry.sourceEntry.id === firstKeptEntryId))).flatMap((entry) => entry.messages));
+			const positions = new Map(entries.map((entry, index) => [entry.id, index]));
+			const keptIndex = firstKeptEntryId === null ? entries.length : (positions.get(firstKeptEntryId) as number);
+			const keptFrom = preview.findIndex((entry) => (positions.get(entry.sourceEntry.id) ?? entries.length) >= keptIndex);
+			const keptTokens = keptFrom < 0 ? 0 : estimateMessageTokens(preview.slice(keptFrom).flatMap((entry) => entry.messages));
 			const availableTokens = knownLimit(limits.model?.contextWindow) - requestFixedTokens(pi, ctx) - budgets.outputReserveTokens;
 			const requiredTokens = ledgerTokenEstimate(summary) + keptTokens;
-			if (requiredTokens > availableTokens) return skip(`the recovery summary and the messages kept from the checkpoint call on need ${requiredTokens} tokens, above the ${availableTokens}-token budget`);
+			if (requiredTokens > availableTokens) return skip(`the recovery summary and the kept messages need ${requiredTokens} tokens, above the ${availableTokens}-token budget`);
 			pending.proposed = { windowId: details.windowId };
-			return [...event.entries, { type: "compaction" as const, summary, firstKeptEntryId, details }];
+			return [{ type: "compaction" as const, summary, firstKeptEntryId, details }, ...event.entries];
 		} catch (error) {
 			return skip(error instanceof Error ? error.message : String(error));
 		}
@@ -3163,9 +3274,11 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		const compaction = checkpointCompaction(event, ctx, "continue");
 		if (compaction) return { entries: compaction };
 		if (event.outcome !== "completed" || event.toolResults.length === 0) return;
-		if (event.context.pendingMessages.some((message) => message.role === "custom" && message.customType === REMINDER_MESSAGE_TYPE)) return;
-		const draft = reminder(ctx);
-		if (draft) pi.sendMessage(draft, { deliverAs: "steer" });
+		const queued = new Set(event.context.pendingMessages.flatMap((message) => message.role === "custom" ? [message.customType] : []));
+		// A reminder carries the usage too, so a queued one also stands for a usage notice.
+		if (queued.has(REMINDER_MESSAGE_TYPE)) return;
+		const draft = reminder(ctx) ?? (queued.has(USAGE_MESSAGE_TYPE) ? undefined : usageNotice(ctx));
+		if (draft) pi.sendMessage<unknown>(draft, { deliverAs: "steer" });
 	});
 
 	// A run ending without a tool batch gets one more turn for a repeated or urgent request; a first request waits for the next tool batch.

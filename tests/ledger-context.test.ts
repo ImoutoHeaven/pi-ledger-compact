@@ -44,7 +44,7 @@ import {
 import { stream as streamResponses, streamSimple as streamSimpleResponses } from "@earendil-works/pi-ai/api/openai-responses";
 import { stream as streamCompletions } from "@earendil-works/pi-ai/api/openai-completions";
 import { stream as streamAnthropic } from "@earendil-works/pi-ai/api/anthropic-messages";
-import { CHECKPOINT_ENTRY_TYPE, COMPACTION_NOTE_TYPE, REMINDER_MESSAGE_TYPE, createLedgerContext, type LedgerContextOptions, type LedgerContextSettingsReader, type LedgerCompactionDetails } from "../src/ledger-context.ts";
+import { CHECKPOINT_ENTRY_TYPE, COMPACTION_NOTE_TYPE, REMINDER_MESSAGE_TYPE, USAGE_MESSAGE_TYPE, createLedgerContext, type LedgerContextOptions, type LedgerContextSettingsReader, type LedgerCompactionDetails } from "../src/ledger-context.ts";
 
 const TEST_TIMEOUT_MS = 5_000;
 const extensionErrors: ExtensionError[] = [];
@@ -2007,7 +2007,9 @@ test("checkpoint requests are bounded per origin, scoped to their window, and es
 		assert.deepEqual(first.map((entry) => [(entry.details as { sequence: number }).sequence, (entry.details as { pressure: string }).pressure]),
 			[[0, "none"], [1, "none"], [2, "urgent"]], "a request is repeated once after more work and once when urgent pressure begins");
 		assert.equal(new Set(first.map((entry) => (entry.details as { windowId: string }).windowId)).size, 1);
-		assert.ok(first.every((entry) => typeof entry.content === "string" && textTokenEstimate(entry.content) <= 256));
+		// The guidelines, the scope line and the context line keep a request short.
+		assert.ok(first.every((entry) => typeof entry.content === "string" && textTokenEstimate(entry.content) <= 288));
+		assert.match(String(first[0].content), /\nContext: 4000 of 10000 tokens \(40%\); \d+ until the compaction boundary\.\n/);
 		assert.match(String(first[2].content), /nearly full/);
 		assert.ok(contexts.some((context) => JSON.stringify(context.messages).includes(String(first[1].content).split("\n")[0])));
 
@@ -6575,6 +6577,10 @@ function checkpointReceipts(entries: SessionEntry[]): Array<Extract<SessionEntry
 	return messageEntries(entries).filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "checkpoint");
 }
 
+function occurrences(text: string, part: string): number {
+	return text.split(part).length - 1;
+}
+
 test("checkpoint compact continue compacts onto the checkpoint after its tool batch, keeps working and survives reload", async (t) => {
 	// An extension that appends during the boundary moves the leaf before Pi commits the compaction.
 	const probe = (pi: ExtensionAPI) => pi.on("turn_end", async () => { pi.appendEntry("boundary-probe", {}); });
@@ -6593,7 +6599,10 @@ test("checkpoint compact continue compacts onto the checkpoint after its tool ba
 	const compaction = latestCompaction(branch);
 	const call = checkpointCallEntry(branch);
 	const receipt = checkpointReceipts(branch).at(-1)!;
-	assert.equal(compaction.firstKeptEntryId, call.id);
+	// A call alone in its message leaves with its result: the compaction keeps no earlier entry.
+	assert.equal(compaction.firstKeptEntryId, compaction.id);
+	assert.equal((compaction.details as LedgerCompactionDetails).firstKeptEntryId, null);
+	assert.ok(branch.indexOf(call) < branch.indexOf(compaction));
 	assert.equal((compaction.details as LedgerCompactionDetails).delta.status, "empty");
 	assert.equal((compaction.details as LedgerCompactionDetails).checkpointEntryId, checkpointEntries(branch).at(-1)!.id);
 	assert.notEqual(compaction.parentId, (compaction.details as LedgerCompactionDetails).sourceBranchTip);
@@ -6606,7 +6615,9 @@ test("checkpoint compact continue compacts onto the checkpoint after its tool ba
 	assert.equal(ledgerFaux.state.callCount, 0);
 	assert.equal(faux.state.callCount, 2);
 	assert.match(nextContext, /Ledger Context Recovery/);
-	assert.match(nextContext, /Compaction scheduled/);
+	assert.match(nextContext, /Your checkpoint call asked for this compaction right after its tool batch/);
+	assert.doesNotMatch(nextContext, /Compaction scheduled/);
+	assert.equal(occurrences(nextContext, "Handoff: finish the parser task."), 1, "the ledger reaches the new window once");
 	assert.doesNotMatch(nextContext, /old evidence/);
 	await session.reload();
 	const errorsBefore = extensionErrors.length;
@@ -6614,6 +6625,16 @@ test("checkpoint compact continue compacts onto the checkpoint after its tool ba
 	await session.prompt("Continue.");
 	assert.deepEqual(extensionErrors.slice(errorsBefore), []);
 	assert.match(JSON.stringify(messageEntries(manager.getBranch()).at(-1)!.message), /"resumed"/);
+	// The next delta does not count the checkpoint call and receipt the compaction dropped as missing evidence.
+	faux.setResponses([fauxAssistantMessage("noted")]);
+	await session.prompt("new evidence ".repeat(400));
+	let deltaRequest = "";
+	ledgerFaux.setResponses([(context) => { deltaRequest = JSON.stringify(context.messages); return fauxAssistantMessage("New evidence arrived."); }]);
+	await session.compact();
+	assert.match(deltaRequest, /new evidence/);
+	// Only the probe's own entry, which the boundary dropped too, may count as missing.
+	const missing = deltaRequest.match(/## Missing from this evidence(.*?)## Evidence/)?.[1] ?? "";
+	for (const id of [call.id, receipt.id]) assert.ok(!missing.includes(id), missing);
 });
 
 test("checkpoint compact stop compacts after the final reply and ends the run", async (t) => {
@@ -6630,16 +6651,36 @@ test("checkpoint compact stop compacts after the final reply and ends the run", 
 	const branch = manager.getBranch();
 	const compaction = latestCompaction(branch);
 	assert.equal(branch.at(-1), compaction);
-	assert.equal(compaction.firstKeptEntryId, checkpointCallEntry(branch).id);
+	const receipt = checkpointReceipts(branch).at(-1)!;
+	assert.equal(compaction.firstKeptEntryId, branch[branch.indexOf(receipt) + 1].id, "the branch is kept from the entry after the call's result");
 	assert.equal((compaction.details as LedgerCompactionDetails).delta.status, "empty");
-	assert.match(toolResultText(checkpointReceipts(branch).at(-1)!), /Compaction scheduled: .*when you end your turn/);
+	assert.match(toolResultText(receipt), /Compaction scheduled: .*when you end your turn/);
 	assert.equal(faux.state.callCount, 2);
 	assert.equal(ledgerFaux.state.callCount, 0);
 	let nextContext = "";
 	faux.setResponses([(context) => { nextContext = JSON.stringify(context.messages); return fauxAssistantMessage("next run"); }]);
 	await session.prompt("Review is done.");
-	assert.match(nextContext, /Handoff: wait for review\./);
+	assert.equal(occurrences(nextContext, "Handoff: wait for review."), 1);
+	assert.match(nextContext, /Your checkpoint call asked for this compaction when you ended your turn/);
 	assert.match(nextContext, /final reply before compaction/);
+	assert.doesNotMatch(nextContext, /old evidence/);
+});
+
+test("checkpoint compact keeps the branch from the call's message when other calls share it", async (t) => {
+	const fixture = await createFixture(false, [], 64, { compactionEnabled: false });
+	t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+	const { session, sessionManager: manager, faux } = fixture;
+	manager.appendMessage({ role: "user", content: "old evidence ".repeat(400), timestamp: Date.now() });
+	manager.appendMessage(fauxAssistantMessage("old answer"));
+	let nextContext = "";
+	faux.setResponses([
+		fauxAssistantMessage([fauxToolCall("history_search", { query: "answer" }), fauxToolCall("checkpoint", { ledger: "Handoff beside a search.", compact: "continue" })]),
+		(context) => { nextContext = JSON.stringify(context.messages); return fauxAssistantMessage("continued"); },
+	]);
+	await session.prompt("Search and hand off.");
+	const branch = manager.getBranch();
+	assert.equal(latestCompaction(branch).firstKeptEntryId, checkpointCallEntry(branch).id);
+	assert.match(nextContext, /"toolName":"history_search"/, "the other call keeps its result");
 	assert.doesNotMatch(nextContext, /old evidence/);
 });
 
@@ -6692,7 +6733,7 @@ test("checkpoint compact declines when the messages kept from the checkpoint cal
 	await session.prompt("Hand off.");
 	const branch = manager.getBranch();
 	assert.equal(branch.some((entry) => entry.type === "compaction"), false);
-	assert.match(JSON.stringify(branch.at(-1)), /messages kept from the checkpoint call on need \d+ tokens, above the \d+-token budget/);
+	assert.match(JSON.stringify(branch.at(-1)), /the recovery summary and the kept messages need \d+ tokens, above the \d+-token budget/);
 });
 
 test("checkpoint compact skips small sessions, needs new state, follows the latest save and yields to later history edits", async (t) => {
@@ -6780,7 +6821,8 @@ for (const order of ["before", "after"] as const) {
 			await session.prompt("Hand off.");
 			const branch = manager.getBranch();
 			const compaction = latestCompaction(branch);
-			assert.equal(compaction.firstKeptEntryId, checkpointCallEntry(branch).id);
+			assert.ok(branch.indexOf(compaction) > branch.indexOf(checkpointCallEntry(branch)));
+			assert.notEqual(compaction.firstKeptEntryId, checkpointCallEntry(branch).id);
 			assert.deepEqual(compactionNotes(branch), []);
 			const last = contexts.at(-1)!;
 			assert.match(last, /Ledger Context Recovery/);
@@ -6864,7 +6906,8 @@ test("a stop compaction commits when another extension aborts the run before it 
 		fixture.faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Handoff.", compact: "stop" })), fauxAssistantMessage("final reply")]);
 		await fixture.session.prompt("Hand off.");
 		const branch = fixture.sessionManager.getBranch();
-		assert.equal(latestCompaction(branch).firstKeptEntryId, checkpointCallEntry(branch).id, order);
+		const receipt = checkpointReceipts(branch).at(-1)!;
+		assert.equal(latestCompaction(branch).firstKeptEntryId, branch[branch.indexOf(receipt) + 1].id, order);
 		assert.deepEqual(compactionNotes(branch), [], order);
 	}
 
@@ -6879,6 +6922,54 @@ test("a stop compaction commits when another extension aborts the run before it 
 	const branch = failing.sessionManager.getBranch();
 	assert.equal(branch.some((entry) => entry.type === "compaction"), false);
 	assert.deepEqual(compactionNotes(branch).map((note) => note.content), ["Ledger Context did not compact onto your checkpoint: the model request failed."]);
+});
+
+test("usage notices report each new step of the model window once per window, and an environment variable sets or disables the step", async (t) => {
+	const work = (pi: ExtensionAPI) => pi.registerTool({ name: "usage_work", label: "Work", description: "Do ordinary work.", parameters: Type.Object({}),
+		execute: async () => ({ content: [{ type: "text" as const, text: "work done" }], details: {} }) });
+	const fixture = await createFixture(false, [work], 1, { contextWindow: 20_000, compactionEnabled: false, extraToolNames: ["usage_work", "get_context_remaining"] });
+	const previous = process.env.LEDGER_CONTEXT_USAGE_NOTICE_PERCENT;
+	t.after(() => {
+		if (previous === undefined) delete process.env.LEDGER_CONTEXT_USAGE_NOTICE_PERCENT;
+		else process.env.LEDGER_CONTEXT_USAGE_NOTICE_PERCENT = previous;
+		fixture.session.dispose();
+		rmSync(fixture.root, { recursive: true, force: true });
+	});
+	const { session, sessionManager: manager, faux, ledgerFaux } = fixture;
+	let usedTokens = 500;
+	session.getContextUsage = () => ({ tokens: usedTokens, contextWindow: 20_000, percent: usedTokens / 200 });
+	const contexts: string[] = [];
+	const step = async (used: number, tool = "usage_work") => {
+		usedTokens = used;
+		faux.setResponses([fauxAssistantMessage(fauxToolCall(tool, {})), (context) => { contexts.push(JSON.stringify(context.messages)); return fauxAssistantMessage("done"); }]);
+		await session.prompt(`work at ${used}`);
+	};
+	const notices = () => manager.getBranch().filter((entry): entry is Extract<SessionEntry, { type: "custom_message" }> =>
+		entry.type === "custom_message" && entry.customType === USAGE_MESSAGE_TYPE);
+	const used = () => notices().map((entry) => (entry.details as { usedTokens: number }).usedTokens);
+
+	await step(500);
+	await step(1_100);
+	await step(1_500);
+	await step(3_200);
+	assert.deepEqual(used(), [1_100, 3_200], "one notice per new 5% step, and one for a jump over several");
+	assert.match(String(notices()[1].content), /^Ledger Context usage: 3200 of 20000 tokens \(16%\); \d+ until the compaction boundary; \d+ tokens of new work since your last checkpoint or compaction\.$/);
+	assert.ok(contexts.at(-1)!.includes(String(notices()[1].content)), "the notice reaches the next request");
+	await step(4_100, "get_context_remaining");
+	assert.deepEqual(used(), [1_100, 3_200], "get_context_remaining already showed the new step");
+
+	ledgerFaux.setResponses([fauxAssistantMessage("No new changes.")]);
+	await session.compact();
+	await step(1_200);
+	assert.deepEqual(used(), [1_100, 3_200, 1_200], "a new window reports its steps again");
+
+	process.env.LEDGER_CONTEXT_USAGE_NOTICE_PERCENT = "10";
+	await step(1_900);
+	await step(2_100);
+	assert.deepEqual(used(), [1_100, 3_200, 1_200, 2_100]);
+	process.env.LEDGER_CONTEXT_USAGE_NOTICE_PERCENT = "0";
+	await step(9_000);
+	assert.equal(notices().length, 4, "0 turns usage notices off");
 });
 
 test("tool prompt text names its tool, stays within the static budget, declares null for omitted parameters, and keeps the tools out of script calls", async (t) => {
