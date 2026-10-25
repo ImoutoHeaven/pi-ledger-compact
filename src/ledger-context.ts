@@ -20,7 +20,7 @@ export const MAX_SOURCE_REFERENCES = 8;
 export const MAX_SOURCE_QUOTE_LENGTH = 512;
 export const MAX_SOURCE_MATCHES = 4;
 export const LEDGER_BYTE_LIMIT = 65_536;
-export const DEFAULT_LEDGER_TOKEN_LIMIT = 4_096;
+export const DEFAULT_LEDGER_TOKEN_LIMIT = 8_192;
 export const DEFAULT_DELTA_TOKEN_LIMIT = 2_048;
 export const DEFAULT_HISTORY_READ_TOKEN_LIMIT = 2_048;
 export const DEFAULT_OUTPUT_RESERVE_TOKEN_LIMIT = 16_384;
@@ -3335,6 +3335,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 			`checkpoint: ${CHECKPOINT_LEDGER_GUIDELINES}`,
 			`checkpoint: an edit save after a compaction appends that compaction's changes under "${FOLDED_CHANGES_HEADING}"; these sections are temporary. When a receipt reports several of them, make your next save a complete ledger that merges them into the current state and drops what they replaced.`,
 			"checkpoint: save after important decisions, user corrections and finished milestones, then continue the task. Put every essential fact in the ledger; sourceQuotes only point to evidence.",
+			"checkpoint: checkpoint, the history_* tools and get_context_remaining are direct calls only; codemode scripts cannot call them.",
 		],
 		parameters: checkpointParameters,
 		prepareArguments: preparedArguments(checkpointParameters, validationError),
@@ -3515,6 +3516,11 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 			// text then keeps only its own caps, and the routed delta request fails if the evidence does not fit.
 			const window = knownLimit(limits.model?.contextWindow);
 			const availableTokens = window - requestFixedTokens(pi, ctx) - budgets.outputReserveTokens;
+			// The kept messages stay in context with the summary, which replaces the previous one; Pi's tail may start inside the previous tail.
+			const positions = new Map(branch.map((entry, index) => [entry.id, index]));
+			const keptIndex = positions.get(firstKeptEntryId) ?? branch.length;
+			const kept = buildSessionProjection(branch).entries.filter((entry) => entry.sourceEntry.type !== "compaction" && (positions.get(entry.sourceEntry.id) ?? -1) >= keptIndex);
+			const keptTokens = estimateMessageTokens(kept.flatMap((entry) => entry.messages));
 			const generationLeaf = ctx.sessionManager.getLeafId();
 			const generationModel = ctx.model;
 			const thinkingLevel = limits.thinkingLevel ?? ctx.thinkingLevel ?? pi.getThinkingLevel();
@@ -3522,7 +3528,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 			const generationUsages: Usage[] = [];
 			const routingId = randomUUID();
 			const delta = await generateCompactionDelta(ctx, state.checkpoint, state.delta, branch, firstKeptEntryId,
-				Math.min(budgets.deltaTokens, availableTokens - ledgerTokenEstimate(summary) + ledgerTokenEstimate(state.delta?.data.ledger ?? "") - 256),
+				Math.min(budgets.deltaTokens, availableTokens - keptTokens - ledgerTokenEstimate(summary) + ledgerTokenEstimate(state.delta?.data.ledger ?? "") - 256),
 				event.signal, event.customInstructions, () => {
 					const requestOptions = (options.requestOptionsReader ?? defaultRequestOptions)(ctx);
 					const { apiKey: _apiKey, headers: _headers, env: _env, ...withoutAuth } = requestOptions;
@@ -3541,9 +3547,9 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 			details = buildCompactionDetails(state, branch, firstKeptEntryId, details.windowId, delta, snapshotPosition);
 			if (generationFailures.length > 0) details.generationFailures = generationFailures;
 			summary = renderBootstrap(branch, state, details, budgets, event.customInstructions);
-			const summaryTokens = ledgerTokenEstimate(summary);
-			if (summaryTokens > availableTokens) {
-				throw new Error(`recovery bootstrap requires ${summaryTokens} tokens, above the ${availableTokens}-token budget`);
+			const requiredTokens = ledgerTokenEstimate(summary) + keptTokens;
+			if (requiredTokens > availableTokens) {
+				throw new Error(`the recovery bootstrap and the kept messages require ${requiredTokens} tokens, above the ${availableTokens}-token budget`);
 			}
 			return {
 				compaction: {

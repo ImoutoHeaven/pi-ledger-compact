@@ -1526,10 +1526,11 @@ test("native threshold compacts before the next request in the same run", { time
 			order.push(event.reason);
 		});
 	};
+	// The window holds the recovery summary and Pi's kept tail after the compaction.
 	const { root, faux, ledgerFaux, session, sessionManager } = await createFixture(true, [observeCompactionExtension], 1_750, {
-		contextWindow: 6_000,
+		contextWindow: 7_000,
 		maxTokens: 100,
-		reserveTokens: 2_500,
+		reserveTokens: 3_500,
 		extraToolNames: ["large_result_first", "large_result_second"],
 	});
 	try {
@@ -4944,10 +4945,11 @@ test("native same-run compaction retains a persisted steering correction", { tim
 		pi.on("session_compact", () => {
 		});
 	};
+	// The window holds the recovery summary and Pi's kept tail after the compaction.
 	const { root, faux, session, sessionManager } = await createFixture(true, [stagedTool], 4_000, {
-		contextWindow: 8_192,
+		contextWindow: 8_704,
 		maxTokens: 100,
-		reserveTokens: 4_192,
+		reserveTokens: 4_704,
 		extraToolNames: ["staged_result"],
 	});
 	try {
@@ -6734,6 +6736,33 @@ test("checkpoint compact declines when the messages kept from the checkpoint cal
 	const branch = manager.getBranch();
 	assert.equal(branch.some((entry) => entry.type === "compaction"), false);
 	assert.match(JSON.stringify(branch.at(-1)), /the recovery summary and the kept messages need \d+ tokens, above the \d+-token budget/);
+});
+
+test("native compaction fits its delta beside the messages Pi keeps, and cancels when they leave no room", async (t) => {
+	const compactWith = async (tail: string, deltas: string[]) => {
+		const fixture = await createFixture(false, [], 1_000, { compactionEnabled: false, contextWindow: 30_000 });
+		t.after(() => { fixture.session.dispose(); rmSync(fixture.root, { recursive: true, force: true }); });
+		const { session, sessionManager: manager, ledgerFaux } = fixture;
+		ledgerFaux.setResponses(deltas.map((delta) => fauxAssistantMessage(delta)));
+		for (let i = 0; i < 3; i++) {
+			manager.appendMessage({ role: "user", content: `old evidence ${i} `.repeat(400), timestamp: Date.now() });
+			manager.appendMessage(fauxAssistantMessage(`old answer ${i}`));
+		}
+		manager.appendMessage({ role: "user", content: "Recent request", timestamp: Date.now() });
+		manager.appendMessage(fauxAssistantMessage(tail));
+		const compacted = await session.compact().then(() => true, (error) => {
+			assert.match(String(error), /Compaction cancelled/);
+			return false;
+		});
+		const compaction = manager.getBranch().filter((entry) => entry.type === "compaction").at(-1);
+		return { compacted, deltaRequests: ledgerFaux.state.callCount, ledger: compaction && generatedDelta(compaction).ledger };
+	};
+	const long = `Long delta: ${"d".repeat(6_000)}`;
+	assert.deepEqual(await compactWith("short recent reply", [long]), { compacted: true, deltaRequests: 1, ledger: long });
+	// Pi keeps the recent reply verbatim, which leaves room for a short delta only: the long one is refused, not committed and cancelled.
+	assert.deepEqual(await compactWith("long recent reply ".repeat(5_008), [long, "Short delta."]), { compacted: true, deltaRequests: 2, ledger: "Short delta." });
+	// With the summary, the kept reply alone overflows the window: no delta is requested.
+	assert.deepEqual(await compactWith("long recent reply ".repeat(8_000), [long]), { compacted: false, deltaRequests: 0, ledger: undefined });
 });
 
 test("checkpoint compact skips small sessions, needs new state, follows the latest save and yields to later history edits", async (t) => {

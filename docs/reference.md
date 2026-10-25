@@ -15,7 +15,7 @@ array items.
 Saves the active recovery baseline on the current branch:
 
 - **`ledger`**: Complete working state string, up to `65536` UTF-8 bytes and
-  `LEDGER_CONTEXT_LEDGER_TOKENS` (default `4096`). An empty or whitespace-only
+  `LEDGER_CONTEXT_LEDGER_TOKENS` (default `8192`). An empty or whitespace-only
   string counts as omitted when another mode is supplied.
 - **`edits`**: Non-empty array of `{ oldText, newText }` replacements applied to
   the saved state (`<checkpoint ledger>` followed by
@@ -133,7 +133,8 @@ When Pi fires `session_before_compact` (automatic threshold, overflow, or manual
    schema version `6`) and cumulative compaction delta (`details.kind === "ledger-context"`).
 2. Calls `ctx.modelRegistry.streamSimple()` using the active physical model (or
    virtual selection before the first physical response) to summarize new
-   eligible branch evidence within `LEDGER_CONTEXT_DELTA_TOKENS` (default `2048`)
+   eligible branch evidence within `LEDGER_CONTEXT_DELTA_TOKENS` (default `2048`),
+   the context budget left after the bootstrap and kept `firstKeptEntryId` tail,
    and `65536` UTF-8 bytes. These limits validate saved text; Pi's stream
    options govern model generation.
 3. If input exceeds model request capacity, retries packing by leaving Pi's
@@ -147,8 +148,9 @@ When Pi fires `session_before_compact` (automatic threshold, overflow, or manual
 5. If delta generation fails or overflows capacity, records `status: "stale"`
    (when a prior delta exists) or `"unavailable"` (`"generation-failed"`,
    `"input-capacity"`, or `"no-model"`), preserving the saved checkpoint and
-   earlier delta. If the recovery bootstrap itself exceeds the available context
-   budget, the compaction is cancelled so existing history stays intact.
+   earlier delta. If the recovery bootstrap with the kept `firstKeptEntryId`
+   tail exceeds the available context budget, the compaction is cancelled so
+   existing history stays intact.
 
 ## 3. Checkpoint Reminders, Usage Notices, and Boundaries
 
@@ -186,7 +188,7 @@ other `LEDGER_CONTEXT_*` variable must be a positive safe integer
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `LEDGER_CONTEXT_LEDGER_TOKENS` | `4096` | Max estimated tokens for a saved checkpoint ledger |
+| `LEDGER_CONTEXT_LEDGER_TOKENS` | `8192` | Max estimated tokens for a saved checkpoint ledger |
 | `LEDGER_CONTEXT_DELTA_TOKENS` | `2048` | Max estimated tokens for a generated compaction delta |
 | `LEDGER_CONTEXT_READ_TOKENS` | `2048` | Default token budget per history query/read (`truncate: false` bypasses) |
 | `LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS` | `max(1, floor(min(W * 0.10, 16384)))` | Context headroom `O` reserved for boundary calculation, reminders, and recovery summaries |

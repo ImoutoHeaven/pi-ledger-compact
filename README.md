@@ -50,7 +50,7 @@ Example arguments for the agent's `checkpoint` tool:
   directly declared to the model (including under `codemode.mode: "only"`) and
   cannot be called from `codemode` scripts. Optional parameters accept `null` as omitted.
 - **Checkpoints, edits, and compaction**: `checkpoint` takes either `ledger` (up
-  to `65536` UTF-8 bytes and `LEDGER_CONTEXT_LEDGER_TOKENS`, default `4096`) or
+  to `65536` UTF-8 bytes and `LEDGER_CONTEXT_LEDGER_TOKENS`, default `8192`) or
   disjoint `edits` against the saved checkpoint plus any `## Folded compaction changes`
   delta. `compact: "continue"` compacts after the current tool batch; `"stop"`
   compacts after the final reply before settling. When the `checkpoint` call is
