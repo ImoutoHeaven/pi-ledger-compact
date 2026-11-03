@@ -3,7 +3,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if command -v cygpath >/dev/null 2>&1; then root="$(cygpath -m "$root")"; fi
 docker info >/dev/null
-for version in 1.3.0 1.4.0; do
+for version in 1.5.0; do
   echo "=== Pi $version ==="
   MSYS_NO_PATHCONV=1 docker run --rm \
     --mount "type=bind,src=$root,dst=/src,readonly" \

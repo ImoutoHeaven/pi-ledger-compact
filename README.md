@@ -7,7 +7,7 @@ history tools.
 ## Requirements and Quickstart
 
 - Node.js `>=22.19.0` with `@earendil-works/pi-coding-agent` and
-  `@earendil-works/pi-ai` `>=1.1.0 <2.0.0` (tested on Pi `1.3.0` and `1.4.0`).
+  `@earendil-works/pi-ai` `>=1.5.0 <2.0.0` (tested on Pi `1.5.0`).
 - Keep Pi native automatic compaction enabled for automatic window transitions,
   with this package as the session's single compaction content extension.
 
@@ -62,8 +62,9 @@ Example arguments for the agent's `checkpoint` tool:
 - **Schema and failure safety**: Recovery records require schema version `6`
   (no automatic migration). Delta generation failures or input capacity overflows
   preserve the saved checkpoint and earlier matching delta.
-- **Persistence uncertainty**: A session log write failure aborts the active run
-  and blocks saves and compactions until the persisted session is reopened.
+- **Session log write failures**: Pi drops an entry it cannot write. A failed
+  checkpoint save aborts the active run and keeps the previous checkpoint; the
+  next request continues from the persisted session.
 - **Context reserve vs. generation limit**: `LEDGER_CONTEXT_OUTPUT_RESERVE_TOKENS`
   reserves context-window headroom for boundaries, reminders, and recovery
   summaries; it does not cap LLM output generation.
@@ -74,8 +75,8 @@ Example arguments for the agent's `checkpoint` tool:
 npm run test:docker
 ```
 
-Requires Docker and network access. The script typechecks and tests Pi `1.3.0`
-and `1.4.0` in temporary containers with source mounted read-only.
+Requires Docker and network access. The script typechecks and tests Pi `1.5.0`
+in temporary containers with source mounted read-only.
 
 See [`docs/reference.md`](docs/reference.md) and [`src/ledger-context.ts`](src/ledger-context.ts).
 License: MIT.

@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
-import { StringEnum, Type, isRetryableAssistantError, type ModelsSimpleStreamOptions, type Static, type TSchema, type Usage } from "@earendil-works/pi-ai";
+import { isRetryableAssistantError, type ModelsSimpleStreamOptions, type Usage } from "@earendil-works/pi-ai";
+import { type Static, type TSchema, Type } from "typebox";
 import {
-	SessionManager,
 	SettingsManager,
 	buildSessionProjection,
 	DEFAULT_COMPACTION_SETTINGS,
@@ -43,6 +43,11 @@ const LEDGER_CONTENTS = "goal and status; constraints and decisions still in for
 const CHECKPOINT_LEDGER_GUIDELINES = `Write the ledger as your complete current working state: ${LEDGER_CONTENTS}. Save it whole with ledger, carrying over everything still needed from the previous checkpoint, the compaction changes and recent work; or change parts of the saved state with edits, which keep all other text and the saved sourceQuotes. Keep plans apart from finished work, and redact secrets.`;
 /** Separates the checkpoint text from folded compaction changes in the text that checkpoint edits change. */
 const FOLDED_CHANGES_HEADING = "## Folded compaction changes";
+
+/** A string enum as `{ type: "string", enum }`, which providers without anyOf/const support accept. */
+function StringEnum<T extends readonly string[]>(values: T, options?: { description?: string }) {
+	return Type.Unsafe<T[number]>({ type: "string", enum: [...values], ...options });
+}
 
 /**
  * An optional parameter that also accepts null. Endpoints that enforce strict function calling make
@@ -482,7 +487,6 @@ interface StoredCheckpoint {
 
 interface SessionState {
 	activeWindowId: string;
-	boundSessionManager?: ExtensionContext["sessionManager"];
 	checkpoint?: StoredCheckpoint;
 	delta?: StoredDelta;
 	currentAgentRequest?: { position: RequestHistoryPosition; recoveryBasis: RecoveryBasis | null };
@@ -492,7 +496,6 @@ interface SessionState {
 	 */
 	pendingCompaction?: { toolCallId: string; mode: CompactMode; proposed?: { windowId: string } | "note" };
 	recoveryError?: string;
-	persistenceUncertain?: string;
 }
 
 function positiveIntegerEnv(name: string, fallback: number): number {
@@ -2310,60 +2313,12 @@ function latestLedgerCompaction(entries: SessionEntry[]): Extract<SessionEntry, 
 	return compaction && isLedgerCompactionDetails(compaction.details) ? compaction : undefined;
 }
 
-function durableBranchMismatch(ctx: ExtensionContext): string | undefined {
-	const sessionFile = ctx.sessionManager.getSessionFile();
-	if (!sessionFile) return undefined;
-	try {
-		const durableSession = SessionManager.open(sessionFile);
-		const durableEntries = durableSession.getEntries();
-		const durableIds = new Set(durableEntries.map((entry) => entry.id));
-		const currentBranch = ctx.sessionManager.getBranch();
-		if (!ctx.sessionManager.getEntries().some((entry) => entry.type === "message" && entry.message.role === "assistant")) return undefined;
-		const missingEntry = currentBranch.find((entry) => !durableIds.has(entry.id));
-		if (missingEntry) {
-			return `session memory entry ${missingEntry.id} is not present in the persisted log`;
-		}
-		const leafId = ctx.sessionManager.getLeafId();
-		if (leafId !== null && !durableIds.has(leafId)) return `session memory leaf ${leafId} is not present in the persisted log`;
-		return undefined;
-	} catch (error) {
-		const reason = error instanceof Error ? error.message : String(error);
-		return `the persisted session log could not be reopened: ${reason}`;
-	}
-}
-
-function invalidateUncertainState(state: SessionState, ctx: ExtensionContext, reason: string): void {
-	state.persistenceUncertain ??= reason;
-	state.checkpoint = undefined;
-	state.delta = undefined;
-	state.currentAgentRequest = undefined;
-	state.activeWindowId = initialWindowId(ctx);
-}
-
-function blockIfPersistenceUncertain(state: SessionState, ctx: ExtensionContext): boolean {
-	if (state.recoveryError) {
-		notify(ctx, `Ledger Context stopped: ${state.recoveryError}`, "error");
-		ctx.abort();
-		throw new Error(`Ledger Context stopped: ${state.recoveryError}`);
-	}
-	const mismatch = durableBranchMismatch(ctx);
-	if (mismatch) {
-		invalidateUncertainState(state, ctx, mismatch);
-		try {
-			ctx.abort();
-		} catch {
-			// The host may already be finishing the failed operation.
-		}
-		notify(ctx, `Ledger Context stopped: ${mismatch}. Reopen the persisted session before continuing.`, "error");
-		return true;
-	}
-	if (!state.persistenceUncertain) return false;
-	notify(
-		ctx,
-		`Ledger Context stopped: ${state.persistenceUncertain}. Reopen the persisted session before continuing.`,
-		"error",
-	);
-	return true;
+/** Stops the operation when the branch's ledger records cannot be read back. */
+function stopOnRecoveryError(state: SessionState, ctx: ExtensionContext): void {
+	if (!state.recoveryError) return;
+	notify(ctx, `Ledger Context stopped: ${state.recoveryError}`, "error");
+	ctx.abort();
+	throw new Error(`Ledger Context stopped: ${state.recoveryError}`);
 }
 
 function hydrateState(state: SessionState, entries: SessionEntry[], ctx: ExtensionContext, resetRequest = true): void {
@@ -2860,7 +2815,6 @@ function matchesCheckpointEntry(entry: SessionEntry, data: AgentCheckpoint): boo
 function appendCheckpoint(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
-	state: SessionState,
 	data: AgentCheckpoint,
 ): { entryId: string; saveScope: CheckpointReceiptDetails["saveScope"] } {
 	const previousLeafId = ctx.sessionManager.getLeafId();
@@ -2874,21 +2828,19 @@ function appendCheckpoint(
 		return { entryId: entry.id, saveScope };
 	} catch (error) {
 		const reason = error instanceof Error ? error.message : String(error);
-		state.persistenceUncertain = reason;
 		try {
 			ctx.abort();
 		} catch {
 			// The host may already be finishing the failed tool operation.
 		}
-		const recoveryMessage =
-			`checkpoint persistence is uncertain after a log error: ${reason}. Reopen the persisted session before saving or compacting again.`;
-		notify(ctx, recoveryMessage, "error");
-		throw new Error(recoveryMessage);
+		const message = `checkpoint not saved after a session log error: ${reason}. The previous checkpoint stays in effect.`;
+		notify(ctx, message, "error");
+		throw new Error(message);
 	}
 }
 
 function saveAgentCheckpoint(pi: ExtensionAPI, ctx: ExtensionContext, state: SessionState, data: AgentCheckpoint) {
-	const saved = appendCheckpoint(pi, ctx, state, data);
+	const saved = appendCheckpoint(pi, ctx, data);
 	state.checkpoint = { entryId: saved.entryId, data };
 	state.delta = undefined;
 	return saved;
@@ -3155,16 +3107,13 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		if (!state) {
 			state = createState(ctx);
 			states.set(key, state);
-		} else if (state.boundSessionManager !== ctx.sessionManager) {
-			state.persistenceUncertain = undefined;
 		}
-		state.boundSessionManager = ctx.sessionManager;
 		return state;
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
 		const state = getState(ctx);
-		if (blockIfPersistenceUncertain(state, ctx)) return;
+		stopOnRecoveryError(state, ctx);
 		// Hosts may bind extensions while the first request is already running; its snapshot stays valid.
 		const request = state.currentAgentRequest;
 		state.pendingCompaction = undefined;
@@ -3177,12 +3126,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		const entries = ctx.sessionManager.getBranch();
 		hydrateState(state, entries, ctx, false);
 		state.currentAgentRequest = undefined;
-		if (blockIfPersistenceUncertain(state, ctx)) return { messages: [] };
-		if (state.recoveryError) {
-			notify(ctx, `Ledger Context recovery error: ${state.recoveryError}`, "error");
-			ctx.abort();
-			throw new Error(state.recoveryError);
-		}
+		stopOnRecoveryError(state, ctx);
 		state.currentAgentRequest = { position: requestPositionForContext(entries), recoveryBasis: requestRecoveryBasis(event.messages, entries) };
 		return undefined;
 	});
@@ -3190,7 +3134,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 	const reminder = (ctx: ExtensionContext) => {
 		try {
 			const state = getState(ctx);
-			if (blockIfPersistenceUncertain(state, ctx)) return undefined;
+			stopOnRecoveryError(state, ctx);
 			return dueReminder(state, pi, ctx, settingsReader);
 		} catch (error) {
 			notify(ctx, `Ledger Context reminders disabled: ${error instanceof Error ? error.message : String(error)}`, "error");
@@ -3201,7 +3145,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 	const usageNotice = (ctx: ExtensionContext) => {
 		try {
 			const state = getState(ctx);
-			if (blockIfPersistenceUncertain(state, ctx)) return undefined;
+			stopOnRecoveryError(state, ctx);
 			return dueUsageNotice(state, pi, ctx, settingsReader);
 		} catch (error) {
 			notify(ctx, `Ledger Context usage notices disabled: ${error instanceof Error ? error.message : String(error)}`, "error");
@@ -3220,10 +3164,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		const pending = state.pendingCompaction;
 		if (!pending || pending.proposed || pending.mode !== mode) return undefined;
 		if (event.type === "turn_end" && !event.toolResults.some((result) => result.toolCallId === pending.toolCallId)) return undefined;
-		if (blockIfPersistenceUncertain(state, ctx)) {
-			state.pendingCompaction = undefined;
-			return undefined;
-		}
+		stopOnRecoveryError(state, ctx);
 		const skip = (reason: string): SessionBoundaryDraft[] => {
 			pending.proposed = "note";
 			return [...event.entries, compactionNote(pending.toolCallId, reason)];
@@ -3292,8 +3233,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 	});
 
 	pi.on("input", async (_event, ctx) => {
-		const state = getState(ctx);
-		if (blockIfPersistenceUncertain(state, ctx)) return { action: "handled" };
+		stopOnRecoveryError(getState(ctx), ctx);
 		return undefined;
 	});
 
@@ -3303,7 +3243,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		const state = getState(ctx);
 		const pending = state.pendingCompaction;
 		state.pendingCompaction = undefined;
-		if (!pending || state.recoveryError || state.persistenceUncertain) return;
+		if (!pending || state.recoveryError) return;
 		const proposed = pending.proposed;
 		const committed = proposed && ctx.sessionManager.getBranch().some((entry) => proposed === "note"
 			? entry.type === "custom_message" && entry.customType === COMPACTION_NOTE_TYPE && (entry.details as { toolCallId?: unknown } | undefined)?.toolCallId === pending.toolCallId
@@ -3316,13 +3256,13 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 	pi.on("session_tree", async (_event, ctx) => {
 		const state = getState(ctx);
 		state.pendingCompaction = undefined;
-		if (blockIfPersistenceUncertain(state, ctx)) return;
+		stopOnRecoveryError(state, ctx);
 		hydrateState(state, ctx.sessionManager.getBranch(), ctx);
 	});
 
 	pi.on("model_select", async (_event, ctx) => {
 		const state = getState(ctx);
-		if (blockIfPersistenceUncertain(state, ctx)) return;
+		stopOnRecoveryError(state, ctx);
 		hydrateState(state, ctx.sessionManager.getBranch(), ctx);
 	});
 
@@ -3344,11 +3284,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		exposure: "model-only",
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
 			const state = getState(ctx);
-			if (blockIfPersistenceUncertain(state, ctx)) {
-				throw new Error(
-					`session persistence is uncertain: ${state.persistenceUncertain}. Reopen the persisted session before retrying.`,
-				);
-			}
+			stopOnRecoveryError(state, ctx);
 			const entries = ctx.sessionManager.getBranch();
 			const input = preparedParameters(params, validationError);
 			const validated = validateCheckpoint(input, state, entries);
@@ -3499,7 +3435,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 	pi.on("session_before_compact", async (event, ctx) => {
 		const state = getState(ctx);
 		try {
-			if (blockIfPersistenceUncertain(state, ctx)) return { cancel: true };
+			stopOnRecoveryError(state, ctx);
 			if (event.signal.aborted) return { cancel: true };
 			const branch = event.branchEntries;
 			const limits = limitsModel(ctx);
@@ -3576,26 +3512,9 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		const details = latestCompaction.details;
 		if (!isLedgerCompactionDetails(details)) return;
 		const state = getState(ctx);
-		if (blockIfPersistenceUncertain(state, ctx)) return;
+		stopOnRecoveryError(state, ctx);
 		hydrateState(state, branch, ctx, false);
 		state.currentAgentRequest = undefined;
-	});
-
-	pi.on("session_compact_failed", async (event, ctx) => {
-		const state = getState(ctx);
-		if (event.fromExtension && event.errorMessage && !event.aborted) {
-			state.persistenceUncertain = event.errorMessage;
-			try {
-				ctx.abort();
-			} catch {
-				// The host may already have stopped the failed compaction.
-			}
-			notify(
-				ctx,
-				`Ledger Context stopped after a session log error: ${event.errorMessage}. Reopen the persisted session before continuing.`,
-				"error",
-			);
-		}
 	});
 }
 

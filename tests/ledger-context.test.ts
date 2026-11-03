@@ -27,7 +27,6 @@ import {
 	createAgentSession,
 } from "@earendil-works/pi-coding-agent";
 import {
-	Type,
 	fauxAssistantMessage,
 	fauxProvider,
 	fauxThinking,
@@ -41,6 +40,7 @@ import {
 	type TranscriptContext,
 	type Usage,
 } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { stream as streamResponses, streamSimple as streamSimpleResponses } from "@earendil-works/pi-ai/api/openai-responses";
 import { stream as streamCompletions } from "@earendil-works/pi-ai/api/openai-completions";
 import { stream as streamAnthropic } from "@earendil-works/pi-ai/api/anthropic-messages";
@@ -1526,6 +1526,11 @@ test("native threshold compacts before the next request in the same run", { time
 			order.push(event.reason);
 		});
 	};
+	// The seeded window ends just below the threshold, inside the default urgent range; a save request there would take the tool call's response.
+	const names = ["LEDGER_CONTEXT_REMINDER_TOKENS", "LEDGER_CONTEXT_URGENT_TOKENS"];
+	const previous = names.map((name) => process.env[name]);
+	process.env.LEDGER_CONTEXT_REMINDER_TOKENS = "2";
+	process.env.LEDGER_CONTEXT_URGENT_TOKENS = "1";
 	// The window holds the recovery summary and Pi's kept tail after the compaction.
 	const { root, faux, ledgerFaux, session, sessionManager } = await createFixture(true, [observeCompactionExtension], 1_750, {
 		contextWindow: 7_000,
@@ -1588,6 +1593,10 @@ test("native threshold compacts before the next request in the same run", { time
 		assert.equal(checkpointEntries(sessionManager.getBranch()).length, 0);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
+		names.forEach((name, index) => {
+			if (previous[index] === undefined) delete process.env[name];
+			else process.env[name] = previous[index];
+		});
 	}
 });
 
@@ -1920,7 +1929,7 @@ test("save requests under pressure wait for half an interval of new work after a
 		// The 7200-token boundary gives a 1200-token interval; under pressure, a request needs 600 tokens of new work.
 		await session.prompt(`work, save, and continue ${"w".repeat(3_000)}`);
 		assert.deepEqual(seen, [1, 1, 1, 1], "a little ordinary work after the checkpoint brings no save request under urgent pressure");
-		assert.deepEqual(notices().map((entry) => (entry.details as { pressure: string }).pressure), ["urgent"]);
+		assert.deepEqual(notices().map((entry) => (entry.details as { pressure: string }).pressure), ["filling"]);
 		const remaining = messageEntries(sessionManager.getBranch()).find(({ message }) => message.role === "toolResult" && message.toolName === "get_context_remaining");
 		assert.equal((remaining?.message as { details?: { newWorkTokens?: number } }).details?.newWorkTokens, 0);
 
@@ -2844,7 +2853,7 @@ test("rejects invalid checkpoint input while retaining the previous version", { 
 			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "checkpoint")
 			.at(-1);
 		assert.ok(invalidReceipt);
-		assert.match(JSON.stringify((invalidReceipt.message as { content: unknown }).content), /must not have additional properties/);
+		assert.match(JSON.stringify((invalidReceipt.message as { content: unknown }).content), /activeRequestEntryIds: unknown field/);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 		if (previousLimit === undefined) delete process.env.LEDGER_CONTEXT_LEDGER_TOKENS;
@@ -2971,31 +2980,34 @@ test("normal compaction cancellation leaves the branch and provider state unchan
 	}
 });
 
-test("stops after a transcript write failure and reopens the last durable checkpoint", { timeout: TEST_TIMEOUT_MS }, async () => {
-	let faultNextCheckpoint = false;
-	let transcriptPath: string | undefined;
-	let backupPath: string | undefined;
-	const faultingTranscript = (pi: ExtensionAPI): void => {
-		pi.on("tool_call", async (event, ctx) => {
-			if (!faultNextCheckpoint || event.toolName !== "checkpoint") return;
-			faultNextCheckpoint = false;
-			transcriptPath = ctx.sessionManager.getSessionFile();
-			if (!transcriptPath) throw new Error("test fixture did not create a persisted transcript");
-			backupPath = `${transcriptPath}.before-write-failure`;
-			renameSync(transcriptPath, backupPath);
-			mkdirSync(transcriptPath);
-		});
-	};
-	const fixture = await createFixture(true, [faultingTranscript]);
+test("a failed checkpoint write stops the run with an error receipt, and the next save edits the durable checkpoint", { timeout: TEST_TIMEOUT_MS }, async () => {
+	const fixture = await createFixture(true);
 	const { root, faux, session, sessionManager } = fixture;
+	const manager = sessionManager as unknown as { appendCustomEntry: (customType: string, data: unknown) => string };
+	const appendCustomEntry = manager.appendCustomEntry.bind(sessionManager);
+	let faultNextCheckpoint = false;
+	// Only the checkpoint entry meets the broken log; the log is back before Pi writes the receipt.
+	manager.appendCustomEntry = (customType, data) => {
+		if (!faultNextCheckpoint || customType !== CHECKPOINT_ENTRY_TYPE) return appendCustomEntry(customType, data);
+		faultNextCheckpoint = false;
+		const log = sessionManager.getSessionFile()!;
+		renameSync(log, `${log}.saved`);
+		mkdirSync(log);
+		try {
+			return appendCustomEntry(customType, data);
+		} finally {
+			rmSync(log, { recursive: true, force: true });
+			renameSync(`${log}.saved`, log);
+		}
+	};
 	try {
 		faux.setResponses([
 			fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Goal: last durable checkpoint." })),
 			fauxAssistantMessage("durable checkpoint saved"),
 		]);
 		await session.prompt("Create the durable checkpoint before the fault");
-		transcriptPath = sessionManager.getSessionFile();
-		assert.ok(transcriptPath && existsSync(transcriptPath));
+		const log = sessionManager.getSessionFile()!;
+		assert.ok(existsSync(log));
 		const providerCallsBeforeFault = faux.state.callCount;
 
 		faultNextCheckpoint = true;
@@ -3003,87 +3015,37 @@ test("stops after a transcript write failure and reopens the last durable checkp
 			fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Goal: this save must fail." })),
 			fauxAssistantMessage("unreachable after write failure"),
 		]);
-		try {
-			await session.prompt("Trigger the transcript write failure");
-		} catch {
-			// A host persistence exception may reject the current prompt after the tool fails.
-		}
+		await session.prompt("Trigger the checkpoint write failure");
+		assert.equal(faultNextCheckpoint, false);
 		assert.equal(session.isStreaming, false);
 		assert.equal(faux.state.callCount, providerCallsBeforeFault + 1, "the aborted run must not consume the unreachable response");
-		assert.ok(backupPath && existsSync(backupPath));
-		const durableBeforeRestore = readFileSync(backupPath!, "utf8");
-		assert.match(durableBeforeRestore, /last durable checkpoint/);
-		assert.doesNotMatch(
-			durableBeforeRestore,
-			/"customType":"ledger-context\/checkpoint","data":\{"schemaVersion":1,"ledger":"Goal: this save must fail\."/,
-		);
-		const failedMemoryCheckpoint = checkpointEntries(sessionManager.getBranch()).at(-1);
-		if (failedMemoryCheckpoint && JSON.stringify(failedMemoryCheckpoint.data).includes("this save must fail")) {
-			assert.match(JSON.stringify(failedMemoryCheckpoint.data), /this save must fail/);
-		}
-		const failedMemoryReceipt = messageEntries(sessionManager.getBranch())
-			.filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "checkpoint")
-			.at(-1);
-		const failedSuccessReceipt = messageEntries(sessionManager.getBranch()).find((entry) => {
-			if (entry.message.role !== "toolResult" || entry.message.toolName !== "checkpoint") return false;
-			const result = entry.message as { content: unknown; details?: unknown };
-			return JSON.stringify(result.content).includes("Checkpoint saved.") && JSON.stringify(result.details).includes("this save must fail");
-		});
-		assert.equal(failedSuccessReceipt, undefined);
-		if (failedMemoryReceipt) {
-			const result = failedMemoryReceipt.message as { content: unknown; isError?: boolean };
-			assert.equal(result.isError, true);
-			assert.doesNotMatch(JSON.stringify(result.content), /Checkpoint saved/);
-		}
+		const durable = SessionManager.open(log).getBranch();
+		// Pi drops the checkpoint it could not write, so the session in memory matches the log.
+		assert.deepEqual(sessionManager.getBranch().map((entry) => entry.id), durable.map((entry) => entry.id));
+		assert.deepEqual(checkpointEntries(durable).map((entry) => (entry.data as { ledger: string }).ledger), ["Goal: last durable checkpoint."]);
+		const receipt = messageEntries(durable).filter((entry) => entry.message.role === "toolResult" && entry.message.toolName === "checkpoint").at(-1)!.message as { content: unknown; isError?: boolean };
+		assert.equal(receipt.isError, true);
+		assert.match(JSON.stringify(receipt.content), /checkpoint not saved after a session log error: EISDIR[^"]*\. The previous checkpoint stays in effect\./);
 
-		rmSync(transcriptPath!, { recursive: true, force: true });
-		renameSync(backupPath!, transcriptPath!);
-		backupPath = undefined;
-		const reopened = SessionManager.open(transcriptPath!);
-		const durableCheckpoints = checkpointEntries(reopened.getBranch());
-		assert.equal(durableCheckpoints.length, 1);
-		assert.match(JSON.stringify(durableCheckpoints[0].data), /last durable checkpoint/);
-
-		await session.reload();
-		const providerCallsBeforeRetry = faux.state.callCount;
-		const branchBeforeRetry = sessionManager.getBranch().map((entry) => entry.id);
+		// An edit applies only to the checkpoint Ledger Context holds, so it succeeds only on the durable one.
 		faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Goal: retry must remain blocked." })),
-			fauxAssistantMessage("blocked save handled"),
+			fauxAssistantMessage(fauxToolCall("checkpoint", { edits: [{ oldText: "last durable checkpoint", newText: "saved after the write failure" }] })),
+			fauxAssistantMessage("saved after the write failure"),
 		]);
-		await session.prompt("Try to save after the write failure");
-		assert.equal(session.isStreaming, false);
-		assert.equal(faux.state.callCount, providerCallsBeforeRetry);
-		assert.deepEqual(sessionManager.getBranch().map((entry) => entry.id), branchBeforeRetry);
-
-		const providerCallsBeforeCompact = faux.state.callCount;
-		await assert.rejects(session.compact(), /Compaction cancelled/);
-		assert.equal(faux.state.callCount, providerCallsBeforeCompact);
-
-		const recovered = await reopenFixture(fixture);
-		try {
-			faux.setResponses([
-				fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "reopened durable recovery" })),
-				fauxAssistantMessage("reopened checkpoint saved"),
-			]);
-			await recovered.session.prompt("save after reopening the durable session");
-			assert.match(JSON.stringify(recovered.sessionManager.getBranch()), /reopened durable recovery/);
-		} finally {
-			recovered.session.dispose();
-		}
+		await session.prompt("Save again after the write failure");
+		const saved = checkpointEntries(SessionManager.open(log).getBranch());
+		assert.equal(saved.length, 2);
+		assert.equal((saved[1].data as { ledger: string }).ledger, "Goal: saved after the write failure.");
 	} finally {
-		if (backupPath && existsSync(backupPath) && transcriptPath) {
-			rmSync(transcriptPath, { recursive: true, force: true });
-			renameSync(backupPath, transcriptPath);
-		}
+		session.dispose();
 		rmSync(root, { recursive: true, force: true });
 	}
 });
 
-test("stops before prompt or manual compact after a model transcript append failure", { timeout: TEST_TIMEOUT_MS }, async () => {
+test("after a model change write failure, the next prompt or manual compact continues the persisted session", { timeout: TEST_TIMEOUT_MS }, async () => {
 	for (const entryPoint of ["compact-first", "prompt-first"] as const) {
 		const fixture = await createFixture(true, [], 64);
-		const { root, faux, session, sessionManager } = fixture;
+		const { root, faux, ledgerFaux, session, sessionManager } = fixture;
 		let sessionFile: string | undefined;
 		let backupPath: string | undefined;
 		try {
@@ -3108,18 +3070,21 @@ test("stops before prompt or manual compact after a model transcript append fail
 			rmSync(sessionFile, { recursive: true, force: true });
 			renameSync(backupPath, sessionFile);
 			backupPath = undefined;
+			// Pi drops the model change it could not write.
+			assert.deepEqual(sessionManager.getBranch().map((entry) => entry.id), durableBeforeFailure);
 
-			const providerCallsBeforeGuard = faux.state.callCount;
 			if (entryPoint === "compact-first") {
-				await assert.rejects(session.compact(), /Compaction cancelled/);
+				ledgerFaux.setResponses([fauxAssistantMessage("Goal: continue after the model write failure. Skills: none.")]);
+				await session.compact();
 			} else {
-				faux.setResponses([fauxAssistantMessage("must remain unused after model write failure")]);
+				faux.setResponses([fauxAssistantMessage("continued after the model write failure")]);
 				await session.prompt("retry after the model transcript write failure");
 			}
-			assert.equal(faux.state.callCount, providerCallsBeforeGuard);
-			const reopened = SessionManager.open(sessionFile);
-			assert.deepEqual(reopened.getBranch().map((entry) => entry.id), durableBeforeFailure);
-			assert.equal(reopened.getLeafId(), durableBeforeFailure.at(-1));
+			const reopened = SessionManager.open(sessionFile).getBranch();
+			assert.deepEqual(reopened.map((entry) => entry.id), sessionManager.getBranch().map((entry) => entry.id));
+			assert.deepEqual(reopened.slice(0, durableBeforeFailure.length).map((entry) => entry.id), durableBeforeFailure);
+			if (entryPoint === "compact-first") assert.equal(reopened.filter((entry) => entry.type === "compaction").length, 1);
+			else assert.match(JSON.stringify(reopened.at(-1)), /continued after the model write failure/);
 		} finally {
 			if (backupPath && sessionFile && existsSync(backupPath)) {
 				rmSync(sessionFile, { recursive: true, force: true });
@@ -4833,10 +4798,16 @@ test("missing checkpoint generation cancellation and persistence failures cancel
 				assert.equal(checkpointEntries(sessionManager.getBranch()).length, 0);
 				assert.equal(readFileSync(sessionManager.getSessionFile()!, "utf8"), beforeGeneration);
 			} else {
-				await assert.rejects(session.compact(), /Already compacted|Compaction cancelled/);
-				assert.equal(ledgerFaux.state.callCount, 1);
-				assert.equal(checkpointEntries(SessionManager.open(`${sessionManager.getSessionFile()!}.saved`).getBranch()).length, 0);
-				assert.equal(SessionManager.open(`${sessionManager.getSessionFile()!}.saved`).getBranch().filter((entry) => entry.type === "compaction").length, 0);
+				// Pi drops the compaction it could not write; once the log is back, the next compaction succeeds without reopening.
+				const log = sessionManager.getSessionFile()!;
+				assert.equal(sessionManager.getBranch().filter((entry) => entry.type === "compaction").length, 0);
+				rmSync(log, { recursive: true, force: true });
+				renameSync(`${log}.saved`, log);
+				assert.equal(readFileSync(log, "utf8"), beforeGeneration);
+				ledgerFaux.setResponses([fauxAssistantMessage("Goal: restore state. Next: verify original evidence. Skills: none.")]);
+				await session.compact();
+				assert.equal(ledgerFaux.state.callCount, 2);
+				assert.equal(SessionManager.open(log).getBranch().filter((entry) => entry.type === "compaction").length, 1);
 			}
 		} finally {
 			session.dispose();
@@ -6696,7 +6667,7 @@ test("checkpoint compact counts only the conversation before the call toward the
 	assert.equal(fixture.sessionManager.getBranch().some((entry) => entry.type === "compaction"), false);
 });
 
-test("a failed append of a checkpoint compaction blocks later requests and keeps the durable checkpoint", async (t) => {
+test("a failed append of a checkpoint compaction keeps the durable checkpoint, and the next request continues without reopening", async (t) => {
 	let log = "";
 	// Replacing the session file with a directory makes Pi's append of the compaction entry fail.
 	const breakLog = (pi: ExtensionAPI) => pi.on("turn_end", (event) => {
@@ -6711,14 +6682,22 @@ test("a failed append of a checkpoint compaction blocks later requests and keeps
 	manager.appendMessage({ role: "user", content: "old evidence ".repeat(400), timestamp: Date.now() });
 	manager.appendMessage(fauxAssistantMessage("old answer"));
 	faux.setResponses([fauxAssistantMessage(fauxToolCall("checkpoint", { ledger: "Durable handoff.", compact: "continue" })), fauxAssistantMessage("unreachable")]);
+	const errorsBefore = extensionErrors.length;
 	await session.prompt("Hand off.").catch(() => undefined);
+	// The run-end note about the dropped compaction cannot be written while the log is a directory either.
+	assert.deepEqual(extensionErrors.splice(errorsBefore).map((error) => [error.event, /EISDIR/.test(error.error)]), [["send_message", true]]);
 	assert.ok(log);
 	rmSync(log, { recursive: true, force: true });
 	renameSync(`${log}.saved`, log);
+	// Pi drops the compaction it could not write, so the session in memory matches the log.
+	assert.equal(manager.getBranch().some((entry) => entry.type === "compaction"), false);
+	assert.deepEqual(manager.getBranch().map((entry) => entry.id), SessionManager.open(log).getBranch().map((entry) => entry.id));
 	const calls = faux.state.callCount;
-	await session.prompt("Resume without reopening.").catch(() => undefined);
-	assert.equal(faux.state.callCount, calls);
+	faux.setResponses([fauxAssistantMessage("resumed")]);
+	await session.prompt("Resume without reopening.");
+	assert.equal(faux.state.callCount, calls + 1);
 	const durable = SessionManager.open(log).getBranch();
+	assert.match(JSON.stringify(durable.at(-1)), /resumed/);
 	assert.equal(durable.some((entry) => entry.type === "compaction"), false);
 	assert.equal((checkpointEntries(durable).at(-1)!.data as any).ledger, "Durable handoff.");
 });
