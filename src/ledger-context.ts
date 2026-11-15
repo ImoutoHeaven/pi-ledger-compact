@@ -26,7 +26,9 @@ export const DEFAULT_HISTORY_READ_TOKEN_LIMIT = 2_048;
 export const DEFAULT_OUTPUT_RESERVE_TOKEN_LIMIT = 16_384;
 export const REMINDER_MESSAGE_TYPE = "ledger-context/reminder";
 export const USAGE_MESSAGE_TYPE = "ledger-context/usage";
+export const RECOVERY_NUDGE_MESSAGE_TYPE = "ledger-context/recovery-nudge";
 export const DEFAULT_USAGE_NOTICE_PERCENT = 5;
+export const DEFAULT_RECOVERY_NUDGE = 0;
 export const COMPACTION_NOTE_TYPE = "ledger-context/compaction-note";
 export const DEFAULT_SOFT_REMINDER_TOKEN_LIMIT = 32_768;
 export const DEFAULT_URGENT_REMINDER_TOKEN_LIMIT = 16_384;
@@ -39,8 +41,8 @@ export const MAX_HISTORY_PAGE_SIZE = 100;
 export const MAX_HISTORY_READ_LENGTH = 65_536;
 export const MAX_HISTORY_SEARCH_SNIPPET_LENGTH = 256;
 export const MAX_HISTORY_QUERY_DISPLAY_LENGTH = 128;
-const LEDGER_CONTENTS = "goal and status; constraints and decisions still in force; what was done and what was verified, with evidence; the next step or what you are waiting for; where to find evidence (paths, pi://entry IDs); useful skills (or none)";
-const CHECKPOINT_LEDGER_GUIDELINES = `Write the ledger as your complete current working state: ${LEDGER_CONTENTS}. Save it whole with ledger, carrying over everything still needed from the previous checkpoint, the compaction changes and recent work; or change parts of the saved state with edits, which keep all other text and the saved sourceQuotes. Keep plans apart from finished work, and redact secrets.`;
+const LEDGER_CONTENTS = "goal and status; constraints and decisions still in force; done and verified, with evidence; next step or waiting state; where to find evidence (paths, pi://entry IDs); useful skills (or none)";
+const CHECKPOINT_LEDGER_GUIDELINES = `Write the ledger as your complete current working state: ${LEDGER_CONTENTS}. Save it whole with ledger, carrying over everything still needed from prior checkpoint, compaction changes and recent work; or edits, which keep all other text. Omitted or null sourceQuotes keeps up to 8 saved references on ledger and edits; non-empty replaces (or keeps state when alone); [] with ledger or edits clears them. Keep plans apart from finished work, and redact secrets.`;
 /** Separates the checkpoint text from folded compaction changes in the text that checkpoint edits change. */
 const FOLDED_CHANGES_HEADING = "## Folded compaction changes";
 
@@ -115,14 +117,14 @@ function preparedParameters<T>(params: T, error: (message: string) => Error): Wi
 }
 
 const checkpointParameters = Type.Object({
-	ledger: optional(Type.String({ description: "Your complete current working state, replacing the saved one. At most 65536 UTF-8 bytes and the configured token budget. Use either ledger or edits." })),
+	ledger: optional(Type.String({ description: "Complete current working state, replacing the saved one (<=65536 UTF-8 bytes and the token budget). Use either ledger or edits." })),
 	edits: optional(Type.Array(Type.Object({ oldText: Type.String({ minLength: 1 }), newText: Type.String() }, { additionalProperties: false }), {
-		description: `Exact replacements in the saved state: the latest checkpoint ledger, followed by "${FOLDED_CHANGES_HEADING}" and the compaction changes when a compaction happened after it. Each oldText must occur exactly once in that text; all edits match the same original text and must not overlap. Each compaction folded in this way adds one section; merge several folded sections with a complete ledger. Use either ledger or edits.`,
+		description: `Exact non-overlapping replacements in the saved state (latest checkpoint plus any "${FOLDED_CHANGES_HEADING}" sections); each oldText must occur once. Merge multiple folded sections with a complete ledger. Use either ledger or edits.`,
 	})),
 	sourceQuotes: optional(
 		Type.Array(Type.String({ minLength: 1, maxLength: MAX_SOURCE_QUOTE_LENGTH }), {
 			maxItems: MAX_SOURCE_REFERENCES,
-			description: "Exact phrases copied from earlier messages that locate key evidence, most important first. Case-sensitive; any whitespace run matches any other. Replaces the saved list; when omitted, ledger saves an empty list and edits keep the saved list. Given alone, it keeps the saved state and replaces only the list. Unmatched phrases are reported and the save still succeeds.",
+			description: "Exact phrases copied from earlier messages locating key evidence, most important first (case-sensitive; any whitespace run matches any other). Omitted or null keeps up to 8 saved references on ledger and edits; non-empty replaces (alone keeps saved state); [] with ledger or edits clears them. Unmatched phrases are reported and the save succeeds.",
 		}),
 	),
 	compact: optional(StringEnum(["continue", "stop"] as const, {
@@ -142,16 +144,16 @@ const historyFilterSchema = Type.Object({
 	windowIds: optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 32, description: "Window IDs from history_list_windows." })),
 	afterEntryId: optional(Type.String({ minLength: 1, description: "Only entries after this entry." })),
 	beforeEntryId: optional(Type.String({ minLength: 1, description: "Only entries before this entry." })),
-	hasImage: optional(Type.Boolean({ description: "Only entries with (true) or without (false) images." })),
-	includeMaintenance: optional(Type.Boolean({ description: "Include checkpoint, history and context-budget tool traffic (default false)." })),
-}, { additionalProperties: false, description: "Fields combine with AND, values within a field with OR; excludeKinds overrides kinds." });
-const historyProjectionSchema = StringEnum(["references", "text", "images", "all"] as const, { description: "Output shape: all (text and image references, default), text, images (image references), references (entry metadata only)." });
+	hasImage: optional(Type.Boolean({ description: "Filter by presence of images." })),
+	includeMaintenance: optional(Type.Boolean({ description: "Include maintenance traffic (default false)." })),
+}, { additionalProperties: false, description: "AND across fields, OR within; excludeKinds overrides kinds." });
+const historyProjectionSchema = StringEnum(["references", "text", "images", "all"] as const, { description: "Output: all (text + image refs, default), text, images, references (metadata only)." });
 
 const historyPageFields = {
-	truncate: optional(Type.Boolean({ description: "false returns full text beyond the default output budget; explicit limit, maxChars and length still apply." })),
-	cursor: optional(Type.String({ minLength: 1, description: "nextCursor from the previous page; repeat the other arguments." })),
-	limit: optional(Type.Integer({ minimum: 1, maximum: MAX_HISTORY_PAGE_SIZE, description: "Maximum results per page (default 20)." })),
-	order: optional(StringEnum(["newest", "oldest"] as const, { description: "Default newest; exchange and neighbors default to oldest." })),
+	truncate: optional(Type.Boolean({ description: "false bypasses default output budget; limit, maxChars, length still apply." })),
+	cursor: optional(Type.String({ minLength: 1, description: "nextCursor from previous page; keep same args." })),
+	limit: optional(Type.Integer({ minimum: 1, maximum: MAX_HISTORY_PAGE_SIZE, description: "Max results per page (default 20)." })),
+	order: optional(StringEnum(["newest", "oldest"] as const, { description: "Default newest (oldest for exchange/neighbors)." })),
 };
 
 const historyItemFields = {
@@ -166,7 +168,7 @@ const historyListWindowsParameters = Type.Object({ ...historyPageFields, filter:
 const historySearchParameters = Type.Object({
 	...historyItemFields,
 	query: optional(Type.String({ minLength: 1, description: "Literal text to find. Use either query or queries." })),
-	queries: optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: MAX_HISTORY_SEARCH_QUERIES, description: "Several literal texts matched with OR (8192 UTF-8 bytes in total); each hit lists the zero-based indexes of the queries it matched." })),
+	queries: optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: MAX_HISTORY_SEARCH_QUERIES, description: "OR literal texts (<=8192 UTF-8 bytes total); hits list matched 0-based indexes." })),
 	caseSensitive: optional(Type.Boolean({ description: "Match letter case exactly (default false)." })),
 }, { additionalProperties: false });
 const historyReadItemParameters = Type.Object({
@@ -181,13 +183,13 @@ const historyReadParameters = Type.Object({
 	items: optional(Type.Array(historyReadItemParameters, { minItems: 1, maxItems: MAX_HISTORY_PAGE_SIZE, description: "view=many: entry or image reads, returned in order." })),
 	snapshotThrough: optional(Type.String({ minLength: 1, description: "view=many continuation: copy from nextRead." })),
 	entryId: optional(Type.String({ minLength: 1, description: "Entry to read; view=many uses items instead." })),
-	view: optional(StringEnum(["entry", "image", "exchange", "neighbors", "many"] as const, { description: "entry (default): paged text. image: one image block. exchange: a tool call with its results. neighbors: surrounding log entries. many: several reads via items." })),
-	contentIndex: optional(Type.Integer({ minimum: 0, description: "Content block index: required for image; selects one block for entry and one call for exchange." })),
+	view: optional(StringEnum(["entry", "image", "exchange", "neighbors", "many"] as const, { description: "entry (default), image, exchange (call + results), neighbors (surrounding entries), or many (items)." })),
+	contentIndex: optional(Type.Integer({ minimum: 0, description: "0-based block/call index (required for image; optional for entry/exchange)." })),
 	projection: optional(historyProjectionSchema),
-	offset: optional(Type.Integer({ minimum: 0, description: "view=entry: start position in UTF-16 units (default 0)." })),
-	length: optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER, description: "view=entry: UTF-16 units to return (default 65536; truncate=false returns the rest)." })),
-	before: optional(Type.Integer({ minimum: 0, maximum: 20, description: "view=neighbors: entries before the anchor (default 2)." })),
-	after: optional(Type.Integer({ minimum: 0, maximum: 20, description: "view=neighbors: entries after the anchor (default 2)." })),
+	offset: optional(Type.Integer({ minimum: 0, description: "entry start in UTF-16 units (default 0)." })),
+	length: optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER, description: "entry UTF-16 length (default 65536; truncate=false reads to end)." })),
+	before: optional(Type.Integer({ minimum: 0, maximum: 20, description: "neighbors before anchor (default 2)." })),
+	after: optional(Type.Integer({ minimum: 0, maximum: 20, description: "neighbors after anchor (default 2)." })),
 	...historyPageFields,
 }, { additionalProperties: false });
 
@@ -209,6 +211,14 @@ type MessageLike = {
 	stopReason?: string;
 	errorMessage?: string;
 	details?: unknown;
+	command?: string;
+	output?: string;
+	exitCode?: number;
+	cancelled?: boolean;
+	truncated?: boolean;
+	fullOutputPath?: string;
+	excludeFromContext?: boolean;
+	timestamp?: number;
 };
 
 type HistoryExecutionStatus = "received" | "requested" | "completed" | "failed" | "saved" | "committed" | "metadata";
@@ -739,9 +749,18 @@ function reminderUsage(pi: ExtensionAPI, ctx: ExtensionContext, settingsReader?:
 	};
 }
 
-/** Ledger notices: checkpoint reminders and usage notices, which stay out of ledgers, deltas, source quotes and new work. */
+/** Ledger notices: checkpoint reminders, usage notices, and recovery nudges, which stay out of ledgers, deltas, source quotes and new work. */
 function isLedgerNotice(customType: string): boolean {
-	return customType === REMINDER_MESSAGE_TYPE || customType === USAGE_MESSAGE_TYPE;
+	return customType === REMINDER_MESSAGE_TYPE || customType === USAGE_MESSAGE_TYPE || customType === RECOVERY_NUDGE_MESSAGE_TYPE;
+}
+
+function recoveryNudgeEnabled(): boolean {
+	const name = "LEDGER_CONTEXT_RECOVERY_NUDGE";
+	const raw = process.env[name];
+	if (raw === undefined) return Boolean(DEFAULT_RECOVERY_NUDGE);
+	if (raw === "0") return false;
+	if (raw === "1") return true;
+	throw new Error(`${name} must be 0 or 1`);
 }
 
 /** The step of usage notices in percent of the model window; 0 turns them off. */
@@ -926,14 +945,21 @@ function textOnlyContent(content: unknown): string {
 		.join("\n");
 }
 
+function isHistoryToolName(name: string | undefined): boolean {
+	return name === "history_read" || name === "history_search" ||
+		name === "history_list_items" || name === "history_list_windows";
+}
+
 function isMaintenanceToolName(name: string | undefined): boolean {
-	return name === "checkpoint" || name === "history_read" || name === "history_search" ||
-		name === "history_list_items" || name === "history_list_windows" || name === "get_context_remaining";
+	return name === "checkpoint" || name === "get_context_remaining" || isHistoryToolName(name);
 }
 
 interface HistoryPart {
 	kind: HistoryKind;
 	contentIndex?: number;
+	/** UTF-16 prefix length that history_read prepends to whole-entry reads; omitted when no linear target offset exists. */
+	readOffset?: number;
+	exactOffset?: boolean;
 	toolName?: string;
 	toolCallId?: string;
 	text: (projection: HistoryProjection) => string;
@@ -957,7 +983,7 @@ function historyParts(entry: SessionEntry, filter: HistoryFilter): HistoryPart[]
 		const base = { kind: kind as HistoryKind, toolName: message.toolName, toolCallId: message.toolCallId };
 		return Array.isArray(message.content) && message.content.length > 0
 			? message.content.map((block: any, index: number) => ({ ...base, contentIndex: index, text: (projection) => historyBlockText(block, entry.id, index, projection) }))
-			: [{ ...base, text: () => contentText(message.content, entry.id) }];
+			: [{ ...base, readOffset: messageHeader(entry as Extract<SessionEntry, { type: "message" }>).length, text: () => contentText(message.content, entry.id) }];
 	}
 	if (message?.role === "assistant") {
 		if (!Array.isArray(message.content) || message.content.length === 0) return accepts("metadata") ? [{ kind: "metadata", text: () => renderEntry(entry) }] : [];
@@ -970,18 +996,15 @@ function historyParts(entry: SessionEntry, filter: HistoryFilter): HistoryPart[]
 		});
 	}
 	if (entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY_TYPE) {
-		return accepts("checkpoint") ? [{ kind: "checkpoint", text: () => parseAgentCheckpoint(entry.data)?.ledger ?? "" }] : [];
+		return accepts("checkpoint") ? [{ kind: "checkpoint", exactOffset: false, text: () => parseAgentCheckpoint(entry.data)?.ledger ?? "" }] : [];
 	}
 	if (entry.type === "compaction" && isLedgerCompactionDetails(entry.details) && entry.details.delta.status === "generated") {
 		const delta = entry.details.delta.record;
-		return accepts("compaction_delta") ? [{ kind: "compaction_delta", text: () => delta.ledger }] : [];
+		return accepts("compaction_delta") ? [{ kind: "compaction_delta", exactOffset: false, text: () => delta.ledger }] : [];
 	}
 	if (!accepts("metadata")) return [];
 	return [{ kind: "metadata", text: (projection) => {
-		if (projection === "text" && entry.type === "context_edit") return projectedHistoryEntry(entry, projection);
-		if (projection === "text" && entry.type === "custom_message" && Array.isArray(entry.content)) {
-			return contentText(entry.content.filter((block: any) => block?.type !== "image"), entry.id);
-		}
+		if (projection === "text" && (entry.type === "context_edit" || entry.type === "custom_message")) return projectedHistoryEntry(entry, projection);
 		return renderEntry(entry);
 	} }];
 }
@@ -1052,18 +1075,41 @@ function requestRecoveryBasis(messages: ContextMessage[], entries: SessionEntry[
 	return { checkpointEntryId: compaction.details.checkpointEntryId, deltaCompactionEntryId: deltaForCompaction(compaction, entries)?.entryId ?? null };
 }
 
+function messageHeader(entry: Extract<SessionEntry, { type: "message" }>): string {
+	const message = entry.message as MessageLike;
+	const role = message.role ?? "unknown";
+	if (role === "toolResult") {
+		const error = message.isError ? " error" : "";
+		return `[entry ${entry.id}] ${role}${error} tool=${message.toolName ?? "unknown"} call=${message.toolCallId ?? "unknown"}\n`;
+	}
+	return `[entry ${entry.id}] ${role}\n`;
+}
+
+function bashExecutionText(message: MessageLike): string {
+	const converted = convertToLlm([{
+		role: "bashExecution",
+		command: typeof message.command === "string" ? message.command : "",
+		output: typeof message.output === "string" ? message.output : "",
+		exitCode: typeof message.exitCode === "number" ? message.exitCode : undefined,
+		cancelled: Boolean(message.cancelled),
+		truncated: Boolean(message.truncated),
+		...(typeof message.fullOutputPath === "string" ? { fullOutputPath: message.fullOutputPath } : {}),
+		timestamp: typeof message.timestamp === "number" ? message.timestamp : 0,
+		excludeFromContext: false,
+	} as ContextMessage]);
+	return textOnlyContent(converted[0]?.content);
+}
+
 function renderEntry(entry: SessionEntry, contentEntryId = entry.id): string {
 	const replacementNote = contentEntryId === entry.id ? "" : `[content replacement: ${historyEntryReference(contentEntryId)}]\n`;
 	if (entry.type === "message") {
 		const message = entry.message as MessageLike;
 		const role = message.role ?? "unknown";
-		const body = replacementNote + (contentText(message.content, contentEntryId) || (role === "assistant"
-			? [message.stopReason ? `stopReason: ${message.stopReason}` : "", message.errorMessage].filter(Boolean).join("\n") : ""));
-		if (role === "toolResult") {
-			const error = message.isError ? " error" : "";
-			return `[entry ${entry.id}] ${role}${error} tool=${message.toolName ?? "unknown"} call=${message.toolCallId ?? "unknown"}\n${body}`;
-		}
-		return `[entry ${entry.id}] ${role}\n${body}`;
+		const body = replacementNote + (role === "bashExecution" && message.content === undefined
+			? bashExecutionText(message)
+			: (contentText(message.content, contentEntryId) || (role === "assistant"
+				? [message.stopReason ? `stopReason: ${message.stopReason}` : "", message.errorMessage].filter(Boolean).join("\n") : "")));
+		return `${messageHeader(entry)}${body}`;
 	}
 	if (entry.type === "custom") {
 		return `[entry ${entry.id}] custom:${entry.customType}\n${safeJson(entry.data)}`;
@@ -1251,7 +1297,12 @@ function historyCapacityError(tool: "history_read" | HistoryPageTool, tokenLimit
 }
 
 function historyResultTokens(content: Array<{ type: "text"; text: string } | { type: "image"; mimeType: string; data: string }>): number {
-	return Math.max(content.reduce((sum, block) => sum + (block.type === "text" ? ledgerTokenEstimate(block.text) : 0), 0), estimateTokens({ role: "toolResult", toolCallId: "history", toolName: "history_read", content, isError: false, timestamp: 0 }));
+	const joinedText = content.filter((block): block is { type: "text"; text: string } => block.type === "text").map((block) => block.text).join("\n");
+	return Math.max(
+		content.reduce((sum, block) => sum + (block.type === "text" ? ledgerTokenEstimate(block.text) : 0), 0),
+		ledgerTokenEstimate(joinedText),
+		estimateTokens({ role: "toolResult", toolCallId: "history", toolName: "history_read", content, isError: false, timestamp: 0 }),
+	);
 }
 
 const HISTORY_TRUNCATION_MARKER = "[truncated]";
@@ -1615,44 +1666,72 @@ async function historyReadMany(params: HistoryReadParameters, ctx: ExtensionCont
 	const end = through === null ? -1 : branch.findIndex(entry => entry.id === through);
 	if (through !== null && end < 0) throw historyValidationError("many snapshot is not on the current branch");
 	const snapshot = branch.slice(0, end + 1);
-	const content: HistoryReadOutput["content"] = [];
-	const items: Array<Record<string, unknown>> = [];
+	const nextRead = (rest: typeof params.items) => rest.length ? { view: "many", items: rest, ...(params.truncate === undefined ? {} : { truncate: params.truncate }), ...(through === null ? {} : { snapshotThrough: through }) } : null;
+	const header = (rest: typeof params.items) => ({ type: "text" as const, text: rest.length ? `history_read many: partial (output budget reached). More: call history_read with ${safeJson(nextRead(rest))}` : "history_read many: complete." });
+	const runItem = async (item: typeof params.items[number], budget: number) => {
+		try {
+			return await historyReadResult({ ...item, truncate: params.truncate }, ctx, signal, toolCallId, snapshot, budget);
+		} catch (error) {
+			signal?.throwIfAborted();
+			if (error instanceof Error && error.message.startsWith("history_output_capacity:")) return undefined;
+			const message = error instanceof Error ? error.message : String(error);
+			return { content: [{ type: "text" as const, text: `entry: ${item.entryId}\nerror: ${message}` }], details: { entryId: item.entryId, error: message } };
+		}
+	};
+	const accepted: Array<{ content: HistoryReadOutput["content"]; details: Record<string, unknown> }> = [];
+	const content = () => accepted.flatMap(entry => entry.content);
 	let remaining = params.items;
-	const nextRead = (rest: typeof remaining) => rest.length ? { view: "many", items: rest, ...(params.truncate === undefined ? {} : { truncate: params.truncate }), ...(through === null ? {} : { snapshotThrough: through }) } : null;
-	const header = (rest: typeof remaining) => ({ type: "text" as const, text: rest.length ? `history_read many: partial (output budget reached). More: call history_read with ${safeJson(nextRead(rest))}` : "history_read many: complete." });
 	for (let index = 0; index < params.items.length; index++) {
 		signal?.throwIfAborted();
 		const item = params.items[index];
-		const allowance = tokenLimit - historyResultTokens([header(params.items.slice(index)), ...content]) - 64;
-		let result: HistoryReadOutput;
-		try {
-			result = await historyReadResult({ ...item, truncate: params.truncate }, ctx, signal, toolCallId, snapshot, allowance);
-		} catch (error) {
-			signal?.throwIfAborted();
-			if (error instanceof Error && error.message.startsWith("history_output_capacity:")) {
-				if (items.length === 0) throw error;
-				break;
-			}
-			const message = error instanceof Error ? error.message : String(error);
-			result = { content: [{ type: "text", text: `entry: ${item.entryId}\nerror: ${message}` }], details: { entryId: item.entryId, error: message } };
-		}
+		// Joined-text token estimates are non-additive across blocks, so probe against tokenLimit and validate the combined result.
+		const result = await runItem(item, tokenLimit);
+		if (!result) break;
 		const continuation = result.details.nextRead as HistoryReadParameters | null | undefined;
 		const returnedLength = typeof result.details.length === "number" ? result.details.length : 0;
 		const continueItem = continuation && (item.length === undefined || returnedLength < item.length);
-		const rest = params.items.slice(index + 1);
-		if (continueItem) rest.unshift({ ...item, offset: continuation.offset, ...(item.length === undefined ? {} : { length: item.length - returnedLength }) });
-		const proposed = [header(rest), ...content, ...result.content];
-		if (historyResultTokens(proposed) > tokenLimit) {
-			if (items.length === 0) throw historyCapacityError("history_read", tokenLimit, historyResultTokens(proposed));
-			break;
-		}
-		content.push(...result.content);
-		items.push({ ...result.details, status: result.details.error ? "error" : "ok" });
-		remaining = rest;
-		if (continueItem) break;
+		if (continueItem || historyResultTokens([header([]), ...content(), ...result.content]) > tokenLimit) break;
+		accepted.push({ content: result.content, details: { ...result.details, status: result.details.error ? "error" : "ok" } });
+		remaining = params.items.slice(index + 1);
 	}
-	return { content: [header(remaining), ...content], details: { schemaVersion: LEDGER_SCHEMA_VERSION, view: "many", items, snapshotThrough: through,
-		nextRead: nextRead(remaining), pageEnd: remaining.length ? "output_budget" : "complete", readTokenLimit: Number.isFinite(tokenLimit) ? tokenLimit : null } };
+	if (remaining.length > 0) {
+		while (accepted.length > 0 && historyResultTokens([header(params.items.slice(accepted.length)), ...content()]) > tokenLimit) accepted.pop();
+		const nextIndex = accepted.length;
+		const item = params.items[nextIndex];
+		const restAfter = params.items.slice(nextIndex + 1);
+		let budget = tokenLimit - [header(restAfter), ...content()].reduce(
+			(sum, block) => sum + (block.type === "text" ? Math.floor(block.text.length / 4) : historyResultTokens([block])),
+			0,
+		);
+		let partial: { result: HistoryReadOutput; rest: typeof params.items } | undefined;
+		for (let attempt = 0; attempt < 5 && budget > 0; attempt++) {
+			const result = await runItem(item, budget);
+			if (!result) break;
+			const continuation = result.details.nextRead as HistoryReadParameters | null | undefined;
+			const returnedLength = typeof result.details.length === "number" ? result.details.length : 0;
+			const continueItem = continuation && (item.length === undefined || returnedLength < item.length);
+			const rest = continueItem ? [{ ...item, offset: continuation.offset, ...(item.length === undefined ? {} : { length: item.length - returnedLength }) }, ...restAfter] : restAfter;
+			const total = historyResultTokens([header(rest), ...content(), ...result.content]);
+			if (total <= tokenLimit) {
+				partial = { result, rest };
+				break;
+			}
+			budget -= total - tokenLimit;
+		}
+		if (partial) {
+			accepted.push({ content: partial.result.content, details: { ...partial.result.details, status: partial.result.details.error ? "error" : "ok" } });
+			remaining = partial.rest;
+		} else {
+			remaining = params.items.slice(accepted.length);
+			if (accepted.length === 0) {
+				const probe = await runItem(item, tokenLimit);
+				const needed = historyResultTokens([header(remaining), ...(probe?.content ?? [])]);
+				throw historyCapacityError("history_read", tokenLimit, Math.max(needed, historyResultTokens([header(remaining)])));
+			}
+		}
+	}
+	return { content: [header(remaining), ...content()], details: { schemaVersion: LEDGER_SCHEMA_VERSION, view: "many", items: accepted.map(entry => entry.details),
+		snapshotThrough: through, nextRead: nextRead(remaining), pageEnd: remaining.length ? "output_budget" : "complete", readTokenLimit: Number.isFinite(tokenLimit) ? tokenLimit : null } };
 }
 
 
@@ -1810,7 +1889,7 @@ function historyItemsResult(
 
 	const tokenLimit = historyReadTokenLimit(params.truncate);
 	const limit = params.limit ?? 20;
-	const candidates: Array<{ view: HistoryEntryView; index: number; parts: HistoryPart[]; text: string; matchedQueryIndexes: number[]; matchOffset: number; match?: { kind: HistoryKind; contentIndex?: number; offset: number; spansBlocks?: boolean } }> = [];
+	const candidates: Array<{ view: HistoryEntryView; index: number; parts: HistoryPart[]; text: string; matchedQueryIndexes: number[]; matchOffset: number; match?: { kind: HistoryKind; contentIndex?: number; offset?: number; spansBlocks?: boolean } }> = [];
 	let totalMatches = 0;
 	for (let index = Math.min(snapshotEndIndex, branchEntries.length - 1); index >= 0; index--) {
 		const entry = branchEntries[index];
@@ -1830,10 +1909,16 @@ function historyItemsResult(
 		totalMatches++;
 		if (afterIndex !== undefined && (order === "newest" ? index >= afterIndex : index <= afterIndex)) continue;
 		let offset = matchOffset;
-		let match: { kind: HistoryKind; contentIndex?: number; offset: number; spansBlocks?: boolean } | undefined;
+		let match: { kind: HistoryKind; contentIndex?: number; offset?: number; spansBlocks?: boolean } | undefined;
 		if (!listing) for (const part of parts) {
 			const size = part.text("all").length;
-			if (offset <= size) { match = { kind: part.kind, contentIndex: part.contentIndex, offset, ...(offset + queries[matchedQueryIndexes[0]].length > size ? { spansBlocks: true } : {}) }; break; }
+			if (offset <= size) {
+				const spansBlocks = offset + queries[matchedQueryIndexes[0]].length > size;
+				match = part.exactOffset === false
+					? { kind: part.kind, ...(spansBlocks ? { spansBlocks: true } : {}) }
+					: { kind: part.kind, contentIndex: part.contentIndex, offset: offset + (part.readOffset ?? 0), ...(spansBlocks ? { spansBlocks: true } : {}) };
+				break;
+			}
 			offset -= size + 1;
 		}
 		candidates.push({
@@ -1877,7 +1962,7 @@ function historyItemsResult(
 		while (snippetLength > 0) {
 			const hitPrefix = [
 				historyEntryLine(view.entry.id, view.role, view.executionStatus),
-				...(match ? [`match: ${match.kind}${match.contentIndex === undefined ? "" : `, contentIndex ${match.contentIndex}`}, offset ${match.offset}${match.spansBlocks ? " (spans blocks; read the whole entry)" : ""}`] : []),
+				...(match ? [`match: ${match.kind}${match.contentIndex === undefined ? "" : `, contentIndex ${match.contentIndex}`}${match.offset === undefined ? " (read the whole entry)" : `, offset ${match.offset}`}${match.spansBlocks ? " (spans blocks; read the whole entry)" : ""}`] : []),
 				...(Array.isArray(query) ? [`matched query indexes: ${matchedQueryIndexes.join(", ")}`] : []),
 				...historyMetadataLines(metadata),
 				payloadSummary(payloads),
@@ -2455,7 +2540,7 @@ function renderBootstrap(
 	const deltaBody = delta?.ledger ?? (slot.status === "unavailable" ? "(none)" : "No changes after the checkpoint needed a summary.");
 	return [
 		"# Ledger Context Recovery",
-		"The earlier conversation was compacted. Resume from your checkpoint plus the changes listed after it; the messages after this summary are kept verbatim.",
+		'The earlier conversation was compacted, and you are taking over from the agent that wrote the checkpoint below. A checkpoint can omit or misstate what the user asked, so you MUST rebuild the user\'s intent from history before your next step (see "Before you continue"). The messages after this summary are kept verbatim.',
 		"",
 		`## Checkpoint${checkpoint ? ` (${historyEntryReference(checkpoint.entryId)})` : ""}`,
 		checkpoint?.data.ledger ?? "No agent checkpoint was saved yet. Rebuild the working state from the changes below and the kept messages.",
@@ -2466,13 +2551,14 @@ function renderBootstrap(
 		...(references.length ? ["", "## Evidence references", ...sourceReferenceLines(references)] : []),
 		...(customInstructions?.trim() ? ["", "## Compaction focus", customInstructions.trim()] : []),
 		"",
-		"## How to use this",
-		...(requested === "continue" ? ["- Your checkpoint call asked for this compaction right after its tool batch: continue the task from the checkpoint."]
+		"## Before you continue",
+		...(requested === "continue" ? ["- Your checkpoint call asked for this compaction right after its tool batch."]
 			: requested === "stop" ? ["- Your checkpoint call asked for this compaction when you ended your turn."] : []),
-		"- The checkpoint is your saved state and the changes update it; checkpoint items stay valid unless a change replaces them.",
-		"- Later user corrections and actual tool results override saved state. Verify before repeating any action with side effects.",
+		'- You MUST rebuild the user\'s intent from history before your next step: call history_list_items with filter.kinds=["user_input"] (newest first; follow nextCursor as needed), then read the needed messages in full with history_read (use view="many" for several entries).',
+		"- Compare those original user requests with the checkpoint and changes above; update the checkpoint (with edits or ledger) only if the saved state missed or misstated something, then continue the task.",
+		"- The checkpoint is your saved state and the changes update it; later user corrections and actual tool results override saved state. Verify before repeating any action with side effects.",
 		`- Events after the saved state: ${later.fromEntryId && later.toEntryId ? `entries ${later.fromEntryId} to ${later.toEntryId}` : "none"}.`,
-		"- Read evidence with history_read when you know the pi://entry ID, or find it with history_search.",
+		"- Find other evidence with history_search, read entries or tool exchanges with history_read, and inspect window summaries with history_list_windows.",
 	].join("\n");
 }
 
@@ -2612,6 +2698,43 @@ function dueUsageNotice(
 	return { type: "custom_message", customType: USAGE_MESSAGE_TYPE, content, display: false, details };
 }
 
+interface RecoveryNudgeDetails {
+	schemaVersion: typeof LEDGER_SCHEMA_VERSION;
+	windowId: string;
+	compactionEntryId: string;
+}
+
+/** At most once per compacted window, nudges the agent after ordinary work if no history tool ran in that window yet. */
+function dueRecoveryNudge(
+	ctx: ExtensionContext,
+	event: TurnEndEvent,
+): (CustomMessageEntryDraft & { details: RecoveryNudgeDetails }) | undefined {
+	if (!recoveryNudgeEnabled()) return undefined;
+	const entries = ctx.sessionManager.getBranch();
+	const compaction = latestLedgerCompaction(entries);
+	if (!compaction || !isLedgerCompactionDetails(compaction.details)) return undefined;
+	const afterCompaction = entries.slice(entries.indexOf(compaction) + 1);
+	if (afterCompaction.some((entry) => {
+		const message = entryMessage(entry);
+		return message?.role === "assistant" && Array.isArray(message.content) &&
+			message.content.some((block: any) => block?.type === "toolCall" && isHistoryToolName(block.name));
+	})) return undefined;
+	if (!event.toolResults.some((result) => !isMaintenanceToolName(result.toolName))) return undefined;
+	if (afterCompaction.some((entry) =>
+		entry.type === "custom_message" &&
+		entry.customType === RECOVERY_NUDGE_MESSAGE_TYPE &&
+		Boolean(entry.details && typeof entry.details === "object") &&
+		(entry.details as { compactionEntryId?: unknown }).compactionEntryId === compaction.id
+	)) return undefined;
+	const details: RecoveryNudgeDetails = {
+		schemaVersion: LEDGER_SCHEMA_VERSION,
+		windowId: compaction.details.windowId,
+		compactionEntryId: compaction.id,
+	};
+	const content = `Ledger Context notice: your context was compacted (${historyEntryReference(compaction.id)}) and you have not rebuilt the user's intent from history in this window. Call history_list_items with filter.kinds=["user_input"], then read the needed messages in full with history_read and compare them with your checkpoint before your next step. Leave this notice out of the ledger and sourceQuotes.`;
+	return { type: "custom_message", customType: RECOVERY_NUDGE_MESSAGE_TYPE, content, display: false, details };
+}
+
 function validationError(message: string): Error {
 	return new Error(`checkpoint validation failed: ${message}`);
 }
@@ -2647,6 +2770,12 @@ function sourceMaterial(entry: SessionEntry, edit?: ContextEditEntry): { entry: 
 	}
 	if (!effective || effective.type !== "message") return undefined;
 	let message = effective.message;
+	if (message.role === "bashExecution") {
+		if (message.excludeFromContext && !edit?.replacement) return undefined;
+		const raw = message as MessageLike;
+		const text = raw.content !== undefined ? contentText(raw.content, edit?.id ?? entry.id) : bashExecutionText(raw);
+		return text.trim() ? { entry: effective, text } : undefined;
+	}
 	if (message.role === "toolResult" && isMaintenanceToolName(message.toolName)) return undefined;
 	if (message.role === "assistant") {
 		const calls = message.content.filter((block) => block.type === "toolCall");
@@ -2786,7 +2915,7 @@ function validateCheckpoint(
 			schemaVersion: LEDGER_SCHEMA_VERSION,
 			kind: "agent-checkpoint",
 			ledger,
-			sourceReferences: editMode && params.sourceQuotes === undefined
+			sourceReferences: params.sourceQuotes === undefined
 				? [...(state.checkpoint?.data.sourceReferences ?? []), ...(state.delta?.data.sourceReferences ?? [])].slice(0, MAX_SOURCE_REFERENCES)
 				: resolveSourceReferences(sourceQuotes.map((quote) => ({ quote })), entries.slice(0, positionStartIndex(entries, requestHistoryPosition))),
 			requestHistoryPosition,
@@ -2877,6 +3006,7 @@ function deltaHistoryMaterial(entry: SessionEntry, contentEntryId = entry.id): {
 	if ((entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY_TYPE) || (entry.type === "custom_message" && isLedgerNotice(entry.customType))) return { excluded: "maintenance" };
 	if (entry.type === "message") {
 		const message = entry.message;
+		if (message.role === "bashExecution" && message.excludeFromContext) return { excluded: "context-omitted" };
 		if (message.role === "toolResult" && ["checkpoint", "get_context_remaining"].includes(message.toolName)) return { excluded: "maintenance" };
 		if (message.role === "assistant" && Array.isArray(message.content)) {
 			const calls = message.content.filter((block) => block.type === "toolCall");
@@ -3080,9 +3210,11 @@ function toolCallEntryIndex(entries: SessionEntry[], toolCallId: string): number
 /** Like Pi's "session too small": the conversation before the cut, without the system prompt and latest summary, fits what Pi keeps verbatim anyway. */
 function compactionTooSmall(entries: SessionEntry[], cut: number, keepRecentTokens: number): boolean {
 	if (cut < 0) return true;
-	const projected = buildSessionProjection(entries).entries;
-	const end = projected.findIndex((entry) => entry.sourceEntry.id === entries[cut].id);
-	const removable = projected.slice(0, Math.max(end, 0)).filter((entry) => entry.sourceEntry.type !== "compaction").flatMap((entry) => entry.messages).filter((message) => message.role !== "system");
+	const positions = new Map(entries.map((entry, index) => [entry.id, index]));
+	const removable = buildSessionProjection(entries).entries
+		.filter((entry) => entry.sourceEntry.type !== "compaction" && (positions.get(entry.sourceEntry.id) ?? entries.length) < cut)
+		.flatMap((entry) => entry.messages)
+		.filter((message) => message.role !== "system");
 	return estimateMessageTokens(removable) <= keepRecentTokens;
 }
 
@@ -3153,11 +3285,23 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		}
 	};
 
+	const recoveryNudge = (ctx: ExtensionContext, event: TurnEndEvent) => {
+		try {
+			const state = getState(ctx);
+			stopOnRecoveryError(state, ctx);
+			return dueRecoveryNudge(ctx, event);
+		} catch (error) {
+			notify(ctx, `Ledger Context recovery nudge disabled: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return undefined;
+		}
+	};
+
 	/**
 	 * The compaction a checkpoint call asked for, as a boundary entry: the run goes on without an abort. The checkpoint covers
-	 * everything before its call, so no delta is generated. A call alone in its message is dropped with its result, which keeps
-	 * the ledger out of the new window twice; a call beside others keeps the branch from its message on, for their results.
-	 * The compaction goes first among the boundary's entries, so those that earlier handlers proposed join the new window.
+	 * everything before its call, so no delta is generated, while keeping up to keepRecentTokens of preceding context when room
+	 * permits. When no pre-cut entries are kept, a call alone in its message is dropped with its result, keeping the ledger out
+	 * of the new window twice; a call beside others keeps the branch from its message on, for their results. The compaction goes
+	 * first among the boundary's entries, so those that earlier handlers proposed join the new window.
 	 */
 	const checkpointCompaction = (event: TurnEndEvent | AgentBeforeSettleEvent, ctx: ExtensionContext, mode: CompactMode) => {
 		const state = getState(ctx);
@@ -3187,19 +3331,66 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		try {
 			const limits = limitsModel(ctx);
 			const budgets = contentBudgets(limits.model?.contextWindow ?? 0);
+			const keepRecentTokens = nativeCompactionSettings(ctx, settingsReader).compaction?.keepRecentTokens ?? DEFAULT_COMPACTION_SETTINGS.keepRecentTokens;
+			const positions = new Map(entries.map((entry, index) => [entry.id, index]));
+			// Drop any prior compaction entry (whose raw index follows its kept pre-compaction tail); boundary drafts default to entries.length.
+			const preview = event.context.contextEntries.filter((entry) => entry.sourceEntry.type !== "compaction");
+			const entryPosition = (entry: (typeof preview)[number]) => positions.get(entry.sourceEntry.id) ?? entries.length;
+			const nonSystemMessages = (entry: (typeof preview)[number]) => entry.messages.filter((message) => message.role !== "system");
 			const alone = messageToolCallIds(entries[cut]).length === 1;
 			const result = alone ? entries.findIndex((entry, index) => index > cut && messageToolResultId(entry) === pending.toolCallId) : -1;
-			const firstKeptEntryId = result < 0 ? entries[cut].id : (entries[result + 1]?.id ?? null);
-			const details = buildCompactionDetails(state, entries, firstKeptEntryId, `window:${ctx.sessionManager.getSessionId()}:${randomUUID()}`, { status: "empty" }, requestPositionForContext(entries));
-			const summary = renderBootstrap(entries, state, details, budgets, undefined, pending.mode);
-			// The preview projection holds the earlier drafts after the branch; they stay in context with the kept entries.
-			const preview = event.context.contextEntries;
-			const positions = new Map(entries.map((entry, index) => [entry.id, index]));
-			const keptIndex = firstKeptEntryId === null ? entries.length : (positions.get(firstKeptEntryId) as number);
-			const keptFrom = preview.findIndex((entry) => (positions.get(entry.sourceEntry.id) ?? entries.length) >= keptIndex);
-			const keptTokens = keptFrom < 0 ? 0 : estimateMessageTokens(preview.slice(keptFrom).flatMap((entry) => entry.messages));
+			const noPreCutFirstKeptId = result < 0 ? entries[cut].id : (entries[result + 1]?.id ?? null);
+			const windowId = `window:${ctx.sessionManager.getSessionId()}:${randomUUID()}`;
+			const snapshotPosition = requestPositionForContext(entries);
 			const availableTokens = knownLimit(limits.model?.contextWindow) - requestFixedTokens(pi, ctx) - budgets.outputReserveTokens;
-			const requiredTokens = ledgerTokenEstimate(summary) + keptTokens;
+
+			let firstKeptEntryId = noPreCutFirstKeptId;
+			let details = buildCompactionDetails(state, entries, firstKeptEntryId, windowId, { status: "empty" }, snapshotPosition);
+			let summary = renderBootstrap(entries, state, details, budgets, undefined, pending.mode);
+			const summaryTokens = ledgerTokenEstimate(summary);
+			const postCutTokens = estimateMessageTokens(preview.filter((entry) => entryPosition(entry) >= cut).flatMap(nonSystemMessages));
+			const preCutCap = Math.min(keepRecentTokens, availableTokens - summaryTokens - postCutTokens);
+			const preCut = preview.filter((entry) => entryPosition(entry) < cut);
+			const isValidCutPoint = (entry: (typeof preview)[number]) => {
+				const messages = nonSystemMessages(entry);
+				return messages.length > 0 && messages.some((message) => message.role !== "toolResult");
+			};
+			if (preCutCap > 0 && preCut.length > 0) {
+				let accumulated = 0;
+				let sliceStart = 0;
+				for (let index = preCut.length - 1; index >= 0; index--) {
+					const messageTokens = estimateMessageTokens(nonSystemMessages(preCut[index]));
+					if (messageTokens === 0) continue;
+					if (accumulated + messageTokens > preCutCap) {
+						sliceStart = index + 1;
+						break;
+					}
+					accumulated += messageTokens;
+					if (accumulated === preCutCap) {
+						sliceStart = index;
+						break;
+					}
+				}
+				const chosen = preCut.slice(sliceStart).find(isValidCutPoint);
+				if (chosen) firstKeptEntryId = chosen.sourceEntry.id;
+			}
+			if (firstKeptEntryId !== noPreCutFirstKeptId) {
+				details = buildCompactionDetails(state, entries, firstKeptEntryId, windowId, { status: "empty" }, snapshotPosition);
+				summary = renderBootstrap(entries, state, details, budgets, undefined, pending.mode);
+			}
+			const keptTokensFor = (keptId: string | null) => {
+				const keptIndex = keptId === null ? entries.length : (positions.get(keptId) as number);
+				return estimateMessageTokens(preview.filter((entry) => entryPosition(entry) >= keptIndex).flatMap(nonSystemMessages));
+			};
+			let keptTokens = keptTokensFor(firstKeptEntryId);
+			let requiredTokens = ledgerTokenEstimate(summary) + keptTokens;
+			if (firstKeptEntryId !== noPreCutFirstKeptId && requiredTokens > availableTokens) {
+				firstKeptEntryId = noPreCutFirstKeptId;
+				details = buildCompactionDetails(state, entries, firstKeptEntryId, windowId, { status: "empty" }, snapshotPosition);
+				summary = renderBootstrap(entries, state, details, budgets, undefined, pending.mode);
+				keptTokens = keptTokensFor(firstKeptEntryId);
+				requiredTokens = ledgerTokenEstimate(summary) + keptTokens;
+			}
 			if (requiredTokens > availableTokens) return skip(`the recovery summary and the kept messages need ${requiredTokens} tokens, above the ${availableTokens}-token budget`);
 			pending.proposed = { windowId: details.windowId };
 			return [{ type: "compaction" as const, summary, firstKeptEntryId, details }, ...event.entries];
@@ -3218,7 +3409,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		const queued = new Set(event.context.pendingMessages.flatMap((message) => message.role === "custom" ? [message.customType] : []));
 		// A reminder carries the usage too, so a queued one also stands for a usage notice.
 		if (queued.has(REMINDER_MESSAGE_TYPE)) return;
-		const draft = reminder(ctx) ?? (queued.has(USAGE_MESSAGE_TYPE) ? undefined : usageNotice(ctx));
+		const draft = reminder(ctx) ?? (queued.has(RECOVERY_NUDGE_MESSAGE_TYPE) ? undefined : recoveryNudge(ctx, event)) ?? (queued.has(USAGE_MESSAGE_TYPE) ? undefined : usageNotice(ctx));
 		if (draft) pi.sendMessage<unknown>(draft, { deliverAs: "steer" });
 	});
 
@@ -3269,12 +3460,12 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 	pi.registerTool({
 		name: "checkpoint",
 		label: "Checkpoint",
-		description: "Save your complete working state, whole (ledger) or as exact edits to the saved state (edits). After context compaction you resume from the latest checkpoint plus an automatic summary of later changes. Each save becomes the new checkpoint; older versions stay in history.",
+		description: "Save your complete working state, whole (ledger) or as exact edits to the saved state (edits). After context compaction, the recovery summary shows the latest checkpoint and a summary of later changes. Each save becomes the new checkpoint; older versions stay in history.",
 		promptSnippet: "save your working state for recovery after compaction",
 		promptGuidelines: [
 			`checkpoint: ${CHECKPOINT_LEDGER_GUIDELINES}`,
-			`checkpoint: an edit save after a compaction appends that compaction's changes under "${FOLDED_CHANGES_HEADING}"; these sections are temporary. When a receipt reports several of them, make your next save a complete ledger that merges them into the current state and drops what they replaced.`,
-			"checkpoint: save after important decisions, user corrections and finished milestones, then continue the task. Put every essential fact in the ledger; sourceQuotes only point to evidence.",
+			`checkpoint: edits after compaction append changes under "${FOLDED_CHANGES_HEADING}"; these are temporary. When a receipt reports several, make your next save a complete ledger that merges them and drops what they replaced.`,
+			"checkpoint: save after important decisions, user corrections and finished milestones. Put every essential fact in the ledger; sourceQuotes only locate evidence.",
 			"checkpoint: checkpoint, the history_* tools and get_context_remaining are direct calls only; codemode scripts cannot call them.",
 		],
 		parameters: checkpointParameters,
@@ -3300,8 +3491,8 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 			}
 			const compactionText = !compaction ? ""
 				: compaction.status === "session-too-small" ? "Compaction skipped: Nothing to compact (session too small)."
-				: compaction.mode === "continue" ? "Compaction scheduled: your context is compacted onto this checkpoint right after this tool batch; then continue the task."
-				: "Compaction scheduled: your context is compacted onto this checkpoint when you end your turn; give your final reply now.";
+				: compaction.mode === "continue" ? "Compaction scheduled: your context is compacted onto this checkpoint right after this tool batch; after the compaction, rebuild the user's intent from history before you continue."
+				: "Compaction scheduled: your context is compacted onto this checkpoint when you end your turn; give your final reply now. After the compaction, rebuild the user's intent from history before your next step.";
 			const details: CheckpointReceiptDetails = {
 				...validated.data,
 				checkpointEntryId: saved.entryId,
@@ -3341,7 +3532,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		description: "Read session history by entry ID: an entry's text (paged), one image, a tool call with its results, the surrounding entries, or several reads at once. History keeps original content, including compacted entries.",
 		promptSnippet: "read history entries, images or tool exchanges by ID",
 		promptGuidelines: [
-			"history_read: use it when you know the entry ID (from a pi://entry reference, a search hit or a listing). Continue a long read with the returned nextRead, or nextCursor for exchange and neighbors.",
+			"history_read: read a known entryId (from pi://entry, search, or list). Continue via nextRead or nextCursor.",
 		],
 		parameters: historyReadParameters,
 		prepareArguments: preparedArguments(historyReadParameters, historyValidationError),
@@ -3366,7 +3557,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		description: "Find history entries containing literal text (case-insensitive by default). Returns one item per entry with its ID, a snippet and the match position.",
 		promptSnippet: "find history entries by literal text",
 		promptGuidelines: [
-			"history_search: use it when you need evidence but lack the entry ID, then read hits with history_read (entryId, plus contentIndex and offset from match).",
+			"history_search: find evidence without an entryId, then read hits with history_read (using entryId, and match.contentIndex/offset when present).",
 		],
 		parameters: historySearchParameters,
 		prepareArguments: preparedArguments(historySearchParameters, historyValidationError),
@@ -3390,7 +3581,7 @@ function installLedgerContext(pi: ExtensionAPI, options: LedgerContextOptions): 
 		label: "History List Items",
 		description: "List history entries with short previews, using the same filters as history_search. Use it to browse a range, a window, your saved checkpoints or the compaction deltas.",
 		promptSnippet: "browse history entries, checkpoints and deltas",
-		promptGuidelines: ["history_list_items: filter.kinds=[\"checkpoint\"] lists your saved checkpoints, [\"compaction_delta\"] the compaction deltas, [\"user_input\"] user requests."],
+		promptGuidelines: ['history_list_items: after every compaction, before your next step, rebuild the user\'s intent by listing filter.kinds=["user_input"] and reading the needed entries in full with history_read. filter.kinds=["checkpoint"] lists your saved checkpoints, ["compaction_delta"] the compaction deltas, ["user_input"] user requests.'],
 		parameters: historyListItemsParameters,
 		prepareArguments: preparedArguments(historyListItemsParameters, historyValidationError),
 		executionMode: "sequential",

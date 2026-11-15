@@ -25,11 +25,13 @@ Saves the active recovery baseline on the current branch:
   complete `ledger` on the next save.
 - **`sourceQuotes`**: Up to `8` case-sensitive literal phrases (`1–512` chars)
   matched against non-maintenance branch messages through the request snapshot.
-  Whitespace runs match any whitespace run. Omitting `sourceQuotes` clears the
-  list on `ledger` saves and keeps up to `8` saved checkpoint+delta references
-  on `edits` saves. Passing non-empty `sourceQuotes` alone keeps the saved
-  state (including any folded delta) as the ledger and replaces its quote list. Unmatched or ambiguous quotes
-  are reported (`matched`, `ambiguous`, `unmatched`, up to `4` matches per quote)
+  Whitespace runs match any whitespace run. Omitting `sourceQuotes` (or passing
+  `null`) keeps up to `8` saved checkpoint+delta references on both `ledger` and
+  `edits` saves. Passing non-empty `sourceQuotes` replaces the list (and given
+  alone keeps the saved state, including any folded delta, while replacing only
+  its quote list). Passing `[]` with `ledger` or `edits` clears the saved list;
+  `{ sourceQuotes: [] }` alone is rejected. Unmatched or ambiguous quotes are
+  reported (`matched`, `ambiguous`, `unmatched`, up to `4` matches per quote)
   without failing the save.
 - **`compact`**: `"continue"` or `"stop"` (requires `ledger` or state-changing
   `edits`).
@@ -38,12 +40,19 @@ Saves the active recovery baseline on the current branch:
   - `"stop"` commits a boundary compaction at `agent_before_settle` after the
     final reply.
   - The checkpoint covers everything before its call, so no delta is generated
-    for that cut. When the `checkpoint` call is the only tool call in its
-    assistant message, the call and its receipt leave with the earlier history:
-    the new window holds the recovery summary (which says the checkpoint asked
-    for it) and the entries after the receipt, such as the final reply in
-    `"stop"` mode, so the ledger appears once. When other tool calls share the
-    message, the branch is kept from that message on, with their results.
+    for that cut. When budget permits and `keepRecentTokens > 0`, the compaction
+    keeps up to `keepRecentTokens` of preceding non-compaction messages before
+    the call, starting at a valid non-`toolResult` entry and retaining the
+    `checkpoint` call and its receipt. When zero preceding entries fit (or
+    `keepRecentTokens` is `0`) and the `checkpoint` call is the only tool call
+    in its assistant message, the call and its receipt leave with the earlier
+    history so the ledger appears once in the recovery summary; entries after
+    the receipt, such as the final reply in `"stop"` mode, stay. When other
+    tool calls share the message and zero preceding entries fit, the branch is
+    kept from that message on, with their results.
+  - The recovery summary directs the model to rebuild user intent before its
+    next step by calling `history_list_items` with `filter.kinds=["user_input"]`
+    and reading needed entries with `history_read`.
   - Entries that other extensions propose at the same boundary join the new
     window.
   - If removable tokens before the cut fit within Pi's `keepRecentTokens`, the
@@ -82,7 +91,9 @@ Both tools inspect the current branch snapshot and share:
 - **Search fields** (`history_search` only): Either `query` or `queries`
   (`1–32` literals, up to `8192` UTF-8 bytes total), plus `caseSensitive`
   (default `false`). Hits include `matchedQueryIndexes`, `matchOffset`, and
-  `match` with UTF-16 `offset` and optional `contentIndex` / `spansBlocks`.
+  `match` (`kind`, optional `contentIndex` / `spansBlocks`, and UTF-16 `offset`
+  for linear entries; `offset` is omitted for `checkpoint` and
+  `compaction_delta` hits, which direct whole-entry `history_read` calls).
 
 ### `history_list_windows`
 
@@ -179,11 +190,21 @@ With model window `W`, extension output reserve `O`, and Pi native
   count as shown; a jump over several steps gives one notice, and a new window
   starts over. Notices queue via `deliverAs: "steer"`, never continue a run,
   and stay out of new work, deltas, and `sourceQuotes`, as reminders do.
+- **Recovery nudges**: When `LEDGER_CONTEXT_RECOVERY_NUDGE=1`, after a
+  completed non-maintenance tool batch in a ledger-compacted window with no
+  prior post-compaction `history_*` call, `turn_end` steers a hidden
+  `ledger-context/recovery-nudge` message citing `pi://entry/<compaction.id>`
+  and instructing the model to inspect user inputs with `history_list_items` and
+  `history_read` before continuing. The nudge fires at most once per compaction
+  window, sits below reminders and above usage notices in `turn_end` priority
+  without skipping later usage notices, never runs from `agent_before_settle`,
+  and stays excluded from new work, deltas, `sourceQuotes`, and `shownUsage`.
 
 ## 4. Environment Variables
 
-`LEDGER_CONTEXT_USAGE_NOTICE_PERCENT` is an integer from `0` to `100`; every
-other `LEDGER_CONTEXT_*` variable must be a positive safe integer
+`LEDGER_CONTEXT_USAGE_NOTICE_PERCENT` is an integer from `0` to `100`, and
+`LEDGER_CONTEXT_RECOVERY_NUDGE` is `0` or `1`; every other `LEDGER_CONTEXT_*`
+variable is a positive safe integer
 (`LEDGER_CONTEXT_URGENT_TOKENS < LEDGER_CONTEXT_REMINDER_TOKENS`).
 
 | Variable | Default | Purpose |
@@ -195,6 +216,7 @@ other `LEDGER_CONTEXT_*` variable must be a positive safe integer
 | `LEDGER_CONTEXT_REMINDER_TOKENS` | `max(2, floor(min(W * 0.20, 32768)))` | Soft reminder lead time before `B` |
 | `LEDGER_CONTEXT_URGENT_TOKENS` | `max(1, min(softDefault - 1, floor(min(W * 0.10, 16384))))` | Urgent reminder lead time before `B` |
 | `LEDGER_CONTEXT_USAGE_NOTICE_PERCENT` | `5` | Step of usage notices in percent of `W`; `0` turns them off |
+| `LEDGER_CONTEXT_RECOVERY_NUDGE` | `0` | Enables (`1`) or disables (`0`) the once-per-compaction post-compaction recovery nudge |
 
 ## 5. SDK Host Integration
 
